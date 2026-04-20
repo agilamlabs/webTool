@@ -1,0 +1,8 @@
+[
+  {"action": "wait", "target": "selector", "value": "h1"},
+  {"action": "evaluate", "expression": "document.title"},
+  {"action": "screenshot", "full_page": false},
+  {"action": "scroll", "direction": "down", "amount": 3},
+  {"action": "screenshot", "full_page": true, "path": "./screenshots/full_page.png"},
+  {"action": "evaluate", "expression": "window.scrollY"}
+]

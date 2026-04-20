@@ -1,0 +1,40 @@
+log_level: "DEBUG"
+output_dir: "./output"
+
+browser:
+  headless: true
+  default_timeout: 30000
+  navigation_timeout: 45000
+  max_contexts: 3
+  block_resources: ["image", "font", "stylesheet", "media"]
+  viewport_width: 1920
+  viewport_height: 1080
+
+search:
+  max_results: 10
+  language: "en"
+  region: "us"
+
+fetch:
+  wait_until: "networkidle"
+  max_retries: 3
+  retry_base_delay: 1.0
+  retry_max_delay: 30.0
+  non_retryable_status_codes: [400, 401, 403, 404, 405, 410, 451]
+
+download:
+  download_dir: "./downloads"
+  max_file_size_mb: 100
+
+extraction:
+  favor_recall: true
+  include_tables: true
+  min_content_length: 50
+
+automation:
+  default_action_timeout: 10000
+  screenshot_dir: "./screenshots"
+  screenshot_format: "png"
+  screenshot_quality: 80
+  stop_on_error: true
+  slow_mo_actions: 0

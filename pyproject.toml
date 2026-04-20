@@ -1,0 +1,51 @@
+[project]
+name = "web-agent-toolkit"
+version = "1.0.0"
+description = "Professional agentic web search, fetch, download, extraction, and browser automation toolkit using Playwright"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["web-scraping", "playwright", "ai-agent", "browser-automation", "content-extraction"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "playwright>=1.55.0,<2.0.0",
+    "playwright-stealth>=2.0.0,<3.0.0",
+    "pydantic>=2.9.0,<3.0.0",
+    "pydantic-settings>=2.0.0",
+    "loguru>=0.7.0",
+    "trafilatura>=2.0.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "PyYAML>=6.0",
+    "httpx>=0.28.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["web_agent*"]
+
+[project.scripts]
+web-agent = "web_agent.main:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests requiring network access and a real browser",
+]
