@@ -123,6 +123,14 @@ async def run_screenshot(args: argparse.Namespace) -> None:
         print(result.model_dump_json(indent=2))
 
 
+def run_serve_mcp(args: argparse.Namespace) -> None:
+    """Run the MCP server on stdio transport."""
+    # Import lazily so users without mcp installed can still use other commands
+    from .mcp_server import main as mcp_main
+
+    mcp_main()
+
+
 # ------------------------------------------------------------------
 # CLI parser
 # ------------------------------------------------------------------
@@ -184,7 +192,18 @@ def main() -> None:
         "--full-page", action="store_true", help="Capture full scrollable page"
     )
 
+    # serve-mcp
+    subparsers.add_parser(
+        "serve-mcp",
+        help="Run as an MCP server (stdio transport) for Claude Desktop/Code, Cursor, etc.",
+    )
+
     args = parser.parse_args()
+
+    # serve-mcp is synchronous (it manages its own event loop internally)
+    if args.command == "serve-mcp":
+        run_serve_mcp(args)
+        return
 
     handler_map = {
         "search": run_search,

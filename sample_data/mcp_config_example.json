@@ -1,0 +1,20 @@
+{
+  "_comment": "Sample MCP server configuration for web_agent. Paste the 'web_agent' entry into your Claude Desktop, Claude Code, or Cursor mcpServers config.",
+  "mcpServers": {
+    "web_agent": {
+      "command": "python",
+      "args": ["-m", "web_agent.mcp_server"]
+    },
+    "web_agent_with_env": {
+      "_comment": "Alternate form with custom environment variables for config overrides",
+      "command": "python",
+      "args": ["-m", "web_agent.mcp_server"],
+      "env": {
+        "WEB_AGENT_LOG_LEVEL": "INFO",
+        "WEB_AGENT_BROWSER__HEADLESS": "true",
+        "WEB_AGENT_SEARCH__MAX_RESULTS": "5",
+        "WEB_AGENT_DOWNLOAD__DOWNLOAD_DIR": "/tmp/web_agent_downloads"
+      }
+    }
+  }
+}
