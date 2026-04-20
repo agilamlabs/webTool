@@ -167,6 +167,7 @@ class Agent:
 ### Result Models
 
 **AgentResult** (from `search_and_extract`):
+
 ```python
 result.query           # str - original search query
 result.search          # SearchResponse - search results with titles, URLs, snippets
@@ -176,6 +177,7 @@ result.total_time_ms   # float - pipeline execution time
 ```
 
 **ExtractionResult** (from `fetch_and_extract`):
+
 ```python
 result.url               # str
 result.title             # str | None
@@ -190,6 +192,7 @@ result.content_length    # int
 ```
 
 **DownloadResult** (from `download`):
+
 ```python
 result.url          # str
 result.filepath     # str - local file path
@@ -200,6 +203,7 @@ result.status       # "success" | "timeout" | "http_error" | "network_error"
 ```
 
 **ScreenshotResult** (from `screenshot`):
+
 ```python
 result.url        # str
 result.path       # str - file path
@@ -249,6 +253,7 @@ async with Agent() as agent:
 #### Example: Action Sequence from JSON
 
 Create `actions.json`:
+
 ```json
 [
   {"action": "wait", "target": "selector", "value": "h1"},
@@ -260,6 +265,7 @@ Create `actions.json`:
 ```
 
 Run it:
+
 ```bash
 python -m web_agent interact "https://example.com" --actions actions.json
 ```
@@ -279,6 +285,7 @@ Agent (orchestrator)
 ```
 
 **Smart routing:**
+
 - File URLs (`.pdf`, `.xlsx`, `.zip`) are detected upfront and routed to the downloader
 - Web page URLs (`.html`, `.htm`) use Playwright page save instead of download events
 - `networkidle` timeouts automatically fall back to `load` wait state
@@ -422,6 +429,7 @@ async with Agent() as agent:
 ```
 
 Exception hierarchy:
+
 ```
 WebAgentError
   |-- BrowserError           Browser launch/context failures
@@ -486,4 +494,4 @@ sample_data/             # Test fixtures and example action sequences
 
 ## License
 
-MIT
+Apache-2.0 license
