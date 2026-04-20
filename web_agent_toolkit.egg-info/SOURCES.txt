@@ -1,3 +1,5 @@
+LICENSE
+README.md
 pyproject.toml
 tests/test_agent.py
 tests/test_browser_actions.py
@@ -13,6 +15,7 @@ web_agent/content_extractor.py
 web_agent/downloader.py
 web_agent/exceptions.py
 web_agent/main.py
+web_agent/mcp_server.py
 web_agent/models.py
 web_agent/py.typed
 web_agent/search_engine.py

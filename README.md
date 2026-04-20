@@ -14,6 +14,7 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 - **Screenshots** -- Viewport, full-page, or element-specific captures
 - **Anti-Detection** -- playwright-stealth, user-agent rotation, resource blocking
 - **Structured Output** -- All results are Pydantic v2 models serializable to JSON
+- **MCP Server** -- Built-in MCP server exposes all capabilities to Claude Desktop, Claude Code, Cursor, and other MCP-compatible AI clients
 
 ## Installation
 
@@ -283,6 +284,127 @@ Agent (orchestrator)
 - `networkidle` timeouts automatically fall back to `load` wait state
 - HTTP 4xx errors fail immediately; 5xx errors retry with exponential backoff
 
+## MCP Integration
+
+Run `web_agent` as an MCP (Model Context Protocol) server so Claude Desktop, Claude Code, Cursor, and any other MCP-compatible AI client can use it directly as a tool. The browser stays warm across tool calls within a session (skips ~5-10s startup per call after the first).
+
+### Starting the server
+
+```bash
+# Via module:
+python -m web_agent.mcp_server
+
+# Via installed script:
+web-agent-mcp
+
+# Via CLI subcommand:
+python -m web_agent serve-mcp
+```
+
+The server uses stdio transport -- it's invoked by the MCP client, not run standalone.
+
+### Exposed Tools
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `web_search` | Search the web and extract content from top results | `query: str`, `max_results: int=10` |
+| `web_fetch` | Fetch a single URL and extract main content | `url: str` |
+| `web_download` | Download a file or save a web page | `url: str`, `filename: str=None` |
+| `web_screenshot` | Take a screenshot of a page | `url: str`, `full_page: bool=False`, `path: str=None` |
+| `web_interact` | Execute a browser action sequence | `url: str`, `actions: list[dict]`, `stop_on_error: bool=True` |
+
+All tools return structured Pydantic models that auto-serialize to JSON for the client.
+
+### Claude Desktop Setup
+
+Edit `claude_desktop_config.json`:
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%AppData%\Claude\claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+Add:
+
+```json
+{
+  "mcpServers": {
+    "web_agent": {
+      "command": "python",
+      "args": ["-m", "web_agent.mcp_server"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The 5 tools should appear in the tool picker.
+
+### Claude Code Setup
+
+```bash
+claude mcp add web_agent -- python -m web_agent.mcp_server
+```
+
+Or manually edit `~/.claude.json` (or your project's `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "web_agent": {
+      "command": "python",
+      "args": ["-m", "web_agent.mcp_server"]
+    }
+  }
+}
+```
+
+### Cursor Setup
+
+Edit `~/.cursor/mcp.json` (or project-local `.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "web_agent": {
+      "command": "python",
+      "args": ["-m", "web_agent.mcp_server"]
+    }
+  }
+}
+```
+
+### Custom Config via Environment Variables
+
+All `AppConfig` fields are overridable via env vars in the MCP config:
+
+```json
+{
+  "mcpServers": {
+    "web_agent": {
+      "command": "python",
+      "args": ["-m", "web_agent.mcp_server"],
+      "env": {
+        "WEB_AGENT_LOG_LEVEL": "INFO",
+        "WEB_AGENT_BROWSER__HEADLESS": "true",
+        "WEB_AGENT_SEARCH__MAX_RESULTS": "5",
+        "WEB_AGENT_DOWNLOAD__DOWNLOAD_DIR": "/tmp/web_agent_downloads"
+      }
+    }
+  }
+}
+```
+
+See [sample_data/mcp_config_example.json](sample_data/mcp_config_example.json) for a complete example.
+
+### Testing the Server
+
+Use the MCP inspector (bundled with the `mcp` CLI):
+
+```bash
+mcp dev web_agent/mcp_server.py
+```
+
+This launches a web UI where you can invoke each tool with test inputs and see the results.
+
 ## Error Handling
 
 All exceptions inherit from `WebAgentError`:
@@ -355,7 +477,8 @@ web_agent/
   web_fetcher.py         # Page fetching with retry + smart routing
   content_extractor.py   # trafilatura -> BS4 -> raw fallback chain
   downloader.py          # Three-strategy file/page download
-  main.py                # CLI (search, fetch, download, interact, screenshot)
+  mcp_server.py          # FastMCP server exposing tools to AI clients
+  main.py                # CLI (search, fetch, download, interact, screenshot, serve-mcp)
 tests/                   # 46 tests (unit + integration)
 config.example.yaml      # Reference configuration
 sample_data/             # Test fixtures and example action sequences
