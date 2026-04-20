@@ -1,4 +1,4 @@
-# web_agent
+# webTool
 
 Professional agentic web search, fetch, download, extraction, and browser automation toolkit built on Playwright's headless Chromium.
 
