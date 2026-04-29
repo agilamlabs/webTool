@@ -30,8 +30,11 @@ from loguru import logger
 
 from .browser_manager import BrowserManager
 from .config import AppConfig
+from .correlation import get_correlation_id
+from .debug import DebugCapture
 from .models import DownloadResult, FetchStatus
-from .utils import get_random_user_agent
+from .session_manager import SessionManager
+from .utils import check_domain_allowed, get_random_user_agent
 
 # Extensions that are web pages (should be saved via page.content(), not expect_download)
 _WEB_PAGE_EXTENSIONS = frozenset({".html", ".htm", ".xhtml", ".mhtml", ".asp", ".aspx", ".php", ".jsp"})
@@ -80,25 +83,80 @@ class Downloader:
     Args:
         browser_manager: Shared browser lifecycle manager.
         config: Application configuration.
+        sessions: Optional SessionManager for persistent browser sessions.
+        debug: Optional DebugCapture for failure artifact capture.
     """
 
-    def __init__(self, browser_manager: BrowserManager, config: AppConfig) -> None:
+    def __init__(
+        self,
+        browser_manager: BrowserManager,
+        config: AppConfig,
+        sessions: Optional[SessionManager] = None,
+        debug: Optional[DebugCapture] = None,
+    ) -> None:
         self._bm = browser_manager
         self._config = config
+        self._sessions = sessions
+        self._debug = debug or DebugCapture(config)
         self._download_dir = Path(config.download.download_dir)
 
     async def download(
-        self, url: str, filename: Optional[str] = None
+        self,
+        url: str,
+        filename: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> DownloadResult:
         """Download a file or save a web page from a URL.
 
         Args:
             url: The URL to download from.
             filename: Output filename. Auto-derived from URL if not provided.
+            session_id: Optional persistent browser session for the download.
 
         Returns:
             DownloadResult with file path, size, and status.
         """
+        cid = get_correlation_id()
+
+        # Domain allow/deny gate
+        if not check_domain_allowed(url, self._config.safety):
+            host = urlparse(url).hostname or ""
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename="",
+                status=FetchStatus.BLOCKED,
+                error_message=f"Domain not allowed by SafetyConfig: {host}",
+                correlation_id=cid,
+            )
+
+        # safe_mode forbids downloads
+        if self._config.safety.safe_mode:
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename="",
+                status=FetchStatus.BLOCKED,
+                error_message="File downloads forbidden by safe_mode",
+                correlation_id=cid,
+            )
+
+        # Validate extension if a non-empty allowlist is configured
+        ext = _get_url_extension(url)
+        allowed_exts = self._config.download.allowed_extensions
+        if ext and allowed_exts and ext not in allowed_exts:
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename="",
+                status=FetchStatus.BLOCKED,
+                error_message=(
+                    f"Extension {ext} not in allowed_extensions. "
+                    f"Allowed: {sorted(allowed_exts)}"
+                ),
+                correlation_id=cid,
+            )
+
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
         if not filename:
@@ -109,29 +167,39 @@ class Downloader:
 
         # Strategy 1: Try httpx streaming (fastest)
         try:
-            return await self._download_httpx(url, filepath)
+            result = await self._download_httpx(url, filepath)
+            result.correlation_id = cid
+            return result
         except httpx.HTTPStatusError as e:
             logger.info(
                 "httpx got HTTP {code} for {url}, trying Playwright browser",
                 code=e.response.status_code,
                 url=url,
             )
+            if self._debug.enabled:
+                artifacts = self._debug.capture_no_page(
+                    e, "httpx_download", context={"url": url, "status": e.response.status_code}
+                )
         except Exception as e:
             logger.info(
                 "httpx failed for {url}: {e}, trying Playwright browser",
                 url=url,
                 e=e,
             )
+            if self._debug.enabled:
+                self._debug.capture_no_page(
+                    e, "httpx_download", context={"url": url}
+                )
 
         # Strategy 2 or 3 depending on URL type
         if _is_web_page_url(url):
-            return await self._save_page_with_playwright(url, filepath)
+            result = await self._save_page_with_playwright(url, filepath, session_id)
         else:
-            result = await self._download_with_playwright(url, filepath)
+            result = await self._download_with_playwright(url, filepath, session_id)
             if result.status != FetchStatus.SUCCESS:
-                # Binary download failed, try page save as last resort
-                return await self._save_page_with_playwright(url, filepath)
-            return result
+                result = await self._save_page_with_playwright(url, filepath, session_id)
+        result.correlation_id = cid
+        return result
 
     async def _download_httpx(self, url: str, filepath: Path) -> DownloadResult:
         """Strategy 1: Stream download using httpx (no browser needed)."""
@@ -174,36 +242,24 @@ class Downloader:
         )
 
     async def _save_page_with_playwright(
-        self, url: str, filepath: Path
+        self,
+        url: str,
+        filepath: Path,
+        session_id: Optional[str] = None,
     ) -> DownloadResult:
         """Strategy 2: Navigate with Playwright and save the rendered page content."""
         try:
-            async with self._bm.new_page(block_resources=False) as page:
-                response = await page.goto(url, wait_until="load")
-                content_type = None
-                if response:
-                    ct = response.headers.get("content-type", "")
-                    content_type = ct.split(";")[0].strip() if ct else None
-
-                html = await page.content()
-                # Save as text (HTML) or binary depending on content
-                filepath.write_text(html, encoding="utf-8")
-                size = filepath.stat().st_size
-
-                logger.info(
-                    "Saved page via Playwright: {url} -> {path} ({size} bytes)",
-                    url=url,
-                    path=filepath,
-                    size=size,
-                )
-                return DownloadResult(
-                    url=url,
-                    filepath=str(filepath),
-                    filename=filepath.name,
-                    size_bytes=size,
-                    content_type=content_type,
-                    status=FetchStatus.SUCCESS,
-                )
+            if session_id and self._sessions is not None:
+                ctx = self._sessions.get(session_id)
+                self._sessions.touch(session_id)
+                page = await ctx.new_page()
+                try:
+                    return await self._do_save_page(page, url, filepath)
+                finally:
+                    await page.close()
+            else:
+                async with self._bm.new_page(block_resources=False) as page:
+                    return await self._do_save_page(page, url, filepath)
         except Exception as e:
             error_msg = f"Page save failed: {e}"
             logger.error(error_msg)
@@ -215,32 +271,82 @@ class Downloader:
                 error_message=error_msg,
             )
 
+    async def _do_save_page(self, page, url: str, filepath: Path) -> DownloadResult:
+        """Inner page-save: navigate and write page.content() to disk."""
+        response = await page.goto(url, wait_until="load")
+        content_type = None
+        if response:
+            ct = response.headers.get("content-type", "")
+            content_type = ct.split(";")[0].strip() if ct else None
+
+        html = await page.content()
+        filepath.write_text(html, encoding="utf-8")
+        size = filepath.stat().st_size
+
+        logger.info(
+            "Saved page via Playwright: {url} -> {path} ({size} bytes)",
+            url=url,
+            path=filepath,
+            size=size,
+        )
+        return DownloadResult(
+            url=url,
+            filepath=str(filepath),
+            filename=filepath.name,
+            size_bytes=size,
+            content_type=content_type,
+            status=FetchStatus.SUCCESS,
+        )
+
     async def _download_with_playwright(
-        self, url: str, filepath: Path
+        self,
+        url: str,
+        filepath: Path,
+        session_id: Optional[str] = None,
     ) -> DownloadResult:
         """Strategy 3: Use Playwright's download event for JS-triggered downloads."""
         try:
-            async with self._bm.new_context(block_resources=False) as ctx:
+            if session_id and self._sessions is not None:
+                ctx = self._sessions.get(session_id)
+                self._sessions.touch(session_id)
                 page = await ctx.new_page()
-                async with page.expect_download(timeout=60000) as download_info:
-                    await page.goto(url)
-                download = await download_info.value
-                await download.save_as(str(filepath))
-                size = filepath.stat().st_size
+                try:
+                    async with page.expect_download(timeout=60000) as download_info:
+                        await page.goto(url)
+                    download = await download_info.value
+                    await download.save_as(str(filepath))
+                    size = filepath.stat().st_size
+                    return DownloadResult(
+                        url=url,
+                        filepath=str(filepath),
+                        filename=filepath.name,
+                        size_bytes=size,
+                        status=FetchStatus.SUCCESS,
+                    )
+                finally:
+                    await page.close()
+            else:
+                async with self._bm.new_context(block_resources=False) as ctx:
+                    page = await ctx.new_page()
+                    async with page.expect_download(timeout=60000) as download_info:
+                        await page.goto(url)
+                    download = await download_info.value
+                    await download.save_as(str(filepath))
+                    size = filepath.stat().st_size
 
-                logger.info(
-                    "Downloaded via Playwright: {url} -> {path} ({size} bytes)",
-                    url=url,
-                    path=filepath,
-                    size=size,
-                )
-                return DownloadResult(
-                    url=url,
-                    filepath=str(filepath),
-                    filename=filepath.name,
-                    size_bytes=size,
-                    status=FetchStatus.SUCCESS,
-                )
+                    logger.info(
+                        "Downloaded via Playwright: {url} -> {path} ({size} bytes)",
+                        url=url,
+                        path=filepath,
+                        size=size,
+                    )
+                    return DownloadResult(
+                        url=url,
+                        filepath=str(filepath),
+                        filename=filepath.name,
+                        size_bytes=size,
+                        status=FetchStatus.SUCCESS,
+                    )
         except Exception as e:
             error_msg = f"Browser download failed: {e}"
             logger.warning(error_msg)

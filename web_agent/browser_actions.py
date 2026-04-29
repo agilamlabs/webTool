@@ -28,13 +28,16 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from loguru import logger
-from playwright.async_api import Dialog, Page
+from playwright.async_api import Dialog, Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from .browser_manager import BrowserManager
 from .config import AppConfig
+from .correlation import get_correlation_id
+from .debug import DebugCapture
 from .models import (
     Action,
     ActionResult,
@@ -48,6 +51,7 @@ from .models import (
     FillInput,
     HoverInput,
     KeyboardInput,
+    LocatorSpec,
     NavigateDirection,
     NavigateInput,
     ScreenshotFormat,
@@ -56,10 +60,77 @@ from .models import (
     ScrollDirection,
     ScrollInput,
     SelectInput,
+    SelectorLike,
     TypeInput,
     WaitInput,
     WaitTarget,
 )
+from .session_manager import SessionManager
+from .utils import check_domain_allowed
+
+
+# Heuristic CSS patterns that look like submit buttons (used by safe_mode)
+_SUBMIT_BUTTON_HINTS = (
+    "button[type=submit]",
+    "button[type='submit']",
+    'button[type="submit"]',
+    "input[type=submit]",
+    "input[type='submit']",
+    'input[type="submit"]',
+)
+
+
+def _looks_like_submit(selector: SelectorLike | None) -> bool:
+    """Best-effort heuristic: does this selector look like a submit button?"""
+    if selector is None:
+        return False
+    if isinstance(selector, LocatorSpec):
+        if selector.role == "button" and selector.role_name:
+            name_lower = selector.role_name.lower()
+            return any(
+                kw in name_lower for kw in ("submit", "send", "save", "log in", "sign in")
+            )
+        # Check selector field of LocatorSpec
+        sel_str = (selector.selector or "").lower()
+    else:
+        sel_str = selector.lower()
+    return any(hint in sel_str for hint in _SUBMIT_BUTTON_HINTS)
+
+
+def _selector_repr(selector: SelectorLike | None) -> Optional[str]:
+    """Render a selector value for inclusion in ActionResult.selector (a str field)."""
+    if selector is None:
+        return None
+    if isinstance(selector, LocatorSpec):
+        return selector.model_dump_json(exclude_none=True)
+    return selector
+
+
+def _resolve_locator(page: Page, spec: SelectorLike) -> Locator:
+    """Convert a CSS selector string or LocatorSpec into a Playwright Locator.
+
+    Resolution priority for LocatorSpec (first non-None wins):
+        role > test_id > label > placeholder > text > selector
+    """
+    if isinstance(spec, str):
+        return page.locator(spec)
+
+    if spec.role:
+        if spec.role_name:
+            return page.get_by_role(spec.role, name=spec.role_name)
+        return page.get_by_role(spec.role)
+    if spec.test_id:
+        return page.get_by_test_id(spec.test_id)
+    if spec.label:
+        return page.get_by_label(spec.label)
+    if spec.placeholder:
+        return page.get_by_placeholder(spec.placeholder)
+    if spec.text:
+        return page.get_by_text(spec.text)
+    if spec.selector:
+        return page.locator(spec.selector)
+
+    raise ValueError("LocatorSpec is empty (no selector field set)")
 
 
 class _DialogState:
@@ -91,11 +162,21 @@ class BrowserActions:
     Args:
         browser_manager: The shared browser lifecycle manager.
         config: Application configuration.
+        sessions: Optional SessionManager for persistent browser sessions.
+        debug: Optional DebugCapture for failure artifact capture.
     """
 
-    def __init__(self, browser_manager: BrowserManager, config: AppConfig) -> None:
+    def __init__(
+        self,
+        browser_manager: BrowserManager,
+        config: AppConfig,
+        sessions: Optional[SessionManager] = None,
+        debug: Optional[DebugCapture] = None,
+    ) -> None:
         self._bm = browser_manager
         self._config = config
+        self._sessions = sessions
+        self._debug = debug or DebugCapture(config)
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,6 +187,7 @@ class BrowserActions:
         url: str,
         actions: list[Action],
         stop_on_error: bool | None = None,
+        session_id: Optional[str] = None,
     ) -> ActionSequenceResult:
         """Navigate to a URL and execute an ordered list of browser actions.
 
@@ -114,10 +196,75 @@ class BrowserActions:
             actions: Ordered list of action inputs to execute.
             stop_on_error: If ``True``, halt on first failure and mark remaining
                 actions as SKIPPED. ``None`` reads from config.
+            session_id: Optional persistent browser session for the entire sequence.
 
         Returns:
             ActionSequenceResult with per-action results and aggregate counts.
         """
+        cid = get_correlation_id()
+
+        # Domain allow/deny gate on the starting URL
+        if not check_domain_allowed(url, self._config.safety):
+            host = urlparse(url).hostname or ""
+            return ActionSequenceResult(
+                url=url,
+                actions_total=len(actions),
+                actions_failed=len(actions),
+                results=[
+                    ActionResult(
+                        action=ActionType(a.action),
+                        status=ActionStatus.SKIPPED,
+                        selector=_selector_repr(getattr(a, "selector", None)),
+                        error_message=f"Domain not allowed: {host}",
+                    )
+                    for a in actions
+                ],
+                correlation_id=cid,
+            )
+
+        # Pre-flight safe_mode checks: forbid evaluate + submit-button clicks
+        if self._config.safety.safe_mode:
+            for a in actions:
+                if isinstance(a, EvaluateInput):
+                    return ActionSequenceResult(
+                        url=url,
+                        actions_total=len(actions),
+                        actions_failed=len(actions),
+                        results=[
+                            ActionResult(
+                                action=ActionType(act.action),
+                                status=ActionStatus.SKIPPED,
+                                selector=_selector_repr(
+                                    getattr(act, "selector", None)
+                                ),
+                                error_message="safe_mode forbids EvaluateInput (custom JS)",
+                            )
+                            for act in actions
+                        ],
+                        correlation_id=cid,
+                    )
+                if isinstance(a, ClickInput) and _looks_like_submit(a.selector):
+                    return ActionSequenceResult(
+                        url=url,
+                        actions_total=len(actions),
+                        actions_failed=len(actions),
+                        results=[
+                            ActionResult(
+                                action=ActionType(act.action),
+                                status=ActionStatus.SKIPPED,
+                                selector=_selector_repr(
+                                    getattr(act, "selector", None)
+                                ),
+                                error_message=(
+                                    "safe_mode forbids clicking submit-typed buttons "
+                                    "(form submission heuristic)"
+                                ),
+                            )
+                            for act in actions
+                        ],
+                        correlation_id=cid,
+                    )
+
         should_stop = (
             stop_on_error
             if stop_on_error is not None
@@ -127,41 +274,62 @@ class BrowserActions:
         results: list[ActionResult] = []
         succeeded = 0
         failed = 0
+        all_artifacts: list[str] = []
 
         # Per-sequence dialog state (thread-safe - not shared across sequences)
         dialog_state = _DialogState()
 
-        async with self._bm.new_page(block_resources=False) as page:
+        # Acquire page from session or ephemeral context
+        if session_id and self._sessions is not None:
+            ctx = self._sessions.get(session_id)
+            self._sessions.touch(session_id)
+            page = await ctx.new_page()
+            owner = "session"
+        else:
+            ctx_mgr = self._bm.new_page(block_resources=False)
+            page = await ctx_mgr.__aenter__()
+            owner = "ephemeral"
+
+        try:
             await page.goto(url, wait_until="domcontentloaded")
             page.on("dialog", dialog_state.handle)
-            # Store dialog_state on page for _do_dialog to access
             page._web_agent_dialog_state = dialog_state  # type: ignore[attr-defined]
 
             for action_input in actions:
-                # Optional delay between actions
                 if self._config.automation.slow_mo_actions > 0:
                     await asyncio.sleep(
                         self._config.automation.slow_mo_actions / 1000
                     )
 
                 result = await self.execute_action(page, action_input)
+                if result.debug_artifacts:
+                    all_artifacts.extend(result.debug_artifacts)
                 results.append(result)
 
-                if result.status in (ActionStatus.SUCCESS,):
+                if result.status == ActionStatus.SUCCESS:
                     succeeded += 1
                 else:
                     failed += 1
                     if should_stop:
-                        # Mark remaining actions as skipped
-                        for remaining in actions[len(results) :]:
+                        for remaining in actions[len(results):]:
                             results.append(
                                 ActionResult(
                                     action=ActionType(remaining.action),
                                     status=ActionStatus.SKIPPED,
-                                    selector=getattr(remaining, "selector", None),
+                                    selector=_selector_repr(
+                                        getattr(remaining, "selector", None)
+                                    ),
                                 )
                             )
                         break
+        finally:
+            if owner == "session":
+                try:
+                    await page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                await ctx_mgr.__aexit__(None, None, None)
 
         elapsed = (time.perf_counter() - start) * 1000
         return ActionSequenceResult(
@@ -171,12 +339,15 @@ class BrowserActions:
             actions_failed=failed,
             results=results,
             total_time_ms=elapsed,
+            correlation_id=cid,
+            debug_artifacts=all_artifacts,
         )
 
     async def execute_action(self, page: Page, action_input: Action) -> ActionResult:
         """Execute a single action on a page. Catches errors and returns structured result."""
         action_type = ActionType(action_input.action)
         handler = self._dispatch.get(action_type)
+        sel_repr = _selector_repr(getattr(action_input, "selector", None))
         if not handler:
             return ActionResult(
                 action=action_type,
@@ -190,20 +361,32 @@ class BrowserActions:
             result.duration_ms = (time.perf_counter() - start) * 1000
             return result
         except PlaywrightTimeout as e:
+            artifacts: list[str] = []
+            if self._debug.enabled:
+                artifacts = await self._debug.capture_page(
+                    page, e, action_type.value, context={"selector": sel_repr}
+                )
             return ActionResult(
                 action=action_type,
                 status=ActionStatus.TIMEOUT,
-                selector=getattr(action_input, "selector", None),
+                selector=sel_repr,
                 duration_ms=(time.perf_counter() - start) * 1000,
                 error_message=str(e),
+                debug_artifacts=artifacts,
             )
         except Exception as e:
+            artifacts = []
+            if self._debug.enabled:
+                artifacts = await self._debug.capture_page(
+                    page, e, action_type.value, context={"selector": sel_repr}
+                )
             return ActionResult(
                 action=action_type,
                 status=ActionStatus.FAILED,
-                selector=getattr(action_input, "selector", None),
+                selector=sel_repr,
                 duration_ms=(time.perf_counter() - start) * 1000,
                 error_message=str(e),
+                debug_artifacts=artifacts,
             )
 
     async def take_screenshot(
@@ -213,8 +396,21 @@ class BrowserActions:
         full_page: bool = False,
         format: ScreenshotFormat = ScreenshotFormat.PNG,
         quality: int | None = None,
+        session_id: Optional[str] = None,
     ) -> ScreenshotResult:
         """Convenience: navigate to URL and take a screenshot."""
+        cid = get_correlation_id()
+
+        if not check_domain_allowed(url, self._config.safety):
+            host = urlparse(url).hostname or ""
+            return ScreenshotResult(
+                url=url,
+                path="",
+                format=format,
+                status=ActionStatus.FAILED,
+                correlation_id=cid,
+            )
+
         ss_dir = Path(self._config.automation.screenshot_dir)
         ss_dir.mkdir(parents=True, exist_ok=True)
 
@@ -223,7 +419,7 @@ class BrowserActions:
             safe_url = "".join(c if c.isalnum() else "_" for c in url)[:50]
             path = str(ss_dir / f"{safe_url}.{ext}")
 
-        async with self._bm.new_page(block_resources=False) as page:
+        async def _capture(page: Page) -> None:
             await page.goto(url, wait_until="networkidle")
             ss_kwargs: dict[str, Any] = {
                 "path": path,
@@ -234,6 +430,18 @@ class BrowserActions:
                 ss_kwargs["quality"] = quality
             await page.screenshot(**ss_kwargs)
 
+        if session_id and self._sessions is not None:
+            ctx = self._sessions.get(session_id)
+            self._sessions.touch(session_id)
+            page = await ctx.new_page()
+            try:
+                await _capture(page)
+            finally:
+                await page.close()
+        else:
+            async with self._bm.new_page(block_resources=False) as page:
+                await _capture(page)
+
         size = Path(path).stat().st_size
         logger.info("Screenshot saved: {path} ({size} bytes)", path=path, size=size)
         return ScreenshotResult(
@@ -242,6 +450,7 @@ class BrowserActions:
             format=format,
             size_bytes=size,
             status=ActionStatus.SUCCESS,
+            correlation_id=cid,
         )
 
     # ------------------------------------------------------------------
@@ -254,41 +463,53 @@ class BrowserActions:
     async def _do_click(self, page: Page, action: ClickInput) -> ActionResult:
         timeout = self._resolve_timeout(action.timeout)
         click_count = 2 if action.double_click else 1
-        await page.click(
-            action.selector,
+        loc = _resolve_locator(page, action.selector)
+        await loc.click(
             button=action.button.value,
             click_count=click_count,
             modifiers=action.modifiers if action.modifiers else None,
             timeout=timeout,
         )
-        logger.debug("Clicked {sel}", sel=action.selector)
+        sel_repr = _selector_repr(action.selector)
+        logger.debug("Clicked {sel}", sel=sel_repr)
         return ActionResult(
             action=ActionType.CLICK,
             status=ActionStatus.SUCCESS,
-            selector=action.selector,
+            selector=sel_repr,
         )
 
     async def _do_type(self, page: Page, action: TypeInput) -> ActionResult:
         timeout = self._resolve_timeout(action.timeout)
+        loc = _resolve_locator(page, action.selector)
         if action.clear_first:
-            await page.fill(action.selector, "", timeout=timeout)
-        await page.type(action.selector, action.text, delay=action.delay, timeout=timeout)
-        logger.debug("Typed into {sel}", sel=action.selector)
+            await loc.fill("", timeout=timeout)
+        # Locator API: fill() then type() doesn't exist as a single combo;
+        # for type-with-keystrokes use locator.press_sequentially when available,
+        # else fall back to keyboard.type after focus.
+        if hasattr(loc, "press_sequentially"):
+            await loc.press_sequentially(action.text, delay=action.delay, timeout=timeout)
+        else:
+            await loc.click(timeout=timeout)
+            await page.keyboard.type(action.text, delay=action.delay)
+        sel_repr = _selector_repr(action.selector)
+        logger.debug("Typed into {sel}", sel=sel_repr)
         return ActionResult(
             action=ActionType.TYPE,
             status=ActionStatus.SUCCESS,
-            selector=action.selector,
+            selector=sel_repr,
             data={"text_length": len(action.text)},
         )
 
     async def _do_fill(self, page: Page, action: FillInput) -> ActionResult:
         timeout = self._resolve_timeout(action.timeout)
-        await page.fill(action.selector, action.value, timeout=timeout)
-        logger.debug("Filled {sel}", sel=action.selector)
+        loc = _resolve_locator(page, action.selector)
+        await loc.fill(action.value, timeout=timeout)
+        sel_repr = _selector_repr(action.selector)
+        logger.debug("Filled {sel}", sel=sel_repr)
         return ActionResult(
             action=ActionType.FILL,
             status=ActionStatus.SUCCESS,
-            selector=action.selector,
+            selector=sel_repr,
         )
 
     async def _do_scroll(self, page: Page, action: ScrollInput) -> ActionResult:
@@ -296,13 +517,14 @@ class BrowserActions:
 
         # Mode 1: Scroll element into view
         if action.selector:
-            loc = page.locator(action.selector)
+            loc = _resolve_locator(page, action.selector)
             await loc.scroll_into_view_if_needed(timeout=timeout)
-            logger.debug("Scrolled {sel} into view", sel=action.selector)
+            sel_repr = _selector_repr(action.selector)
+            logger.debug("Scrolled {sel} into view", sel=sel_repr)
             return ActionResult(
                 action=ActionType.SCROLL,
                 status=ActionStatus.SUCCESS,
-                selector=action.selector,
+                selector=sel_repr,
             )
 
         # Mode 2: Infinite scroll
@@ -359,7 +581,7 @@ class BrowserActions:
             ss_kwargs["quality"] = action.quality
 
         if action.selector:
-            loc = page.locator(action.selector)
+            loc = _resolve_locator(page, action.selector)
             await loc.screenshot(**ss_kwargs)
         else:
             ss_kwargs["full_page"] = action.full_page
@@ -370,7 +592,7 @@ class BrowserActions:
         return ActionResult(
             action=ActionType.SCREENSHOT,
             status=ActionStatus.SUCCESS,
-            selector=action.selector,
+            selector=_selector_repr(action.selector),
             data={"path": path, "size_bytes": size},
         )
 
@@ -414,16 +636,19 @@ class BrowserActions:
 
     async def _do_hover(self, page: Page, action: HoverInput) -> ActionResult:
         timeout = self._resolve_timeout(action.timeout)
-        await page.hover(action.selector, timeout=timeout)
-        logger.debug("Hovered {sel}", sel=action.selector)
+        loc = _resolve_locator(page, action.selector)
+        await loc.hover(timeout=timeout)
+        sel_repr = _selector_repr(action.selector)
+        logger.debug("Hovered {sel}", sel=sel_repr)
         return ActionResult(
             action=ActionType.HOVER,
             status=ActionStatus.SUCCESS,
-            selector=action.selector,
+            selector=sel_repr,
         )
 
     async def _do_select(self, page: Page, action: SelectInput) -> ActionResult:
         timeout = self._resolve_timeout(action.timeout)
+        sel_repr = _selector_repr(action.selector)
         kwargs: dict[str, Any] = {"timeout": timeout}
         if action.value is not None:
             kwargs["value"] = action.value
@@ -435,15 +660,16 @@ class BrowserActions:
             return ActionResult(
                 action=ActionType.SELECT,
                 status=ActionStatus.FAILED,
-                selector=action.selector,
+                selector=sel_repr,
                 error_message="Must specify value, label, or index",
             )
-        await page.select_option(action.selector, **kwargs)
-        logger.debug("Selected option in {sel}", sel=action.selector)
+        loc = _resolve_locator(page, action.selector)
+        await loc.select_option(**kwargs)
+        logger.debug("Selected option in {sel}", sel=sel_repr)
         return ActionResult(
             action=ActionType.SELECT,
             status=ActionStatus.SUCCESS,
-            selector=action.selector,
+            selector=sel_repr,
         )
 
     async def _do_keyboard(self, page: Page, action: KeyboardInput) -> ActionResult:

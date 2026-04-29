@@ -11,10 +11,17 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 - **Content Extraction** -- Three-tier fallback: trafilatura (F1 ~0.958) -> BeautifulSoup4 -> raw text
 - **File Download** -- Three strategies: httpx streaming -> Playwright page save -> Playwright JS download
 - **Browser Automation** -- 12 action types composable into scripted sequences
+- **Semantic Locators** -- Find elements by ARIA role, label, text, or test_id (not just CSS)
+- **Browser Sessions** -- Persistent named contexts retain cookies/login across multi-call workflows
+- **High-Level Recipes** -- `search_and_open_best_result`, `find_and_download_file`, `web_research`
+- **Safety Controls** -- Domain allow/deny lists, safe_mode, per-call budgets (pages/chars/time)
+- **Retry Profiles** -- Declarative `fast`/`balanced`/`paranoid` retry policies
+- **Debug Mode** -- Auto-capture HTML/screenshot/error JSON on failures
+- **Correlation IDs** -- Trace single requests across all subsystems via auto-injected log fields
 - **Screenshots** -- Viewport, full-page, or element-specific captures
 - **Anti-Detection** -- playwright-stealth, user-agent rotation, resource blocking
 - **Structured Output** -- All results are Pydantic v2 models serializable to JSON
-- **MCP Server** -- Built-in MCP server exposes all capabilities to Claude Desktop, Claude Code, Cursor, and other MCP-compatible AI clients
+- **MCP Server** -- 11 tools exposed to Claude Desktop, Claude Code, Cursor, and other MCP-compatible AI clients
 
 ## Installation
 
@@ -139,7 +146,8 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `search` | `language` | `"en"` | Search language |
 | `search` | `region` | `"us"` | Search region |
 | `fetch` | `wait_until` | `"networkidle"` | Wait condition (`networkidle`, `load`, `domcontentloaded`) |
-| `fetch` | `max_retries` | `3` | Retry count for transient failures |
+| `fetch` | `retry_policy` | `"balanced"` | Profile: `fast` / `balanced` / `paranoid` |
+| `fetch` | `max_retries` | `3` | Retry count (overrides policy when set) |
 | `fetch` | `retry_base_delay` | `1.0` | Base delay (seconds) for exponential backoff |
 | `download` | `download_dir` | `"./downloads"` | Directory for downloaded files |
 | `download` | `max_file_size_mb` | `100` | Maximum file size limit |
@@ -149,6 +157,16 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `automation` | `default_action_timeout` | `10000` | Timeout per browser action (ms) |
 | `automation` | `screenshot_dir` | `"./screenshots"` | Directory for screenshots |
 | `automation` | `stop_on_error` | `true` | Halt action sequence on first failure |
+| `safety` | `allowed_domains` | `[]` | Suffix-match allow-list (empty = allow all) |
+| `safety` | `denied_domains` | `[]` | Suffix-match deny-list (takes precedence) |
+| `safety` | `safe_mode` | `false` | Block downloads, JS eval, submit clicks |
+| `safety` | `max_pages_per_call` | `50` | Pages-per-call budget |
+| `safety` | `max_chars_per_call` | `1000000` | Chars-per-call extraction budget |
+| `safety` | `max_time_per_call_seconds` | `300` | Wall-clock budget per Agent call |
+| `debug` | `enabled` | `false` | Auto-capture HTML/screenshot/JSON on failures |
+| `debug` | `debug_dir` | `"./debug"` | Directory for failure artifacts |
+| `debug` | `capture_html` | `true` | Save HTML snapshot on failure |
+| `debug` | `capture_screenshot` | `true` | Save PNG snapshot on failure |
 
 ## API Reference
 
@@ -291,6 +309,162 @@ Agent (orchestrator)
 - `networkidle` timeouts automatically fall back to `load` wait state
 - HTTP 4xx errors fail immediately; 5xx errors retry with exponential backoff
 
+## Browser Sessions
+
+Persistent browser sessions retain cookies, localStorage, and origin tokens across multiple Agent calls -- ideal for login flows, multi-step workflows, or any task that needs continuity.
+
+```python
+async with Agent() as agent:
+    # Step 1: log in once
+    sid = await agent.create_session(name="my-app")
+    await agent.interact("https://app.example.com/login", [
+        FillInput(selector="#user", value="me"),
+        FillInput(selector="#pass", value="secret"),
+        ClickInput(selector="button[type=submit]"),
+    ], session_id=sid)
+
+    # Step 2: subsequent calls reuse cookies
+    dashboard = await agent.fetch_and_extract(
+        "https://app.example.com/dashboard", session_id=sid
+    )
+    report = await agent.download(
+        "https://app.example.com/reports/q4.pdf", session_id=sid
+    )
+
+    await agent.close_session(sid)
+```
+
+In MCP, the equivalent flow is `create_browser_session` -> `web_interact(...session_id=sid)` -> `web_fetch(...session_id=sid)` -> `close_browser_session`.
+
+## Safety Controls
+
+`SafetyConfig` provides domain allow/deny lists, safe mode, and per-call budgets:
+
+```python
+from web_agent import Agent, AppConfig
+
+config = AppConfig(safety={
+    "allowed_domains": ["wikipedia.org", "arxiv.org"],
+    "denied_domains": ["malicious.example.com"],
+    "safe_mode": True,            # blocks downloads, JS eval, submit clicks
+    "max_pages_per_call": 10,
+    "max_chars_per_call": 500_000,
+    "max_time_per_call_seconds": 60.0,
+})
+async with Agent(config) as agent:
+    ...
+```
+
+| Field | Default | Effect |
+|---|---|---|
+| `allowed_domains` | `[]` (allow all) | Suffix-match patterns; empty allows everything |
+| `denied_domains` | `[]` | Always blocked, takes precedence over allow-list |
+| `safe_mode` | `false` | Blocks file downloads, `EvaluateInput`, submit-button clicks |
+| `max_pages_per_call` | `50` | Stops fetching after N pages |
+| `max_chars_per_call` | `1_000_000` | Stops extracting after total chars exceeded |
+| `max_time_per_call_seconds` | `300` | Wall-clock cutoff per Agent call |
+
+Blocked URLs return `FetchStatus.BLOCKED` with a clear `error_message`. Budget exhaustion raises `BudgetExceededError` (caught and added to `errors[]` in `AgentResult`).
+
+## High-Level Recipes
+
+Three composite workflows AI agents can call directly without orchestrating primitives:
+
+```python
+# Recipe 1: search + rank + fetch top hit
+result = await agent.search_and_open_best_result("FastAPI tutorial 2024")
+print(result.title, result.content[:500])
+
+# Recipe 2: search + locate file + download
+dl = await agent.find_and_download_file(
+    "Tesla 10-K annual report 2024", file_types=["pdf"]
+)
+print(f"Saved: {dl.filepath} ({dl.size_bytes} bytes)")
+
+# Recipe 3: multi-page research with citations
+research = await agent.web_research("vector databases comparison", max_pages=5)
+for c in research.citations:
+    print(f"[{c.relevance_score:.2f}] {c.title} -- {c.url}")
+```
+
+`search_and_open_best_result` ranking schemes:
+- `default` -- query overlap + HTTPS bonus + well-known domain bonus + position tiebreaker
+- `overlap` -- pure token overlap
+- `position` -- inverse search engine rank
+
+## Semantic Locators
+
+Beyond CSS selectors, browser automation actions accept `LocatorSpec` for AI-friendly element targeting:
+
+```python
+from web_agent.models import ClickInput, FillInput, LocatorSpec
+
+# All three are equivalent ways to target the same element:
+ClickInput(selector="button.submit-btn")                          # CSS
+ClickInput(selector=LocatorSpec(role="button", role_name="Submit"))  # ARIA role
+ClickInput(selector=LocatorSpec(text="Submit"))                   # visible text
+
+# More options:
+FillInput(selector=LocatorSpec(label="Email"), value="me@example.com")
+FillInput(selector=LocatorSpec(placeholder="Search..."), value="query")
+ClickInput(selector=LocatorSpec(test_id="login-button"))
+```
+
+In JSON (and MCP `web_interact`), pass either a string or a `LocatorSpec` object:
+
+```json
+{"action": "click", "selector": {"role": "button", "role_name": "Submit"}}
+```
+
+Resolution priority: `role` > `test_id` > `label` > `placeholder` > `text` > `selector`.
+
+## Retry Policies
+
+Declarative retry profiles via `FetchConfig.retry_policy`:
+
+| Policy | Retries | Base | Max | Use case |
+|---|---|---|---|---|
+| `fast` | 1 | 0.5s | 5s | Latency-sensitive flows; quick failure preferred |
+| `balanced` (default) | 3 | 1s | 30s | General-purpose |
+| `paranoid` | 5 | 2s | 60s | Flaky targets where eventual success matters |
+
+```python
+config = AppConfig(fetch={"retry_policy": "paranoid"})
+```
+
+Numeric overrides win over the policy: `AppConfig(fetch={"retry_policy": "fast", "max_retries": 7})` keeps `fast`'s base/max delays but uses 7 retries.
+
+## Debug Mode
+
+When enabled, every fetch/action/download failure auto-captures HTML, a screenshot, and an error JSON to `debug_dir/{correlation_id}/{timestamp}-{label}.{ext}`:
+
+```python
+config = AppConfig(debug={"enabled": True, "debug_dir": "/tmp/web_agent_debug"})
+async with Agent(config) as agent:
+    result = await agent.fetch_and_extract("https://flaky-site.example.com")
+    if result.extraction_method == "none":
+        print("Failed; debug artifacts:", result.debug_artifacts)
+```
+
+Result models gain a `debug_artifacts: list[str]` field with the saved file paths.
+
+## Correlation IDs
+
+Every public Agent method generates a UUID4 correlation id. The id is:
+
+- Echoed back on every result model (`result.correlation_id`)
+- Auto-injected into every `loguru` log record's `extra["cid"]` field
+- Carried through retries, fetches, extractions, and recipe sub-calls
+
+To use it in your own log format:
+
+```python
+from loguru import logger
+import sys
+logger.remove()
+logger.add(sys.stderr, format="{time} | {extra[cid]} | {message}")
+```
+
 ## MCP Integration
 
 Run `web_agent` as an MCP (Model Context Protocol) server so Claude Desktop, Claude Code, Cursor, and any other MCP-compatible AI client can use it directly as a tool. The browser stays warm across tool calls within a session (skips ~5-10s startup per call after the first).
@@ -310,17 +484,35 @@ python -m web_agent serve-mcp
 
 The server uses stdio transport -- it's invoked by the MCP client, not run standalone.
 
-### Exposed Tools
+### Exposed Tools (11 total)
+
+**Single-shot tools** -- one URL or query, one result:
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
-| `web_search` | Search the web and extract content from top results | `query: str`, `max_results: int=10` |
-| `web_fetch` | Fetch a single URL and extract main content | `url: str` |
-| `web_download` | Download a file or save a web page | `url: str`, `filename: str=None` |
-| `web_screenshot` | Take a screenshot of a page | `url: str`, `full_page: bool=False`, `path: str=None` |
-| `web_interact` | Execute a browser action sequence | `url: str`, `actions: list[dict]`, `stop_on_error: bool=True` |
+| `web_search` | Search the web and extract content from top results | `query`, `max_results=10`, `session_id=None` |
+| `web_fetch` | Fetch a single URL and extract main content | `url`, `session_id=None` |
+| `web_download` | Download a file or save a web page | `url`, `filename=None`, `session_id=None` |
+| `web_screenshot` | Take a screenshot of a page | `url`, `full_page=False`, `path=None`, `session_id=None` |
+| `web_interact` | Execute a browser action sequence | `url`, `actions: list[dict]`, `stop_on_error=True`, `session_id=None` |
 
-All tools return structured Pydantic models that auto-serialize to JSON for the client.
+**High-level recipes** -- composite workflows for common goals:
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `web_search_best` | Search, rank results, return extracted top hit | `query`, `ranking="default"`, `session_id=None` |
+| `web_find_and_download` | Search and download first matching file | `query`, `file_types=["pdf"]`, `session_id=None` |
+| `web_research` | Multi-page research with citations | `query`, `max_pages=5`, `depth=1`, `session_id=None` |
+
+**Browser session management** -- retain cookies/login across calls:
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `create_browser_session` | Create a persistent browser session | `name=None` |
+| `close_browser_session` | Close a session and free resources | `session_id` |
+| `list_browser_sessions` | List all live sessions | -- |
+
+All tools return structured Pydantic models that auto-serialize to JSON for the client. Every tool accepts an optional `session_id` to reuse a persistent browser context for cookie/login continuity.
 
 ### Claude Desktop Setup
 
@@ -432,15 +624,18 @@ Exception hierarchy:
 
 ```
 WebAgentError
-  |-- BrowserError           Browser launch/context failures
-  |-- NavigationError        Page load, timeout, blocked
-  |-- ExtractionError        Content extraction failures
-  |-- SearchError            Search engine failures
-  |-- DownloadError          File download failures
-  |-- ActionError            Browser action failures
+  |-- BrowserError              Browser launch/context failures
+  |-- NavigationError           Page load, timeout, blocked
+  |-- ExtractionError           Content extraction failures
+  |-- SearchError               Search engine failures
+  |-- DownloadError             File download failures
+  |-- ActionError               Browser action failures
   |     |-- ActionTimeoutError
   |     `-- SelectorNotFoundError
-  `-- ConfigError            Configuration validation failures
+  |-- DomainNotAllowedError     URL host not in allow-list / matches deny-list
+  |-- BudgetExceededError       Per-call budget (pages/chars/time) hit
+  |-- SafeModeBlockedError      Operation forbidden by safe_mode
+  `-- ConfigError               Configuration validation failures
 ```
 
 ## Docker
@@ -459,13 +654,16 @@ CMD ["python", "-m", "web_agent", "search", "example query"]
 ## Testing
 
 ```bash
-# Run all 46 tests
+# Run all 111 tests
 python -m pytest -v
 
-# Unit tests only (no network)
-python -m pytest tests/test_models.py tests/test_content_extractor.py -v
+# Unit tests only (no network) -- 90 tests, runs in <1 second
+python -m pytest tests/test_models.py tests/test_content_extractor.py \
+                 tests/test_correlation.py tests/test_retry_policies.py \
+                 tests/test_safety.py tests/test_locators.py \
+                 tests/test_recipes.py -v
 
-# Integration tests (requires network + Chromium)
+# Integration tests (requires network + Chromium) -- 21 tests, ~2 minutes
 python -m pytest tests/test_agent.py tests/test_browser_actions.py -v
 ```
 
@@ -473,21 +671,26 @@ python -m pytest tests/test_agent.py tests/test_browser_actions.py -v
 
 ```
 web_agent/
-  __init__.py            # v1.0.0, public API exports
+  __init__.py            # v1.1.0, public API exports (49 names)
   py.typed               # PEP 561 type checking support
-  exceptions.py          # Exception hierarchy
+  exceptions.py          # Exception hierarchy (12 classes)
   config.py              # Programmatic + env var + YAML configuration
-  models.py              # 25+ Pydantic v2 models
+  models.py              # 30+ Pydantic v2 models (incl. LocatorSpec, SessionInfo, Citation, ResearchResult)
+  utils.py               # Retry decorator, RetryPolicy, BudgetTracker, domain checks
+  correlation.py         # ContextVar-based correlation IDs + loguru patcher
+  debug.py               # DebugCapture for failure HTML/screenshot/JSON snapshots
   agent.py               # Main entry point (Agent class)
-  browser_manager.py     # Chromium lifecycle, stealth, semaphore pool
-  browser_actions.py     # 12 automation action handlers
+  browser_manager.py     # Chromium lifecycle, stealth, semaphore + persistent contexts
+  browser_actions.py     # 12 automation action handlers + semantic locators
+  session_manager.py     # Persistent named BrowserContext sessions
   search_engine.py       # Google + DuckDuckGo search
-  web_fetcher.py         # Page fetching with retry + smart routing
+  web_fetcher.py         # Page fetching with retry, safety, debug, sessions
   content_extractor.py   # trafilatura -> BS4 -> raw fallback chain
-  downloader.py          # Three-strategy file/page download
-  mcp_server.py          # FastMCP server exposing tools to AI clients
+  downloader.py          # Three-strategy file/page download with safety + sessions
+  recipes.py             # High-level recipes (search_and_open_best, find_and_download, web_research)
+  mcp_server.py          # FastMCP server with 11 tools
   main.py                # CLI (search, fetch, download, interact, screenshot, serve-mcp)
-tests/                   # 46 tests (unit + integration)
+tests/                   # 111 tests (90 unit + 21 integration)
 config.example.yaml      # Reference configuration
 sample_data/             # Test fixtures and example action sequences
 ```

@@ -17,9 +17,11 @@ search:
 
 fetch:
   wait_until: "networkidle"
-  max_retries: 3
-  retry_base_delay: 1.0
-  retry_max_delay: 30.0
+  retry_policy: "balanced"          # fast | balanced | paranoid
+  # Numeric overrides win when explicitly set; uncomment to override the policy:
+  # max_retries: 3
+  # retry_base_delay: 1.0
+  # retry_max_delay: 30.0
   non_retryable_status_codes: [400, 401, 403, 404, 405, 410, 451]
 
 download:
@@ -38,3 +40,23 @@ automation:
   screenshot_quality: 80
   stop_on_error: true
   slow_mo_actions: 0
+
+# Domain allow/deny lists, safe mode, and per-call budget knobs.
+# Empty allowed_domains = allow all (subject to denied_domains).
+# Domain patterns use suffix-match: "example.com" matches "api.example.com".
+safety:
+  allowed_domains: []
+  denied_domains: []
+  safe_mode: false                  # forbids downloads, custom JS, submit-button clicks
+  max_pages_per_call: 50
+  max_chars_per_call: 1000000
+  max_time_per_call_seconds: 300
+
+# Auto-capture HTML/screenshot/error JSON on failures.
+# Artifacts saved to debug_dir/{correlation_id}/{timestamp}-{label}.{ext}
+debug:
+  enabled: false
+  debug_dir: "./debug"
+  capture_html: true
+  capture_screenshot: true
+  max_artifacts_per_call: 5

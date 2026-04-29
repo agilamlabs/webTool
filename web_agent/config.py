@@ -54,17 +54,46 @@ class SearchConfig(BaseSettings):
 
 
 class FetchConfig(BaseSettings):
-    """Page fetching, rendering wait conditions, and retry settings."""
+    """Page fetching, rendering wait conditions, and retry settings.
+
+    Use ``retry_policy`` for declarative retry profiles
+    (``"fast"`` | ``"balanced"`` | ``"paranoid"``).  When ``retry_policy``
+    is set and the numeric retry fields (``max_retries``/``retry_base_delay``/
+    ``retry_max_delay``) are left at their defaults, the policy values
+    are applied automatically.  If the user explicitly sets any numeric
+    retry field, it overrides the policy.
+    """
 
     wait_until: str = "networkidle"
     wait_for_selector: Optional[str] = None
     extra_wait_ms: int = 0
+    retry_policy: str = "balanced"  # fast | balanced | paranoid
     max_retries: int = 3
     retry_base_delay: float = 1.0
     retry_max_delay: float = 30.0
     non_retryable_status_codes: list[int] = Field(
         default_factory=lambda: [400, 401, 403, 404, 405, 410, 451]
     )
+
+    @model_validator(mode="after")
+    def _apply_retry_policy(self) -> FetchConfig:
+        """Apply named retry policy unless user explicitly set numeric fields."""
+        # Default policy values (matches BALANCED). If any numeric retry field
+        # was explicitly set to something different, that means the user
+        # provided it -- skip policy application to preserve their choice.
+        explicit = self.model_fields_set
+        numeric_keys = {"max_retries", "retry_base_delay", "retry_max_delay"}
+        user_set_numeric = bool(explicit & numeric_keys)
+
+        if not user_set_numeric and self.retry_policy != "balanced":
+            # Lazy import to avoid circular dep
+            from .utils import get_retry_policy
+
+            kwargs = get_retry_policy(self.retry_policy)
+            self.max_retries = int(kwargs["max_retries"])
+            self.retry_base_delay = float(kwargs["base_delay"])
+            self.retry_max_delay = float(kwargs["max_delay"])
+        return self
 
 
 class DownloadConfig(BaseSettings):
@@ -101,6 +130,47 @@ class AutomationConfig(BaseSettings):
     screenshot_quality: int = 80
     stop_on_error: bool = True
     slow_mo_actions: int = 0
+
+
+class SafetyConfig(BaseSettings):
+    """Domain allow/deny lists, safe mode, and per-call budget knobs.
+
+    Empty ``allowed_domains`` means all hosts are allowed (subject to deny-list).
+    Domain patterns use suffix-match semantics: ``example.com`` matches
+    ``api.example.com`` and ``www.example.com`` but not ``notexample.com``.
+
+    ``safe_mode`` is a heuristic safety layer:
+        - Refuses file downloads
+        - Refuses ``EvaluateInput`` (custom JavaScript)
+        - Refuses clicks on submit-typed buttons (best-effort selector match)
+
+    Budget knobs limit the cost of a single Agent method call:
+        - ``max_pages_per_call``: stops fetching after N pages
+        - ``max_chars_per_call``: stops extracting after total chars exceeded
+        - ``max_time_per_call_seconds``: wall-clock cutoff for the call
+    """
+
+    allowed_domains: list[str] = Field(default_factory=list)
+    denied_domains: list[str] = Field(default_factory=list)
+    safe_mode: bool = False
+    max_pages_per_call: int = 50
+    max_chars_per_call: int = 1_000_000
+    max_time_per_call_seconds: float = 300.0
+
+
+class DebugConfig(BaseSettings):
+    """Auto-capture HTML/screenshot/error context on failures for debugging.
+
+    When ``enabled`` is True, every fetch/action/download failure dumps a
+    snapshot to ``debug_dir/{correlation_id}/{timestamp}-{label}.{html|png|json}``
+    so the failure can be reproduced and diagnosed offline.
+    """
+
+    enabled: bool = False
+    debug_dir: str = "./debug"
+    capture_html: bool = True
+    capture_screenshot: bool = True
+    max_artifacts_per_call: int = 5
 
 
 class AppConfig(BaseSettings):
@@ -146,6 +216,8 @@ class AppConfig(BaseSettings):
     download: DownloadConfig = Field(default_factory=DownloadConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
+    safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    debug: DebugConfig = Field(default_factory=DebugConfig)
     log_level: str = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")
@@ -164,6 +236,7 @@ class AppConfig(BaseSettings):
         self.output_dir = _resolve(self.output_dir)
         self.download.download_dir = _resolve(self.download.download_dir)
         self.automation.screenshot_dir = _resolve(self.automation.screenshot_dir)
+        self.debug.debug_dir = _resolve(self.debug.debug_dir)
         return self
 
     @classmethod

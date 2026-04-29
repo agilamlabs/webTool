@@ -21,39 +21,51 @@ Quick start::
         # Take a screenshot
         screenshot = await agent.screenshot("https://example.com", full_page=True)
 
+        # High-level recipes
+        best = await agent.search_and_open_best_result("FastAPI tutorial")
+        research = await agent.web_research("vector databases", max_pages=3)
+
 Custom configuration::
 
-    from web_agent import Agent, AppConfig
+    from web_agent import Agent, AppConfig, RetryPolicy, SafetyConfig
 
     config = AppConfig(
         browser={"headless": False},
         log_level="DEBUG",
-        output_dir="/tmp/results",
+        fetch={"retry_policy": "fast"},
+        safety={"allowed_domains": ["example.com"], "max_pages_per_call": 10},
+        debug={"enabled": True},
     )
     async with Agent(config) as agent:
         ...
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .agent import Agent
 from .config import (
     AppConfig,
     AutomationConfig,
     BrowserConfig,
+    DebugConfig,
     DownloadConfig,
     ExtractionConfig,
     FetchConfig,
+    SafetyConfig,
     SearchConfig,
 )
+from .correlation import correlation_scope, get_correlation_id, new_correlation_id
 from .exceptions import (
     ActionError,
     ActionTimeoutError,
     BrowserError,
+    BudgetExceededError,
     ConfigError,
+    DomainNotAllowedError,
     DownloadError,
     ExtractionError,
     NavigationError,
+    SafeModeBlockedError,
     SearchError,
     SelectorNotFoundError,
     WebAgentError,
@@ -65,51 +77,77 @@ from .models import (
     ActionStatus,
     ActionType,
     AgentResult,
+    Citation,
     DownloadResult,
     ExtractionResult,
     FetchResult,
     FetchStatus,
+    LocatorSpec,
+    ResearchResult,
     ScreenshotResult,
     SearchResponse,
     SearchResultItem,
+    SelectorLike,
+    SessionInfo,
 )
+from .recipes import Recipes
+from .utils import BudgetTracker, RetryPolicy, get_retry_policy
 
 __all__ = [
     # Version
     "__version__",
     # Core
     "Agent",
+    "Recipes",
     # Configuration
     "AppConfig",
     "AutomationConfig",
     "BrowserConfig",
+    "DebugConfig",
     "DownloadConfig",
     "ExtractionConfig",
     "FetchConfig",
+    "SafetyConfig",
     "SearchConfig",
+    # Correlation
+    "correlation_scope",
+    "get_correlation_id",
+    "new_correlation_id",
+    # Retry
+    "RetryPolicy",
+    "get_retry_policy",
+    "BudgetTracker",
     # Exceptions
     "ActionError",
     "ActionTimeoutError",
     "BrowserError",
+    "BudgetExceededError",
     "ConfigError",
+    "DomainNotAllowedError",
     "DownloadError",
     "ExtractionError",
     "NavigationError",
+    "SafeModeBlockedError",
     "SearchError",
     "SelectorNotFoundError",
     "WebAgentError",
-    # Models - Results
+    # Models
     "Action",
     "ActionResult",
     "ActionSequenceResult",
     "ActionStatus",
     "ActionType",
     "AgentResult",
+    "Citation",
     "DownloadResult",
     "ExtractionResult",
     "FetchResult",
     "FetchStatus",
+    "LocatorSpec",
+    "ResearchResult",
     "ScreenshotResult",
     "SearchResponse",
     "SearchResultItem",
+    "SelectorLike",
+    "SessionInfo",
 ]

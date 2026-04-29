@@ -70,3 +70,31 @@ class SelectorNotFoundError(ActionError):
 
 class ConfigError(WebAgentError):
     """Configuration validation or loading failure."""
+
+
+class DomainNotAllowedError(WebAgentError):
+    """URL host is not in the allow-list or matches the deny-list."""
+
+    def __init__(self, message: str, url: str = "", host: str = "") -> None:
+        self.url = url
+        self.host = host
+        super().__init__(message)
+
+
+class BudgetExceededError(WebAgentError):
+    """Per-call budget (pages, chars, or wall-clock time) has been exhausted."""
+
+    def __init__(
+        self, message: str, budget_type: str = "", limit: float = 0.0
+    ) -> None:
+        self.budget_type = budget_type
+        self.limit = limit
+        super().__init__(message)
+
+
+class SafeModeBlockedError(WebAgentError):
+    """Operation forbidden by ``SafetyConfig.safe_mode``."""
+
+    def __init__(self, message: str, operation: str = "") -> None:
+        self.operation = operation
+        super().__init__(message)
