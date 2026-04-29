@@ -72,6 +72,76 @@ class BrowserManager:
         self._started = False
         logger.info("Browser closed")
 
+    async def _build_context(
+        self,
+        user_agent: str | None = None,
+        block_resources: bool | None = None,
+    ) -> BrowserContext:
+        """Internal: build a BrowserContext with stealth + UA rotation + resource blocking.
+
+        Returns a context the caller is responsible for closing.
+        Used by both ``new_context`` (semaphore-bounded, auto-closed) and
+        ``create_persistent_context`` (no semaphore, caller-managed).
+        """
+        if not self._browser:
+            raise RuntimeError("BrowserManager not started. Call start() first.")
+
+        ua = user_agent or get_random_user_agent()
+        ctx = await self._browser.new_context(
+            user_agent=ua,
+            viewport={
+                "width": self._config.browser.viewport_width,
+                "height": self._config.browser.viewport_height,
+            },
+            locale="en-US",
+            timezone_id="America/New_York",
+            java_script_enabled=True,
+            bypass_csp=False,
+        )
+        ctx.set_default_timeout(self._config.browser.default_timeout)
+        ctx.set_default_navigation_timeout(self._config.browser.navigation_timeout)
+
+        should_block = block_resources if block_resources is not None else True
+        blocked = self._config.browser.block_resources
+        if should_block and blocked:
+
+            async def _block_resources(route: Route) -> None:
+                if route.request.resource_type in blocked:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await ctx.route("**/*", _block_resources)
+
+        return ctx
+
+    async def create_persistent_context(
+        self,
+        user_agent: str | None = None,
+        block_resources: bool | None = None,
+    ) -> BrowserContext:
+        """Create a non-managed BrowserContext that the caller is responsible for closing.
+
+        Used by :class:`SessionManager`. Bypasses the concurrency semaphore --
+        sessions are explicit user-managed resources and shouldn't block
+        ephemeral context allocation.
+
+        Args:
+            user_agent: Override the random user-agent.
+            block_resources: Whether to block images/fonts/CSS/media.
+                Defaults to False since interactive sessions usually need
+                full styling. Pass ``True`` to opt in.
+
+        Returns:
+            A BrowserContext. Caller must call ``await ctx.close()`` when done.
+        """
+        # Default for sessions is to NOT block resources (interactive use)
+        if block_resources is None:
+            block_resources = False
+        ctx = await self._build_context(user_agent, block_resources)
+        logger.debug("Persistent session context created")
+        return ctx
+
     @asynccontextmanager
     async def new_context(
         self,
@@ -86,43 +156,13 @@ class BrowserManager:
                 ``None`` reads from config (default: True for fetch speed).
                 ``False`` disables blocking (needed for automation/interaction).
         """
-        if not self._browser:
-            raise RuntimeError("BrowserManager not started. Call start() first.")
-
         async with self._semaphore:
-            ua = user_agent or get_random_user_agent()
-            ctx = await self._browser.new_context(
-                user_agent=ua,
-                viewport={
-                    "width": self._config.browser.viewport_width,
-                    "height": self._config.browser.viewport_height,
-                },
-                locale="en-US",
-                timezone_id="America/New_York",
-                java_script_enabled=True,
-                bypass_csp=False,
-            )
-            ctx.set_default_timeout(self._config.browser.default_timeout)
-            ctx.set_default_navigation_timeout(self._config.browser.navigation_timeout)
-
-            # Block heavy resources to speed up page loads (unless disabled)
-            should_block = block_resources if block_resources is not None else True
-            blocked = self._config.browser.block_resources
-            if should_block and blocked:
-
-                async def _block_resources(route: Route) -> None:
-                    if route.request.resource_type in blocked:
-                        await route.abort()
-                    else:
-                        await route.continue_()
-
-                await ctx.route("**/*", _block_resources)
-
+            ctx = await self._build_context(user_agent, block_resources)
             try:
                 yield ctx
             finally:
                 await ctx.close()
-                logger.debug("Context closed (ua={ua})", ua=ua[:50])
+                logger.debug("Context closed")
 
     @asynccontextmanager
     async def new_page(

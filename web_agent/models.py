@@ -50,6 +50,12 @@ class FetchResult(BaseModel):
     html: Optional[str] = Field(default=None, description="Raw HTML content")
     error_message: Optional[str] = Field(default=None)
     response_time_ms: float = Field(default=0.0)
+    correlation_id: Optional[str] = Field(
+        default=None, description="Request correlation id for tracing"
+    )
+    debug_artifacts: list[str] = Field(
+        default_factory=list, description="File paths to debug snapshots, if captured"
+    )
 
 
 class ExtractionResult(BaseModel):
@@ -73,6 +79,7 @@ class ExtractionResult(BaseModel):
     fetched_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    correlation_id: Optional[str] = Field(default=None)
 
 
 class DownloadResult(BaseModel):
@@ -85,6 +92,8 @@ class DownloadResult(BaseModel):
     content_type: Optional[str] = Field(default=None)
     status: FetchStatus
     error_message: Optional[str] = Field(default=None)
+    correlation_id: Optional[str] = Field(default=None)
+    debug_artifacts: list[str] = Field(default_factory=list)
 
 
 class AgentResult(BaseModel):
@@ -95,6 +104,7 @@ class AgentResult(BaseModel):
     pages: list[ExtractionResult] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     total_time_ms: float = Field(default=0.0)
+    correlation_id: Optional[str] = Field(default=None)
 
 
 # =========================================================================
@@ -168,15 +178,78 @@ class ScreenshotFormat(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Semantic Locators (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class LocatorSpec(BaseModel):
+    """Semantic locator using Playwright's role/text/label/test_id APIs.
+
+    Provides AI-friendly element selection beyond raw CSS. At least one
+    locator field must be set. Resolution priority (first non-None wins):
+    role > test_id > label > placeholder > text > selector.
+
+    Examples::
+
+        # Find a button by accessible name:
+        LocatorSpec(role="button", role_name="Submit")
+
+        # Find an input by label:
+        LocatorSpec(label="Customer name:")
+
+        # Find by data-testid:
+        LocatorSpec(test_id="login-form")
+
+        # Fall back to a CSS selector:
+        LocatorSpec(selector="button.primary")
+    """
+
+    selector: Optional[str] = Field(default=None, description="CSS selector")
+    role: Optional[str] = Field(
+        default=None,
+        description="ARIA role: 'button', 'link', 'textbox', 'checkbox', etc.",
+    )
+    role_name: Optional[str] = Field(
+        default=None, description="Accessible name filter for role"
+    )
+    text: Optional[str] = Field(default=None, description="Visible text match")
+    label: Optional[str] = Field(default=None, description="Form label association")
+    placeholder: Optional[str] = Field(
+        default=None, description="Placeholder attribute"
+    )
+    test_id: Optional[str] = Field(default=None, description="data-testid value")
+
+    def is_empty(self) -> bool:
+        return not any(
+            (
+                self.selector,
+                self.role,
+                self.text,
+                self.label,
+                self.placeholder,
+                self.test_id,
+            )
+        )
+
+
+# Type alias for action selector fields. Pydantic v2 accepts either a plain
+# string (existing CSS selector behavior) or a LocatorSpec dict, dispatching
+# automatically. Existing JSON callers continue to work unchanged.
+SelectorLike = Union[str, LocatorSpec]
+
+
+# ---------------------------------------------------------------------------
 # Action Input Models (discriminated union on 'action' field)
 # ---------------------------------------------------------------------------
 
 
 class ClickInput(BaseModel):
-    """Click an element by CSS selector."""
+    """Click an element by CSS selector or semantic locator."""
 
     action: Literal["click"] = "click"
-    selector: str = Field(description="CSS selector of element to click")
+    selector: SelectorLike = Field(
+        description="CSS selector or LocatorSpec for the target element"
+    )
     timeout: Optional[int] = Field(default=None, description="Override timeout in ms")
     button: MouseButton = Field(default=MouseButton.LEFT)
     double_click: bool = Field(default=False)
@@ -189,7 +262,9 @@ class TypeInput(BaseModel):
     """Type text into an element keystroke-by-keystroke."""
 
     action: Literal["type"] = "type"
-    selector: str = Field(description="CSS selector of input element")
+    selector: SelectorLike = Field(
+        description="CSS selector or LocatorSpec for the input element"
+    )
     timeout: Optional[int] = Field(default=None)
     text: str = Field(description="Text to type")
     delay: int = Field(default=0, description="Delay in ms between key presses")
@@ -200,7 +275,9 @@ class FillInput(BaseModel):
     """Fill an input element with a value (instant, no keystrokes)."""
 
     action: Literal["fill"] = "fill"
-    selector: str = Field(description="CSS selector of input element")
+    selector: SelectorLike = Field(
+        description="CSS selector or LocatorSpec for the input element"
+    )
     timeout: Optional[int] = Field(default=None)
     value: str = Field(description="Value to fill")
 
@@ -209,7 +286,9 @@ class ScrollInput(BaseModel):
     """Scroll the page or an element."""
 
     action: Literal["scroll"] = "scroll"
-    selector: Optional[str] = Field(default=None, description="Element to scroll into view")
+    selector: Optional[SelectorLike] = Field(
+        default=None, description="Element to scroll into view (CSS or LocatorSpec)"
+    )
     timeout: Optional[int] = Field(default=None)
     direction: ScrollDirection = Field(default=ScrollDirection.DOWN)
     amount: int = Field(default=3, description="Scroll ticks")
@@ -222,7 +301,10 @@ class ScreenshotInput(BaseModel):
     """Take a screenshot of the page or a specific element."""
 
     action: Literal["screenshot"] = "screenshot"
-    selector: Optional[str] = Field(default=None, description="Element to screenshot (or full page)")
+    selector: Optional[SelectorLike] = Field(
+        default=None,
+        description="Element to screenshot (CSS or LocatorSpec). None for full page.",
+    )
     timeout: Optional[int] = Field(default=None)
     path: Optional[str] = Field(default=None, description="Output file path (auto-generated if None)")
     full_page: bool = Field(default=False)
@@ -255,7 +337,9 @@ class HoverInput(BaseModel):
     """Hover over an element."""
 
     action: Literal["hover"] = "hover"
-    selector: str = Field(description="CSS selector of element to hover")
+    selector: SelectorLike = Field(
+        description="CSS selector or LocatorSpec for the target element"
+    )
     timeout: Optional[int] = Field(default=None)
 
 
@@ -263,7 +347,9 @@ class SelectInput(BaseModel):
     """Select an option from a dropdown."""
 
     action: Literal["select"] = "select"
-    selector: str = Field(description="CSS selector of <select> element")
+    selector: SelectorLike = Field(
+        description="CSS selector or LocatorSpec for the <select> element"
+    )
     timeout: Optional[int] = Field(default=None)
     value: Optional[str] = Field(default=None, description="Option value attribute")
     label: Optional[str] = Field(default=None, description="Option visible text")
@@ -341,6 +427,7 @@ class ActionResult(BaseModel):
     data: Optional[dict[str, Any]] = Field(
         default=None, description="Action-specific return data"
     )
+    debug_artifacts: list[str] = Field(default_factory=list)
 
 
 class ActionSequenceResult(BaseModel):
@@ -352,6 +439,8 @@ class ActionSequenceResult(BaseModel):
     actions_failed: int = Field(default=0)
     results: list[ActionResult] = Field(default_factory=list)
     total_time_ms: float = Field(default=0.0)
+    correlation_id: Optional[str] = Field(default=None)
+    debug_artifacts: list[str] = Field(default_factory=list)
 
 
 class ScreenshotResult(BaseModel):
@@ -362,3 +451,64 @@ class ScreenshotResult(BaseModel):
     format: ScreenshotFormat
     size_bytes: int = Field(default=0)
     status: ActionStatus
+    correlation_id: Optional[str] = Field(default=None)
+
+
+# =========================================================================
+# Browser Sessions (Phase 5)
+# =========================================================================
+
+
+class SessionInfo(BaseModel):
+    """Metadata for a persistent browser session.
+
+    Sessions retain cookies, localStorage, and origin tokens across multiple
+    Agent method calls. Created via :meth:`Agent.create_session` and
+    referenced by ``session_id`` in subsequent fetch/download/screenshot/
+    interact calls.
+    """
+
+    session_id: str
+    name: Optional[str] = None
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    last_used_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    page_count: int = Field(default=0)
+    user_agent: Optional[str] = None
+
+
+# =========================================================================
+# High-Level Recipe Results (Phase 6)
+# =========================================================================
+
+
+class Citation(BaseModel):
+    """A research citation: URL plus extracted title/snippet and relevance score."""
+
+    url: str
+    title: Optional[str] = None
+    snippet: Optional[str] = None
+    extraction_method: str = Field(default="none")
+    relevance_score: float = Field(
+        default=0.0,
+        description="Score from the recipe ranker, higher is better",
+    )
+
+
+class ResearchResult(BaseModel):
+    """Result of the multi-page web_research recipe.
+
+    Returned by :meth:`Agent.web_research` and the matching MCP tool.
+    """
+
+    query: str
+    citations: list[Citation] = Field(default_factory=list)
+    summary_pages: list[ExtractionResult] = Field(default_factory=list)
+    pages_visited: int = Field(default=0)
+    chars_extracted: int = Field(default=0)
+    errors: list[str] = Field(default_factory=list)
+    correlation_id: Optional[str] = None
+    total_time_ms: float = Field(default=0.0)

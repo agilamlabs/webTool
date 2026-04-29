@@ -1,8 +1,8 @@
 """Pipeline orchestrator: search -> fetch -> extract -> download -> automate.
 
 The :class:`Agent` is the main entry point for AI agents to interact with the web.
-It composes all subsystems (browser, search, fetch, extract, download, automate)
-behind a clean async context manager API.
+It composes all subsystems (browser, search, fetch, extract, download, automate,
+sessions, recipes) behind a clean async context manager API.
 
 Example::
 
@@ -24,12 +24,26 @@ Example::
             FillInput(selector="#search", value="query"),
             ClickInput(selector="button[type=submit]"),
         ])
+
+        # Persistent sessions for multi-call workflows (login, etc.)
+        sid = await agent.create_session(name="my-login")
+        await agent.interact(login_url, login_actions, session_id=sid)
+        result = await agent.fetch_and_extract(dashboard_url, session_id=sid)
+        await agent.close_session(sid)
+
+        # High-level recipes
+        best = await agent.search_and_open_best_result("Python FastAPI tutorial")
+        report = await agent.find_and_download_file(
+            "Tesla 10-K annual report 2024", file_types=["pdf"]
+        )
+        research = await agent.web_research("vector databases comparison", max_pages=3)
 """
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Optional
 
 from loguru import logger
 
@@ -37,59 +51,72 @@ from .browser_actions import BrowserActions
 from .browser_manager import BrowserManager
 from .config import AppConfig
 from .content_extractor import ContentExtractor
+from .correlation import correlation_scope
+from .debug import DebugCapture
 from .downloader import Downloader
 from .models import (
     Action,
     ActionSequenceResult,
     AgentResult,
+    Citation,
     DownloadResult,
     ExtractionResult,
-    ScreenshotFormat,
+    ResearchResult,
     ScreenshotResult,
+    SessionInfo,
 )
+from .recipes import Recipes
 from .search_engine import SearchEngine
-from .web_fetcher import WebFetcher
+from .session_manager import SessionManager
+from .utils import BudgetTracker, check_domain_allowed
+from .web_fetcher import WebFetcher, _is_download_url
 
 
 class Agent:
     """Main entry point for the web_agent toolkit.
 
     Orchestrates browser lifecycle, web search, page fetching, content
-    extraction, file downloading, and browser automation through a single
-    async context manager.
+    extraction, file downloading, browser automation, persistent sessions,
+    and high-level research recipes through a single async context manager.
 
     Args:
         config: Application configuration. If ``None``, uses all defaults
             (no config file needed).
-
-    Example::
-
-        from web_agent import Agent, AppConfig
-
-        # With defaults:
-        async with Agent() as agent:
-            result = await agent.search_and_extract("query")
-
-        # With custom config:
-        config = AppConfig(browser={"headless": False}, log_level="DEBUG")
-        async with Agent(config) as agent:
-            result = await agent.fetch_and_extract("https://example.com")
     """
 
     def __init__(self, config: AppConfig | None = None) -> None:
         self._config = config or AppConfig()
         self._bm = BrowserManager(self._config)
+        self._sessions = SessionManager(self._bm, self._config)
+        self._debug = DebugCapture(self._config)
         self._search = SearchEngine(self._bm, self._config)
-        self._fetcher = WebFetcher(self._bm, self._config)
+        self._fetcher = WebFetcher(
+            self._bm, self._config, sessions=self._sessions, debug=self._debug
+        )
         self._extractor = ContentExtractor(self._config)
-        self._downloader = Downloader(self._bm, self._config)
-        self._actions = BrowserActions(self._bm, self._config)
+        self._downloader = Downloader(
+            self._bm, self._config, sessions=self._sessions, debug=self._debug
+        )
+        self._actions = BrowserActions(
+            self._bm, self._config, sessions=self._sessions, debug=self._debug
+        )
+        self._recipes = Recipes(
+            self._search,
+            self._fetcher,
+            self._extractor,
+            self._downloader,
+            self._config,
+        )
 
     async def __aenter__(self) -> Agent:
         await self._bm.start()
         return self
 
     async def __aexit__(self, *args: object) -> None:
+        try:
+            await self._sessions.close_all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Error closing sessions on exit: {e}", e=exc)
         await self._bm.stop()
 
     # ------------------------------------------------------------------
@@ -97,99 +124,145 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def search_and_extract(
-        self, query: str, max_results: int | None = None
+        self,
+        query: str,
+        max_results: int | None = None,
+        *,
+        session_id: Optional[str] = None,
     ) -> AgentResult:
-        """Full pipeline: Google search -> fetch top pages -> extract content.
+        """Full pipeline: search -> fetch top pages -> extract content.
 
-        Returns an AgentResult containing all search results, extracted page
-        content, any errors encountered, and total execution time.
+        Args:
+            query: The search query.
+            max_results: Maximum number of results to process.
+            session_id: Optional persistent browser session for the fetches.
+
+        Returns:
+            AgentResult with search results, extracted pages, errors, and timing.
         """
-        start = time.perf_counter()
-        errors: list[str] = []
+        with correlation_scope() as cid:
+            self._debug.reset()
+            start = time.perf_counter()
+            errors: list[str] = []
+            budget = BudgetTracker(self._config.safety)
 
-        # Step 1: Search Google
-        logger.info("Starting pipeline for query: {q}", q=query)
-        search_response = await self._search.search(query, max_results)
-        logger.info(
-            "Search returned {n} results", n=search_response.total_results
-        )
+            logger.info("Starting pipeline for query: {q}", q=query)
+            search_response = await self._search.search(query, max_results)
+            logger.info(
+                "Search returned {n} results", n=search_response.total_results
+            )
 
-        if not search_response.results:
+            if not search_response.results:
+                return AgentResult(
+                    query=query,
+                    search=search_response,
+                    errors=["No search results found"],
+                    total_time_ms=(time.perf_counter() - start) * 1000,
+                    correlation_id=cid,
+                )
+
+            # Separate file URLs from page URLs and filter blocked domains
+            page_urls: list[str] = []
+            file_urls: list[str] = []
+            for r in search_response.results:
+                if not check_domain_allowed(r.url, self._config.safety):
+                    errors.append(f"Domain blocked: {r.url}")
+                    continue
+                if _is_download_url(r.url):
+                    file_urls.append(r.url)
+                else:
+                    page_urls.append(r.url)
+
+            if file_urls:
+                logger.info(
+                    "Detected {n} file download URLs (skipping fetch, use agent.download())",
+                    n=len(file_urls),
+                )
+                for furl in file_urls:
+                    errors.append(
+                        f"File URL skipped (use agent.download()): {furl}"
+                    )
+
+            logger.info("Fetching {n} pages...", n=len(page_urls))
+            fetch_results = await self._fetcher.fetch_many(
+                page_urls, session_id=session_id
+            )
+
+            pages: list[ExtractionResult] = []
+            for fr in fetch_results:
+                try:
+                    budget.check_time()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(str(exc))
+                    break
+
+                if fr.html:
+                    try:
+                        budget.add_page()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc))
+                        break
+                    extraction = self._extractor.extract(fr)
+                    extraction.correlation_id = cid
+                    try:
+                        budget.add_chars(extraction.content_length)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc))
+                        pages.append(extraction)
+                        break
+                    pages.append(extraction)
+                else:
+                    errors.append(f"Failed to fetch {fr.url}: {fr.error_message}")
+
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.info(
+                "Pipeline complete: {n} pages extracted in {t:.0f}ms",
+                n=len(pages),
+                t=elapsed,
+            )
+
             return AgentResult(
                 query=query,
                 search=search_response,
-                errors=["No search results found"],
-                total_time_ms=(time.perf_counter() - start) * 1000,
+                pages=pages,
+                errors=errors,
+                total_time_ms=elapsed,
+                correlation_id=cid,
             )
-
-        # Step 2: Separate page URLs from file download URLs
-        from .web_fetcher import _is_download_url
-
-        page_urls: list[str] = []
-        file_urls: list[str] = []
-        for r in search_response.results:
-            if _is_download_url(r.url):
-                file_urls.append(r.url)
-            else:
-                page_urls.append(r.url)
-
-        if file_urls:
-            logger.info(
-                "Detected {n} file download URLs (skipping fetch, use agent.download())",
-                n=len(file_urls),
-            )
-            for furl in file_urls:
-                errors.append(
-                    f"File URL skipped (use agent.download()): {furl}"
-                )
-
-        # Step 3: Fetch page URLs concurrently
-        logger.info("Fetching {n} pages...", n=len(page_urls))
-        fetch_results = await self._fetcher.fetch_many(page_urls)
-
-        # Step 4: Extract content from each fetched page
-        pages: list[ExtractionResult] = []
-        for fr in fetch_results:
-            if fr.html:
-                extraction = self._extractor.extract(fr)
-                pages.append(extraction)
-            else:
-                errors.append(f"Failed to fetch {fr.url}: {fr.error_message}")
-
-        elapsed = (time.perf_counter() - start) * 1000
-        logger.info(
-            "Pipeline complete: {n} pages extracted in {t:.0f}ms",
-            n=len(pages),
-            t=elapsed,
-        )
-
-        return AgentResult(
-            query=query,
-            search=search_response,
-            pages=pages,
-            errors=errors,
-            total_time_ms=elapsed,
-        )
 
     # ------------------------------------------------------------------
     # Single URL: Fetch + Extract
     # ------------------------------------------------------------------
 
-    async def fetch_and_extract(self, url: str) -> ExtractionResult:
-        """Fetch a single URL and extract its content (no search step)."""
-        logger.info("Fetching and extracting: {url}", url=url)
-        fr = await self._fetcher.fetch(url)
-        return self._extractor.extract(fr)
+    async def fetch_and_extract(
+        self, url: str, *, session_id: Optional[str] = None
+    ) -> ExtractionResult:
+        """Fetch a single URL and extract its content."""
+        with correlation_scope() as cid:
+            self._debug.reset()
+            logger.info("Fetching and extracting: {url}", url=url)
+            fr = await self._fetcher.fetch(url, session_id=session_id)
+            extraction = self._extractor.extract(fr)
+            extraction.correlation_id = cid
+            return extraction
 
     # ------------------------------------------------------------------
     # Download
     # ------------------------------------------------------------------
 
     async def download(
-        self, url: str, filename: str | None = None
+        self,
+        url: str,
+        filename: str | None = None,
+        *,
+        session_id: Optional[str] = None,
     ) -> DownloadResult:
         """Download a file from a URL."""
-        return await self._downloader.download(url, filename)
+        with correlation_scope():
+            self._debug.reset()
+            return await self._downloader.download(
+                url, filename, session_id=session_id
+            )
 
     # ------------------------------------------------------------------
     # Browser Automation
@@ -200,24 +273,113 @@ class Agent:
         url: str,
         actions: list[Action],
         stop_on_error: bool | None = None,
+        *,
+        session_id: Optional[str] = None,
     ) -> ActionSequenceResult:
         """Execute a scripted sequence of browser actions on a URL."""
-        logger.info(
-            "Starting interaction sequence on {url} ({n} actions)",
-            url=url,
-            n=len(actions),
-        )
-        return await self._actions.execute_sequence(url, actions, stop_on_error)
+        with correlation_scope():
+            self._debug.reset()
+            logger.info(
+                "Starting interaction sequence on {url} ({n} actions, session={s})",
+                url=url,
+                n=len(actions),
+                s=session_id or "ephemeral",
+            )
+            return await self._actions.execute_sequence(
+                url, actions, stop_on_error=stop_on_error, session_id=session_id
+            )
 
     async def screenshot(
         self,
         url: str,
         path: str | None = None,
         full_page: bool = False,
+        *,
+        session_id: Optional[str] = None,
     ) -> ScreenshotResult:
         """Navigate to a URL and take a screenshot."""
-        logger.info("Taking screenshot of {url}", url=url)
-        return await self._actions.take_screenshot(url, path, full_page)
+        with correlation_scope():
+            self._debug.reset()
+            logger.info("Taking screenshot of {url}", url=url)
+            return await self._actions.take_screenshot(
+                url, path, full_page, session_id=session_id
+            )
+
+    # ------------------------------------------------------------------
+    # Browser Sessions
+    # ------------------------------------------------------------------
+
+    async def create_session(self, name: str | None = None) -> str:
+        """Create a persistent browser session and return its session_id.
+
+        Pass the session_id to subsequent fetch/download/screenshot/interact
+        calls to retain cookies, localStorage, and origin tokens. Sessions
+        live until ``close_session`` or until the Agent context exits.
+        """
+        with correlation_scope():
+            return await self._sessions.create(name=name)
+
+    async def close_session(self, session_id: str) -> None:
+        """Close and discard a persistent browser session."""
+        with correlation_scope():
+            await self._sessions.close(session_id)
+
+    def list_sessions(self) -> list[SessionInfo]:
+        """Return SessionInfo snapshots for all live sessions."""
+        return self._sessions.list()
+
+    # ------------------------------------------------------------------
+    # High-Level Recipes
+    # ------------------------------------------------------------------
+
+    async def search_and_open_best_result(
+        self,
+        query: str,
+        ranking: str = "default",
+        *,
+        session_id: Optional[str] = None,
+    ) -> ExtractionResult:
+        """Recipe: search, rank results, fetch + extract the top hit."""
+        with correlation_scope() as cid:
+            self._debug.reset()
+            result = await self._recipes.search_and_open_best_result(
+                query, ranking, session_id
+            )
+            result.correlation_id = cid
+            return result
+
+    async def find_and_download_file(
+        self,
+        query: str,
+        file_types: list[str] | None = None,
+        *,
+        session_id: Optional[str] = None,
+    ) -> DownloadResult:
+        """Recipe: search, find the first matching file URL, download it."""
+        with correlation_scope() as cid:
+            self._debug.reset()
+            result = await self._recipes.find_and_download_file(
+                query, file_types, session_id
+            )
+            result.correlation_id = cid
+            return result
+
+    async def web_research(
+        self,
+        query: str,
+        depth: int = 1,
+        max_pages: int = 5,
+        *,
+        session_id: Optional[str] = None,
+    ) -> ResearchResult:
+        """Recipe: search + parallel fetch + extract top N pages, return citations."""
+        with correlation_scope() as cid:
+            self._debug.reset()
+            result = await self._recipes.web_research(
+                query, depth, max_pages, session_id
+            )
+            result.correlation_id = cid
+            return result
 
     # ------------------------------------------------------------------
     # Output
