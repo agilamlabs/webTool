@@ -435,6 +435,42 @@ async with Agent(config) as agent:
 
 Failures are logged with `"status": "error"` and `"error": "<repr(exc)>"`. The `correlation_id` field cross-references the entry with regular loguru logs.
 
+### Cache (NEW in 1.5.0)
+
+`CacheConfig` enables a disk-backed TTL cache for fetch results and search responses. Disabled by default. When enabled, every successful `agent.fetch_and_extract(url)` and `agent.search_and_extract(query)` writes its result to disk; subsequent calls within `ttl_seconds` short-circuit and return the cached payload (`from_cache=True`) without hitting the network.
+
+```python
+from web_agent import Agent, AppConfig
+
+config = AppConfig(cache={
+    "enabled": True,
+    "cache_dir": "./cache",
+    "ttl_seconds": 3600,    # 1 hour
+    "max_cache_mb": 100,    # LRU-by-mtime eviction past this
+})
+async with Agent(config) as agent:
+    page1 = await agent.fetch_and_extract("https://example.com")  # network
+    page2 = await agent.fetch_and_extract("https://example.com")  # cache hit
+    # page2.url == page1.url and the underlying FetchResult.from_cache == True
+```
+
+Cache keys: URL for fetches, `"search:<query>:<max_results>"` for searches. Only successful fetches and non-empty search responses are cached -- caching errors/empty would lock in transient failures across the TTL window.
+
+To clear the cache mid-run: `await agent._cache.clear()` (returns count removed). To extend the cache backend (e.g. Redis), implement the `Cache` ABC in `web_agent/cache.py` and pass it directly to `WebFetcher` / `SearchEngine`.
+
+### Markdown Extraction (NEW in 1.5.0)
+
+`ExtractionResult.markdown` is a markdown rendering of the page, populated automatically whenever `trafilatura` is the winning extractor (the most common path). Markdown preserves headings, lists, links, and emphasis, which most LLMs prefer to consume over plain text.
+
+```python
+async with Agent() as agent:
+    page = await agent.fetch_and_extract("https://example.com")
+    print(page.content)    # plain text, like before
+    print(page.markdown)   # markdown rendering -- preserves structure
+```
+
+`markdown` stays `None` when the bs4 or raw-text fallback layers win (those layers don't have a markdown equivalent). The double-pass through trafilatura is cheap -- HTML is parsed twice, no extra network.
+
 ### Strict Mode
 
 By default, all `Agent` methods return result models even on failure. Pass `strict=True` to convert failures into typed exceptions:

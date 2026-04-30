@@ -20,12 +20,16 @@ class SearchResultItem(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    """Response from a Google search query."""
+    """Response from a search query (any provider)."""
 
     query: str = Field(description="Original search query")
     total_results: int = Field(default=0, description="Number of results parsed")
     results: list[SearchResultItem] = Field(default_factory=list)
     searched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    from_cache: bool = Field(
+        default=False,
+        description="True if this response was served from the local cache.",
+    )
 
 
 class FetchStatus(str, Enum):
@@ -54,6 +58,10 @@ class FetchResult(BaseModel):
     debug_artifacts: list[str] = Field(
         default_factory=list, description="File paths to debug snapshots, if captured"
     )
+    from_cache: bool = Field(
+        default=False,
+        description="True if this fetch was served from the local cache.",
+    )
 
 
 class ExtractionResult(BaseModel):
@@ -66,6 +74,15 @@ class ExtractionResult(BaseModel):
     date: Optional[str] = Field(default=None, description="Publication date if found")
     sitename: Optional[str] = Field(default=None, description="Site name")
     content: Optional[str] = Field(default=None, description="Main text content")
+    markdown: Optional[str] = Field(
+        default=None,
+        description=(
+            "Markdown rendering of the page (only populated when "
+            "trafilatura succeeds with output_format='markdown'). "
+            "Useful for LLM consumption -- preserves headings, lists, "
+            "links, and emphasis without HTML noise."
+        ),
+    )
     language: Optional[str] = Field(default=None, description="Detected language")
     extraction_method: str = Field(
         default="none",

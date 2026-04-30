@@ -40,15 +40,17 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 from .agent import Agent
 from .audit import AuditLogger
+from .cache import Cache, DiskCache
 from .config import (
     AppConfig,
     AuditConfig,
     AutomationConfig,
     BrowserConfig,
+    CacheConfig,
     DebugConfig,
     DownloadConfig,
     ExtractionConfig,
@@ -114,6 +116,7 @@ __all__ = [
     "AuditConfig",
     "AutomationConfig",
     "BrowserConfig",
+    "CacheConfig",
     "DebugConfig",
     "DownloadConfig",
     "ExtractionConfig",
@@ -132,6 +135,9 @@ __all__ = [
     "AuditLogger",
     "RateLimiter",
     "RobotsChecker",
+    # Cache
+    "Cache",
+    "DiskCache",
     # Search providers
     "DDGSProvider",
     "PlaywrightProvider",

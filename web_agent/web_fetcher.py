@@ -25,6 +25,7 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from .browser_manager import BrowserManager
+from .cache import Cache
 from .config import AppConfig
 from .correlation import get_correlation_id
 from .debug import DebugCapture
@@ -91,6 +92,7 @@ class WebFetcher:
         debug: Optional[DebugCapture] = None,
         rate_limiter: Optional[RateLimiter] = None,
         robots: Optional[RobotsChecker] = None,
+        cache: Optional[Cache] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
@@ -98,6 +100,7 @@ class WebFetcher:
         self._debug = debug or DebugCapture(config)
         self._rate_limiter = rate_limiter
         self._robots = robots
+        self._cache = cache
 
     async def fetch(
         self,
@@ -159,6 +162,16 @@ class WebFetcher:
                 correlation_id=cid,
             )
 
+        # Cache lookup (before politeness layer -- saves both rate-limit
+        # tokens and the actual fetch). Cache key is just the URL.
+        if self._cache is not None:
+            cached = await self._cache.get(f"fetch:{url}")
+            if cached is not None:
+                logger.debug("Cache hit: {url}", url=url)
+                cached["correlation_id"] = cid
+                cached["from_cache"] = True
+                return FetchResult(**cached)
+
         # Politeness layer: per-host rate limit (may sleep)
         if self._rate_limiter is not None:
             await self._rate_limiter.acquire(urlparse(url).hostname or "")
@@ -168,6 +181,10 @@ class WebFetcher:
             with timer:
                 result = await self._do_fetch(url, session_id=session_id)
             result.correlation_id = cid
+            # Cache successful fetches only -- caching errors / blocks
+            # would lock in transient failures across the TTL window.
+            if self._cache is not None and result.status == FetchStatus.SUCCESS:
+                await self._cache.set(f"fetch:{url}", result.model_dump(mode="json"))
             return result
         except NonRetryableHTTPError as e:
             return FetchResult(

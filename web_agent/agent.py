@@ -52,6 +52,7 @@ from loguru import logger
 from .audit import AuditLogger
 from .browser_actions import BrowserActions
 from .browser_manager import BrowserManager
+from .cache import Cache, DiskCache
 from .config import AppConfig
 from .content_extractor import ContentExtractor
 from .correlation import correlation_scope
@@ -129,7 +130,26 @@ class Agent:
             enabled=self._config.audit.enabled,
         )
 
-        self._search = SearchEngine(self._bm, self._config, rate_limiter=self._rate_limiter)
+        # Cache: disk-backed TTL cache for fetch + search results.
+        # None when disabled so subsystems can short-circuit on a single
+        # `if self._cache is not None` check.
+        cache_cfg = self._config.cache
+        self._cache: Cache | None = (
+            DiskCache(
+                cache_dir=cache_cfg.cache_dir,
+                ttl_seconds=cache_cfg.ttl_seconds,
+                max_cache_mb=cache_cfg.max_cache_mb,
+            )
+            if cache_cfg.enabled
+            else None
+        )
+
+        self._search = SearchEngine(
+            self._bm,
+            self._config,
+            rate_limiter=self._rate_limiter,
+            cache=self._cache,
+        )
         self._fetcher = WebFetcher(
             self._bm,
             self._config,
@@ -137,6 +157,7 @@ class Agent:
             debug=self._debug,
             rate_limiter=self._rate_limiter,
             robots=self._robots,
+            cache=self._cache,
         )
         self._extractor = ContentExtractor(self._config)
         self._downloader = Downloader(

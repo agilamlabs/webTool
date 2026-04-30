@@ -40,6 +40,32 @@ class TestTrafilaturaExtraction:
         assert result.title is not None
         assert "Web Scraping" in result.title or "Python" in result.title
 
+    def test_produces_markdown_when_trafilatura_succeeds(
+        self, app_config: AppConfig, sample_article_html: str
+    ) -> None:
+        """When trafilatura is the winning extractor, markdown should be populated."""
+        extractor = ContentExtractor(app_config)
+        result = extractor.extract(_make_fetch_result(sample_article_html))
+
+        if result.extraction_method == "trafilatura":
+            assert result.markdown is not None
+            assert len(result.markdown) > 0
+            # Markdown should contain heading/list/emphasis syntax characters
+            # somewhere in the rendered output (we don't pin a specific char
+            # to keep this robust across trafilatura versions).
+            md_chars = set(result.markdown)
+            assert any(c in md_chars for c in "#*-_[")
+
+    def test_markdown_omitted_when_bs4_or_raw_path(self, app_config: AppConfig) -> None:
+        """When trafilatura is NOT the winning extractor, markdown stays None."""
+        # Bare HTML that trafilatura's bare_extraction typically rejects.
+        minimal = "<html><body><p>tiny</p></body></html>"
+        extractor = ContentExtractor(app_config)
+        result = extractor.extract(_make_fetch_result(minimal))
+
+        if result.extraction_method != "trafilatura":
+            assert result.markdown is None
+
 
 class TestBS4Extraction:
     """Tests for the BeautifulSoup fallback layer."""
