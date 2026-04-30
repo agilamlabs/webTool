@@ -1,59 +1,127 @@
-log_level: "DEBUG"
+# Example configuration for the web_agent toolkit.
+# Load via: AppConfig.from_yaml("config.example.yaml")
+# Every section is optional; defaults are used for anything you omit.
+# Relative paths (output_dir, cache_dir, etc.) resolve against base_dir.
+
+log_level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
 output_dir: "./output"
 
+# ---------------------------------------------------------------------------
+# Browser (Chromium via Playwright)
+# ---------------------------------------------------------------------------
 browser:
   headless: true
-  default_timeout: 30000
-  navigation_timeout: 45000
-  max_contexts: 3
+  default_timeout: 30000              # ms
+  navigation_timeout: 45000           # ms
+  max_contexts: 3                     # concurrency cap
   block_resources: ["image", "font", "stylesheet", "media"]
   viewport_width: 1920
   viewport_height: 1080
 
+# ---------------------------------------------------------------------------
+# Search chain (NEW in 1.4.0)
+# Providers tried in priority order until one returns results.
+# - "searxng": self-hosted SearXNG instance (skipped if searxng_base_url is null)
+# - "ddgs":    DuckDuckGo via the ddgs Python package (skipped if not installed)
+# - "playwright": browser-driven Google + DDG HTML scraping (always available)
+# ---------------------------------------------------------------------------
 search:
   max_results: 10
   language: "en"
   region: "us"
+  safe_search: false
+  providers:
+    - searxng
+    - ddgs
+    - playwright
+  searxng_base_url: null              # e.g. "http://localhost:8888" (see docker/searxng/)
+  searxng_timeout: 10.0               # seconds
 
+# ---------------------------------------------------------------------------
+# Fetch (page rendering + retry)
+# ---------------------------------------------------------------------------
 fetch:
-  wait_until: "networkidle"
-  retry_policy: "balanced"          # fast | balanced | paranoid
+  wait_until: "networkidle"           # commit | domcontentloaded | load | networkidle
+  retry_policy: "balanced"            # fast | balanced | paranoid
   # Numeric overrides win when explicitly set; uncomment to override the policy:
   # max_retries: 3
   # retry_base_delay: 1.0
   # retry_max_delay: 30.0
   non_retryable_status_codes: [400, 401, 403, 404, 405, 410, 451]
 
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
 download:
   download_dir: "./downloads"
   max_file_size_mb: 100
 
+# ---------------------------------------------------------------------------
+# Content extraction (trafilatura -> BS4 -> raw)
+# Markdown is also populated when trafilatura wins.
+# ---------------------------------------------------------------------------
 extraction:
   favor_recall: true
   include_tables: true
   min_content_length: 50
 
+# ---------------------------------------------------------------------------
+# Browser automation
+# ---------------------------------------------------------------------------
 automation:
-  default_action_timeout: 10000
+  default_action_timeout: 10000       # ms
   screenshot_dir: "./screenshots"
   screenshot_format: "png"
   screenshot_quality: 80
   stop_on_error: true
   slow_mo_actions: 0
 
-# Domain allow/deny lists, safe mode, and per-call budget knobs.
-# Empty allowed_domains = allow all (subject to denied_domains).
-# Domain patterns use suffix-match: "example.com" matches "api.example.com".
+# ---------------------------------------------------------------------------
+# Safety: domains, granular feature flags, SSRF + politeness layer
+# (granular flags + politeness added in 1.2.0/1.3.0)
+# ---------------------------------------------------------------------------
 safety:
-  allowed_domains: []
+  allowed_domains: []                 # empty = allow all (subject to denied_domains)
   denied_domains: []
-  safe_mode: false                  # forbids downloads, custom JS, submit-button clicks
+  safe_mode: false                    # master kill-switch -> forces all allow_* below to False
+
+  # Granular flags (each independently configurable when safe_mode is False)
+  allow_js_evaluation: false          # gates EvaluateInput actions (LLM-supplied JS)
+  allow_downloads: true               # gates agent.download() calls
+  allow_form_submit: true             # gates clicks on submit-typed buttons (heuristic)
+  block_private_ips: true             # SSRF protection: blocks RFC1918 + loopback + AWS IMDS
+
+  # Per-call budgets (cost limiters)
   max_pages_per_call: 50
   max_chars_per_call: 1000000
   max_time_per_call_seconds: 300
 
-# Auto-capture HTML/screenshot/error JSON on failures.
+  # Politeness layer (NEW in 1.3.0)
+  rate_limit_per_host_rps: 2.0        # 0 disables the rate limiter entirely
+  respect_robots_txt: true            # fetch + obey robots.txt (1h TTL cache)
+  robots_user_agent: "web-agent-toolkit"
+
+# ---------------------------------------------------------------------------
+# Audit log (NEW in 1.3.0): append-only JSONL of every Agent operation
+# ---------------------------------------------------------------------------
+audit:
+  enabled: false
+  audit_log_path: "./audit.jsonl"
+
+# ---------------------------------------------------------------------------
+# Disk cache (NEW in 1.5.0): TTL cache for fetch + search results
+# Cache hits skip rate-limit and network. robots.txt still runs first.
+# ---------------------------------------------------------------------------
+cache:
+  enabled: false
+  cache_dir: "./cache"
+  ttl_seconds: 3600                   # 1 hour
+  max_cache_mb: 100                   # LRU-by-mtime eviction past this
+
+# ---------------------------------------------------------------------------
+# Debug capture: HTML / screenshot / error JSON on failures
 # Artifacts saved to debug_dir/{correlation_id}/{timestamp}-{label}.{ext}
+# ---------------------------------------------------------------------------
 debug:
   enabled: false
   debug_dir: "./debug"

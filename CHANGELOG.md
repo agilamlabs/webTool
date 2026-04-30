@@ -17,8 +17,9 @@ on every successful trafilatura extraction).
 - ``CacheConfig``: ``enabled`` (False), ``cache_dir`` (./cache),
   ``ttl_seconds`` (3600), ``max_cache_mb`` (100). Path resolved
   against ``base_dir`` like other directory configs.
-- Wired into ``WebFetcher.fetch`` (cache hit returns immediately,
-  skipping rate-limit + robots + network) and
+- Wired into ``WebFetcher.fetch`` (cache hit skips rate-limit +
+  network; robots.txt is still checked first so a host's robots.txt
+  changes immediately take effect even on cached URLs) and
   ``SearchEngine.search`` (cache hit short-circuits the full provider
   chain). Both subsystems take a ``cache: Cache | None`` kwarg.
 - Only **successful** fetches and **non-empty** search responses are
