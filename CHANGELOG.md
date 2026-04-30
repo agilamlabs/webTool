@@ -1,5 +1,69 @@
 # Changelog
 
+## [1.5.2] - 2026-04-30
+
+### Hygiene cleanup (10 findings from full-project review)
+
+Bug fix:
+
+- ``SearchEngine.search`` cache hits now reset ``searched_at`` to
+  ``datetime.now(timezone.utc)`` instead of returning the original
+  search timestamp. Previously, a 1-hour-old cache hit would surface
+  a stale ``searched_at`` that misled callers into thinking the data
+  was fresh; now ``from_cache=True`` is the source of truth and
+  ``searched_at`` reflects when the cached payload was returned.
+  ``WebFetcher`` already did the right thing.
+
+Dead code:
+
+- Removed unused ``RetryableHTTPError`` class from
+  ``web_agent/utils.py`` -- never raised anywhere; the 5xx path in
+  ``web_fetcher.py`` raises a plain ``Exception`` and lets
+  ``async_retry`` handle it.
+- Removed two unused fixtures (``minimal_html``, ``empty_html``)
+  from ``tests/conftest.py``.
+
+Documentation drift:
+
+- ``SearchError`` docstring no longer says "Google and DuckDuckGo
+  both failed" -- now correctly describes the v1.4 multi-provider
+  chain. Same fix in ``Agent.search_and_extract`` docstring (3 spots),
+  ``mcp_server.py:web_search`` docstring, and the README's strict-mode
+  example.
+- README "Project Structure" section was missing 5 modules added in
+  v1.3-1.5: ``rate_limiter.py``, ``robots.py``, ``audit.py``,
+  ``cache.py``, ``search_providers.py``. Added with version-stamp
+  one-liners.
+- README test count refreshed: 111 -> 213, 90 unit -> 192 unit. The
+  unit-test command was rewritten to use ``--ignore`` instead of an
+  explicit (and incomplete) module list.
+- README export count refreshed: 49 -> 60 names; version stamp
+  ``v1.1.0`` -> ``v1.5.2``.
+- README configuration table + ``config.example.yaml`` now document
+  ``browser.slow_mo`` (was implemented but undocumented).
+
+Repo hygiene:
+
+- ``.gitignore`` now also ignores ``cache/`` and ``audit.jsonl``
+  (the default runtime output paths for v1.3 audit + v1.5 cache).
+- ``search_providers.py`` mixed ``Optional[X]`` and ``X | None`` in
+  the same file -- normalized to ``X | None`` (consistent with
+  Python 3.10+ idiom and the rest of the file's style).
+
+Comment fix:
+
+- ``WebFetcher.fetch`` cache-lookup comment was already corrected in
+  v1.5.1; no change here.
+
+Tests:
+
+- ``test_cache.py`` extended with ``test_fetch_caches_result_and_serves_from_cache``
+  -- covers the ``FetchResult.from_cache`` field that previously had
+  no direct test (only the ``SearchResponse.from_cache`` counterpart
+  was tested).
+
+Test count: 192 -> 193 unit (+1). 213 -> 214 total.
+
 ## [1.5.0] - 2026-04-30
 
 ### New: disk-backed TTL cache + markdown extraction

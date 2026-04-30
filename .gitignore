@@ -45,6 +45,9 @@ downloads/
 output/
 screenshots/
 debug/
+cache/
+audit.jsonl
+*.audit.jsonl
 
 # Loose generated files at the repo root (HTML/PDF/images dropped by tests
 # or by the agent during ad-hoc runs). Anything intentional belongs in

@@ -209,3 +209,51 @@ class TestCacheIntegrationViaAgent:
         third = await agent._search.search("test query", max_results=10)
         assert call_count == 2
         assert third.from_cache is False
+
+    @pytest.mark.asyncio
+    async def test_fetch_caches_result_and_serves_from_cache(self, tmp_path: Path) -> None:
+        """Counterpart of the search test: WebFetcher.fetch sets from_cache=True
+        on a hit. We stub _do_fetch so no browser is started."""
+        from unittest.mock import AsyncMock
+
+        from web_agent import Agent, AppConfig
+        from web_agent.models import FetchResult, FetchStatus
+
+        config = AppConfig(
+            cache={"enabled": True, "cache_dir": str(tmp_path / "cache")},
+            # Disable both politeness checks so the test is hermetic.
+            safety={
+                "rate_limit_per_host_rps": 0,
+                "respect_robots_txt": False,
+            },
+        )
+        agent = Agent(config)
+
+        # Stub the network layer so no browser launches.
+        call_count = 0
+
+        async def _fake_do_fetch(url: str, session_id=None) -> FetchResult:
+            nonlocal call_count
+            call_count += 1
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status_code=200,
+                status=FetchStatus.SUCCESS,
+                html=f"<html><body>Hi from {url}</body></html>",
+                response_time_ms=10.0,
+            )
+
+        agent._fetcher._do_fetch = AsyncMock(side_effect=_fake_do_fetch)
+
+        first = await agent._fetcher.fetch("https://example.com/page")
+        assert call_count == 1
+        assert first.from_cache is False
+        assert first.status == FetchStatus.SUCCESS
+
+        # Second identical call -> cache hit, no network, from_cache=True
+        second = await agent._fetcher.fetch("https://example.com/page")
+        assert call_count == 1, "_do_fetch should NOT have been re-called"
+        assert second.from_cache is True
+        assert second.status == FetchStatus.SUCCESS
+        assert second.html == first.html
