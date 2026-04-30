@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -95,6 +95,12 @@ from .models import (
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
 from .robots import RobotsChecker
+from .search_providers import (
+    DDGSProvider,
+    PlaywrightProvider,
+    SearchProvider,
+    SearXNGProvider,
+)
 from .utils import BudgetTracker, RetryPolicy, get_retry_policy
 
 __all__ = [
@@ -126,6 +132,11 @@ __all__ = [
     "AuditLogger",
     "RateLimiter",
     "RobotsChecker",
+    # Search providers
+    "DDGSProvider",
+    "PlaywrightProvider",
+    "SearXNGProvider",
+    "SearchProvider",
     # Exceptions
     "ActionError",
     "ActionTimeoutError",

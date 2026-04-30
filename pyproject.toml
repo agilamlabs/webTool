@@ -30,6 +30,7 @@ dependencies = [
     "PyYAML>=6.0",
     "httpx>=0.28.0",
     "mcp[cli]>=1.0.0",
+    "ddgs>=9.0.0",
 ]
 
 [project.optional-dependencies]

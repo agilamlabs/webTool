@@ -1,5 +1,73 @@
 # Changelog
 
+## [1.4.0] - 2026-04-30
+
+### Search pipeline rebuilt: SearXNG -> DDGS -> Playwright
+
+The hardcoded "Google then DuckDuckGo via Playwright" path is replaced
+with a configurable provider chain. The old behavior is still available
+as the third tier; the new default makes search **3-5x faster** by
+skipping browser launch when an API-based provider can answer.
+
+**New flow** for ``Agent.search_and_extract(query)``:
+
+1. **URL short-circuit** -- if ``query`` is itself a single ``http(s)://``
+   URL, skip search entirely and fetch + extract the URL directly.
+2. **SearXNG** -- query a self-hosted SearXNG JSON API. Privacy-
+   respecting metasearch aggregator. Skipped silently when
+   ``searxng_base_url`` is not set.
+3. **DDGS** -- DuckDuckGo via the ``ddgs`` Python package (no browser).
+   Skipped silently if the optional dep is missing.
+4. **Playwright** -- browser-driven Google + DDG-HTML scraping (the
+   pre-1.4 behavior, still here as the safety-net fallback).
+5. Extract page content (existing trafilatura -> bs4 -> raw chain).
+
+### New modules
+
+- ``web_agent/search_providers.py``:
+  - ``SearchProvider`` (ABC)
+  - ``SearXNGProvider`` -- httpx + SearXNG JSON API
+  - ``DDGSProvider`` -- ``ddgs`` package (lazy-imported, optional)
+  - ``PlaywrightProvider`` -- absorbed the old Google + DDG-HTML
+    parsing logic from ``search_engine.py``
+
+### Refactor
+
+- ``SearchEngine`` is now a ~140-line chain orchestrator over
+  ``SearchProvider`` instances. Builds the catalog from
+  ``config.search.providers`` (default
+  ``["searxng", "ddgs", "playwright"]``) and walks the chain until
+  one returns results. ``strict=True`` raises ``SearchError`` if all
+  providers exhaust.
+- The 200+ lines of Google SERP parsing + DDG-HTML parsing moved out
+  of ``search_engine.py`` and into ``PlaywrightProvider``. No public
+  API change.
+
+### Config additions
+
+- ``SearchConfig.providers: list[str] = ["searxng", "ddgs", "playwright"]``
+- ``SearchConfig.searxng_base_url: str | None = None``
+- ``SearchConfig.searxng_timeout: float = 10.0``
+
+### Dependencies
+
+- New runtime dep: ``ddgs >= 9.0.0`` (formerly ``duckduckgo-search``).
+
+### Tests
+
+- ``tests/test_search_providers.py`` (new): 23 tests covering each
+  provider in isolation (mocked HTTP / mocked ``ddgs``), the chain
+  orchestrator (mocked providers via ``_RecordingProvider``), and
+  URL-as-query detection.
+- Test count: 171 -> 196 unit tests (192 -> 217 total with
+  integration). All green.
+
+### Performance
+
+- Live integration suite (``tests/test_agent.py``) runs in **~36s**
+  vs. ~106s pre-1.4 because DDGS resolves search results in
+  sub-second without a browser launch.
+
 ## [1.3.0] - 2026-04-30
 
 ### New: politeness layer + audit log
