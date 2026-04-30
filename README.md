@@ -293,7 +293,11 @@ python -m web_agent interact "https://example.com" --actions actions.json
 ```
 Agent (orchestrator)
   |
-  |-- SearchEngine          Google -> DuckDuckGo fallback
+  |-- SearchEngine          Chain: SearXNG -> DDGS -> Playwright
+  |     |-- SearXNGProvider     httpx + self-hosted SearXNG JSON API
+  |     |-- DDGSProvider        ddgs package (no browser needed)
+  |     `-- PlaywrightProvider  Browser-driven Google + DDG HTML
+  |
   |-- WebFetcher            Playwright page rendering + retry
   |-- ContentExtractor      trafilatura -> BS4 -> raw text
   |-- Downloader            httpx -> Playwright page save -> Playwright download
@@ -304,10 +308,41 @@ Agent (orchestrator)
 
 **Smart routing:**
 
+- **URL-as-query**: `agent.search_and_extract("https://example.com")` skips search entirely and fetches the URL directly
+- **Search chain**: SearXNG (skipped silently if `searxng_base_url` not set) -> DDGS (skipped silently if `ddgs` not installed) -> Playwright (always available, slow fallback)
 - File URLs (`.pdf`, `.xlsx`, `.zip`) are detected upfront and routed to the downloader
 - Web page URLs (`.html`, `.htm`) use Playwright page save instead of download events
 - `networkidle` timeouts automatically fall back to `load` wait state
 - HTTP 4xx errors fail immediately; 5xx errors retry with exponential backoff
+
+### Configuring the search chain
+
+```python
+from web_agent import Agent, AppConfig
+
+# Use a self-hosted SearXNG as the primary source
+config = AppConfig(search={
+    "providers": ["searxng", "ddgs", "playwright"],
+    "searxng_base_url": "http://localhost:8888",
+    "searxng_timeout": 10.0,
+})
+
+# Or skip browser-based search entirely (faster, but no fallback if APIs fail)
+config = AppConfig(search={"providers": ["searxng", "ddgs"]})
+
+# Or only use the legacy Playwright path (1.3.0 behavior)
+config = AppConfig(search={"providers": ["playwright"]})
+
+async with Agent(config) as agent:
+    result = await agent.search_and_extract("python web scraping")
+```
+
+The chain falls through on each provider's empty result or transient error. Pass `strict=True` to raise `SearchError` when the entire chain exhausts:
+
+```python
+result = await agent.search_and_extract("query", strict=True)
+# raises SearchError if SearXNG, DDGS, and Playwright all fail
+```
 
 ## Browser Sessions
 

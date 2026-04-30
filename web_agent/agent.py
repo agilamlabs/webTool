@@ -77,6 +77,18 @@ from .utils import BudgetTracker, check_domain_allowed
 from .web_fetcher import WebFetcher, _is_download_url
 
 
+def _query_is_url(query: str) -> bool:
+    """Detect a search query that is itself a single URL.
+
+    True iff the (stripped) query starts with ``http://`` or ``https://``
+    AND contains no whitespace -- avoids matching natural-language
+    queries like "fetch https://example.com please" which should still
+    go through the search pipeline.
+    """
+    s = query.strip()
+    return s.startswith(("http://", "https://")) and " " not in s
+
+
 class Agent:
     """Main entry point for the web_agent toolkit.
 
@@ -207,6 +219,31 @@ class Agent:
             start = time.perf_counter()
             errors: list[str] = []
             budget = BudgetTracker(self._config.safety)
+
+            # Step 1: URL-as-query short-circuit. If the caller passed a
+            # bare URL instead of a search query, skip the search chain
+            # and fetch + extract the URL directly. Returns an
+            # AgentResult with an empty search response and a single page.
+            from .models import SearchResponse
+
+            if _query_is_url(query):
+                logger.info("Query is a URL, skipping search: {q}", q=query)
+                fr = await self._fetcher.fetch(query, session_id=session_id)
+                url_pages: list[ExtractionResult] = []
+                if fr.html:
+                    extracted = self._extractor.extract(fr)
+                    extracted.correlation_id = cid
+                    url_pages.append(extracted)
+                else:
+                    errors.append(f"Failed to fetch {query}: {fr.error_message or 'unknown'}")
+                return AgentResult(
+                    query=query,
+                    search=SearchResponse(query=query),
+                    pages=url_pages,
+                    errors=errors,
+                    total_time_ms=(time.perf_counter() - start) * 1000,
+                    correlation_id=cid,
+                )
 
             logger.info("Starting pipeline for query: {q}", q=query)
             search_response = await self._search.search(query, max_results, strict=strict)

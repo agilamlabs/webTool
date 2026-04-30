@@ -44,13 +44,48 @@ class BrowserConfig(BaseSettings):
 
 
 class SearchConfig(BaseSettings):
-    """Web search parameters (Google primary, DuckDuckGo fallback)."""
+    """Web search parameters and multi-provider chain configuration.
+
+    Provider chain (NEW in 1.4.0): ``providers`` lists search backends
+    in priority order. Each provider is tried until one returns
+    results. Available providers:
+
+    - ``"searxng"`` -- self-hosted SearXNG instance via JSON API (set
+      ``searxng_base_url`` to enable, otherwise silently skipped).
+    - ``"ddgs"`` -- DuckDuckGo via the ``ddgs`` package (silently
+      skipped when the optional dependency is missing).
+    - ``"playwright"`` -- browser-driven Google + DDG HTML scraping
+      (always available; slow but reliable fallback).
+
+    To use only browser-based search: ``providers=["playwright"]``.
+    To skip Playwright entirely: ``providers=["searxng", "ddgs"]``.
+    """
 
     max_results: int = 10
     search_url: str = "https://www.google.com/search"
     language: str = "en"
     region: str = "us"
     safe_search: bool = False
+
+    # Multi-provider chain (NEW in 1.4.0)
+    providers: list[str] = Field(
+        default_factory=lambda: ["searxng", "ddgs", "playwright"],
+        description=(
+            "Search providers tried in priority order. First non-empty "
+            "result wins. Available: 'searxng', 'ddgs', 'playwright'."
+        ),
+    )
+    searxng_base_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Base URL of self-hosted SearXNG (e.g. http://localhost:8888). "
+            "When None, the SearXNG provider is silently skipped."
+        ),
+    )
+    searxng_timeout: float = Field(
+        default=10.0,
+        description="HTTP timeout (seconds) for SearXNG JSON API calls.",
+    )
 
 
 class FetchConfig(BaseSettings):
