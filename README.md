@@ -344,6 +344,53 @@ result = await agent.search_and_extract("query", strict=True)
 # raises SearchError if SearXNG, DDGS, and Playwright all fail
 ```
 
+### Self-hosting SearXNG (recommended for the primary tier)
+
+[SearXNG](https://github.com/searxng/searxng) is a privacy-respecting metasearch engine that aggregates ~80 search backends (Google, Bing, DuckDuckGo, Wikipedia, GitHub, arXiv, etc.) without tracking. Self-hosting gives you the fastest tier of the chain (no browser launch, no third-party rate limit) at the cost of running one container.
+
+The repo ships a tuned config under [`docker/searxng/`](docker/searxng/):
+
+- [`docker-compose.yml`](docker/searxng/docker-compose.yml) — pinned to the official `searxng/searxng:latest` image, bound to `127.0.0.1:8888` only.
+- [`settings.yml`](docker/searxng/settings.yml) — JSON output enabled (required by web_agent), default engines, internal limiter disabled (web_agent rate-limits on its own).
+
+Three steps from a fresh clone:
+
+```bash
+# 1. Generate a per-deployment secret key:
+python -c "import secrets; print(secrets.token_hex(32))"
+# ... paste the output into docker/searxng/settings.yml in place of
+# the REPLACE_WITH_RANDOM_STRING placeholder.
+
+# 2. Start the container:
+docker compose -f docker/searxng/docker-compose.yml up -d
+
+# 3. Smoke-test the JSON endpoint web_agent uses:
+curl 'http://localhost:8888/search?q=python&format=json' | head -c 500
+```
+
+Then point web_agent at it:
+
+```python
+from web_agent import Agent, AppConfig
+
+config = AppConfig(search={
+    "providers": ["searxng", "ddgs", "playwright"],
+    "searxng_base_url": "http://localhost:8888",
+})
+async with Agent(config) as agent:
+    result = await agent.search_and_extract("python web scraping")
+    # First provider in the chain (SearXNG) handles it -- no browser
+    # launch, no DDGS network, sub-second latency.
+```
+
+To stop and clean up:
+
+```bash
+docker compose -f docker/searxng/docker-compose.yml down
+```
+
+**Production / shared use**: re-enable the SearXNG-level rate limiter (`server.limiter: true` in `settings.yml`), put it behind a reverse proxy with auth + TLS, and consider a Redis backend (see the [SearXNG admin docs](https://docs.searxng.org/admin/settings/settings_server.html)).
+
 ## Browser Sessions
 
 Persistent browser sessions retain cookies, localStorage, and origin tokens across multiple Agent calls -- ideal for login flows, multi-step workflows, or any task that needs continuity.

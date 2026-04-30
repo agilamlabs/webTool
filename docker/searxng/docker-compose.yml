@@ -1,0 +1,53 @@
+# Self-hosted SearXNG instance for use as the primary search provider
+# in the web_agent toolkit.
+#
+# Quick start (from the repo root):
+#
+#   1. Generate a secret key and write it into settings.yml:
+#        # Linux / macOS:
+#        SECRET=$(openssl rand -hex 32)
+#        sed -i "s/REPLACE_WITH_RANDOM_STRING/$SECRET/" docker/searxng/settings.yml
+#        # Windows / portable (any platform with Python):
+#        python -c "import secrets; print(secrets.token_hex(32))"
+#        # ... then paste it into settings.yml manually
+#
+#   2. Bring the stack up:
+#        docker compose -f docker/searxng/docker-compose.yml up -d
+#
+#   3. Smoke-test the JSON endpoint web_agent uses:
+#        curl 'http://localhost:8888/search?q=python&format=json' | head -c 500
+#
+#   4. Point web_agent at it:
+#        from web_agent import Agent, AppConfig
+#        cfg = AppConfig(search={"searxng_base_url": "http://localhost:8888"})
+#        async with Agent(cfg) as agent:
+#            await agent.search_and_extract("hello world")
+#
+# By default the service binds to 127.0.0.1:8888 -- ONLY reachable
+# from the host running Docker. To expose to your LAN, change the
+# port mapping to "8888:8080" (no IP prefix). Don't expose to the
+# internet without a reverse proxy + auth.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: web-agent-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - INSTANCE_NAME=web-agent-searxng
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "1"

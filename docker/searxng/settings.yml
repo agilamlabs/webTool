@@ -1,0 +1,41 @@
+# SearXNG configuration tuned for use with the web_agent toolkit.
+#
+# CRITICAL: `search.formats` MUST include `json` -- web_agent calls
+#   /search?format=json
+# and SearXNG returns 403 if JSON output isn't explicitly enabled.
+#
+# CRITICAL: `secret_key` MUST be a unique random string per deployment.
+# Generate one with:
+#   Linux / macOS:  openssl rand -hex 32
+#   Any platform:   python -c "import secrets; print(secrets.token_hex(32))"
+# Then replace the placeholder below.
+
+use_default_settings: true
+
+server:
+  secret_key: "REPLACE_WITH_RANDOM_STRING"
+  # web_agent has its own per-host rate gate
+  # (safety.rate_limit_per_host_rps, default 2 rps) so we disable the
+  # SearXNG-level limiter to avoid double-throttling local dev.
+  # For a production / shared instance, set this back to `true` and
+  # configure a Redis backend (see SearXNG docs:
+  # https://docs.searxng.org/admin/settings/settings_server.html).
+  limiter: false
+  image_proxy: true
+
+search:
+  # web_agent requires JSON. HTML is kept enabled so you can also
+  # browse the same instance manually at http://localhost:8888.
+  formats:
+    - html
+    - json
+  safe_search: 0          # 0=off, 1=moderate, 2=strict
+  autocomplete: ""        # disabled -- web_agent doesn't need it
+
+ui:
+  default_locale: en
+  query_in_title: false
+  infinite_scroll: false
+
+# Engines: leaving default (~80 enabled). Browse to /preferences on
+# the running instance to disable any you don't want.
