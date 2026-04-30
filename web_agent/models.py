@@ -450,6 +450,13 @@ class ScreenshotResult(BaseModel):
     format: ScreenshotFormat
     size_bytes: int = Field(default=0)
     status: ActionStatus
+    error_message: Optional[str] = Field(
+        default=None,
+        description=(
+            "Failure reason when status != SUCCESS (domain blocked, "
+            "redirected to disallowed host, path traversal rejected, etc.)"
+        ),
+    )
     correlation_id: Optional[str] = Field(default=None)
 
 
