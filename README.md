@@ -4,6 +4,8 @@ Professional agentic web search, fetch, download, extraction, and browser automa
 
 Designed as a tool for AI agents that need to search the web, fetch JavaScript-heavy pages, extract structured content, download files, and automate browser interactions -- all through a clean async Python API.
 
+Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
+
 ## Features
 
 - **Web Search** -- Free-first provider chain: SearXNG -> DDGS -> Playwright fallback. URL-as-query short-circuits to direct fetch.
@@ -24,7 +26,7 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 - **Screenshots** -- Viewport, full-page, or element-specific captures
 - **Anti-Detection** -- playwright-stealth, user-agent rotation, resource blocking
 - **Structured Output** -- All results are Pydantic v2 models serializable to JSON
-- **MCP Server** -- 11 tools exposed to Claude Desktop, Claude Code, Cursor, and other MCP-compatible AI clients
+- **MCP Server** -- 11 tools exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client
 
 ## Installation
 
@@ -644,7 +646,7 @@ logger.add(sys.stderr, format="{time} | {extra[cid]} | {message}")
 
 ## MCP Integration
 
-Run `web_agent` as an MCP (Model Context Protocol) server so Claude Desktop, Claude Code, Cursor, and any other MCP-compatible AI client can use it directly as a tool. The browser stays warm across tool calls within a session (skips ~5-10s startup per call after the first).
+Run `web_agent` as an MCP (Model Context Protocol) server so Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client can use it directly as a tool. The browser stays warm across tool calls within a session (skips ~5-10s startup per call after the first).
 
 ### Starting the server
 
@@ -748,6 +750,31 @@ Edit `~/.cursor/mcp.json` (or project-local `.cursor/mcp.json`):
 }
 ```
 
+### Codex Setup
+
+OpenAI's [Codex CLI](https://developers.openai.com/codex/cli) reads MCP servers from `~/.codex/config.toml`. Add:
+
+```toml
+[mcp_servers.web_agent]
+command = "python"
+args = ["-m", "web_agent.mcp_server"]
+```
+
+Or scope to a single project via `.codex/config.toml` (only honored in trusted project dirs). For environment-variable overrides:
+
+```toml
+[mcp_servers.web_agent]
+command = "python"
+args = ["-m", "web_agent.mcp_server"]
+
+[mcp_servers.web_agent.env]
+WEB_AGENT_LOG_LEVEL = "INFO"
+WEB_AGENT_SEARCH__SEARXNG_BASE_URL = "http://localhost:8888"
+WEB_AGENT_CACHE__ENABLED = "true"
+```
+
+You can manage entries from the CLI with `codex mcp add` / `codex mcp list`. The IDE extension (VS Code / JetBrains Codex plugin) shares this config -- no duplicate setup needed.
+
 ### Custom Config via Environment Variables
 
 All `AppConfig` fields are overridable via env vars in the MCP config:
@@ -780,6 +807,105 @@ mcp dev web_agent/mcp_server.py
 ```
 
 This launches a web UI where you can invoke each tool with test inputs and see the results.
+
+## Using web_agent as a Backend for Local Agents
+
+`web_agent` is designed to slot under autonomous agents that run on user hardware (no API keys, no cloud calls). Two integration shapes work for almost any framework:
+
+### OpenClaw Integration
+
+[OpenClaw](https://github.com/openclaw/openclaw) is a local autonomous AI agent (the runtime, not a framework). It needs a web backend to actually browse / search / scrape, and `web_agent` is a clean fit: free-first search chain (SearXNG -> DDGS -> Playwright), built-in safety policy (rate limit + robots.txt + SSRF protection + domain allow/deny), and structured Pydantic output that matches OpenClaw's tool-result schema.
+
+**Path A: As an MCP server** (recommended -- browser stays warm across calls, zero glue code):
+
+```toml
+# In OpenClaw's MCP server registry (consult your OpenClaw deployment
+# for the exact path -- typically ~/.openclaw/config.toml or similar)
+[[mcp_servers]]
+name = "web_agent"
+command = "python"
+args = ["-m", "web_agent.mcp_server"]
+
+[mcp_servers.env]
+# Tighter policy for an always-on autonomous agent:
+WEB_AGENT_SAFETY__RATE_LIMIT_PER_HOST_RPS = "1.0"
+WEB_AGENT_SAFETY__RESPECT_ROBOTS_TXT = "true"
+WEB_AGENT_AUDIT__ENABLED = "true"
+WEB_AGENT_AUDIT__AUDIT_LOG_PATH = "/var/log/openclaw/web_agent.audit.jsonl"
+WEB_AGENT_CACHE__ENABLED = "true"
+WEB_AGENT_CACHE__CACHE_DIR = "/var/cache/openclaw/web_agent"
+```
+
+OpenClaw will auto-discover all 11 tools (`web_search`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the 3 recipes, plus the 3 session-management tools).
+
+**Path B: As a Python library** (for OpenClaw skills / custom hooks where you need fine control):
+
+```python
+from web_agent import Agent, AppConfig
+
+# Production-ready config for an unattended agent:
+config = AppConfig(
+    search={
+        "providers": ["searxng", "ddgs", "playwright"],
+        "searxng_base_url": "http://localhost:8888",  # see docker/searxng/
+    },
+    safety={
+        "respect_robots_txt": True,
+        "rate_limit_per_host_rps": 1.0,    # be a good citizen 24/7
+        "block_private_ips": True,         # SSRF defense
+        "denied_domains": ["facebook.com", "tiktok.com"],
+    },
+    cache={"enabled": True, "ttl_seconds": 3600},
+    audit={"enabled": True, "audit_log_path": "./openclaw_web.jsonl"},
+)
+
+async with Agent(config) as agent:
+    # Tool intent: "research"
+    research = await agent.web_research("vector databases comparison", max_pages=5)
+
+    # Tool intent: "open this URL"
+    page = await agent.fetch_and_extract(url)
+    print(page.markdown)  # LLM-friendly markdown rendering
+
+    # Tool intent: "fetch this report"
+    dl = await agent.download(url, filename="q4-report.pdf")
+```
+
+Pair `web_agent.safety` with OpenClaw's policy layer -- the granular flags (`allow_js_evaluation`, `allow_downloads`, `allow_form_submit`) and the audit log give OpenClaw a tamper-evident record of every web operation the agent took, which is invaluable when running unattended.
+
+### Generic LangGraph / LangChain Integration
+
+The Python-library path above also works inside any LangGraph node or LangChain tool:
+
+```python
+from langchain_core.tools import tool
+from web_agent import Agent, AppConfig
+
+# Agent is created once per graph; reuse across nodes via dependency injection
+_agent: Agent | None = None
+
+async def get_agent() -> Agent:
+    global _agent
+    if _agent is None:
+        _agent = await Agent(AppConfig(cache={"enabled": True})).__aenter__()
+    return _agent
+
+@tool
+async def web_search_and_extract(query: str, max_results: int = 5) -> dict:
+    """Search the web and extract content from the top results."""
+    agent = await get_agent()
+    result = await agent.search_and_extract(query, max_results=max_results)
+    return result.model_dump()
+
+@tool
+async def web_fetch(url: str) -> dict:
+    """Fetch and extract a single URL."""
+    agent = await get_agent()
+    result = await agent.fetch_and_extract(url)
+    return result.model_dump()
+```
+
+Pydantic v2 result models serialize cleanly to dicts, so they round-trip through LangGraph's state without custom encoders.
 
 ## Error Handling
 
