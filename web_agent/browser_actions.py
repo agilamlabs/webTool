@@ -66,7 +66,7 @@ from .models import (
     WaitTarget,
 )
 from .session_manager import SessionManager
-from .utils import check_domain_allowed
+from .utils import check_domain_allowed, safe_join_path
 
 
 # Heuristic CSS patterns that look like submit buttons (used by safe_mode)
@@ -80,17 +80,34 @@ _SUBMIT_BUTTON_HINTS = (
 )
 
 
+_SUBMIT_TEXT_KEYWORDS = (
+    "submit", "send", "save", "log in", "sign in", "register",
+    "create account", "continue",
+)
+
+
 def _looks_like_submit(selector: SelectorLike | None) -> bool:
-    """Best-effort heuristic: does this selector look like a submit button?"""
+    """Best-effort heuristic: does this selector look like a submit button?
+
+    For a CSS selector string, checks for ``button[type=submit]`` patterns.
+    For a LocatorSpec, checks every text-bearing field (role_name, text,
+    label, placeholder) for submit-like keywords (submit, send, save,
+    log in, sign in, register, create account, continue).
+    """
     if selector is None:
         return False
     if isinstance(selector, LocatorSpec):
-        if selector.role == "button" and selector.role_name:
-            name_lower = selector.role_name.lower()
-            return any(
-                kw in name_lower for kw in ("submit", "send", "save", "log in", "sign in")
-            )
-        # Check selector field of LocatorSpec
+        # Check ALL text-bearing fields, not just role_name
+        for text_field in (
+            selector.role_name,
+            selector.text,
+            selector.label,
+            selector.placeholder,
+        ):
+            if text_field and any(
+                kw in text_field.lower() for kw in _SUBMIT_TEXT_KEYWORDS
+            ):
+                return True
         sel_str = (selector.selector or "").lower()
     else:
         sel_str = selector.lower()
@@ -111,7 +128,12 @@ def _resolve_locator(page: Page, spec: SelectorLike) -> Locator:
 
     Resolution priority for LocatorSpec (first non-None wins):
         role > test_id > label > placeholder > text > selector
+
+    Raises:
+        SelectorNotFoundError: If ``spec`` is an empty LocatorSpec.
     """
+    from .exceptions import SelectorNotFoundError
+
     if isinstance(spec, str):
         return page.locator(spec)
 
@@ -130,7 +152,10 @@ def _resolve_locator(page: Page, spec: SelectorLike) -> Locator:
     if spec.selector:
         return page.locator(spec.selector)
 
-    raise ValueError("LocatorSpec is empty (no selector field set)")
+    raise SelectorNotFoundError(
+        "LocatorSpec is empty (no selector field set)",
+        action="resolve_locator",
+    )
 
 
 class _DialogState:
@@ -222,48 +247,43 @@ class BrowserActions:
                 correlation_id=cid,
             )
 
-        # Pre-flight safe_mode checks: forbid evaluate + submit-button clicks
-        if self._config.safety.safe_mode:
-            for a in actions:
-                if isinstance(a, EvaluateInput):
-                    return ActionSequenceResult(
-                        url=url,
-                        actions_total=len(actions),
-                        actions_failed=len(actions),
-                        results=[
-                            ActionResult(
-                                action=ActionType(act.action),
-                                status=ActionStatus.SKIPPED,
-                                selector=_selector_repr(
-                                    getattr(act, "selector", None)
-                                ),
-                                error_message="safe_mode forbids EvaluateInput (custom JS)",
-                            )
-                            for act in actions
-                        ],
-                        correlation_id=cid,
+        # Pre-flight granular safety checks
+        safety = self._config.safety
+
+        def _block_all(reason: str) -> ActionSequenceResult:
+            return ActionSequenceResult(
+                url=url,
+                actions_total=len(actions),
+                actions_failed=len(actions),
+                results=[
+                    ActionResult(
+                        action=ActionType(act.action),
+                        status=ActionStatus.SKIPPED,
+                        selector=_selector_repr(
+                            getattr(act, "selector", None)
+                        ),
+                        error_message=reason,
                     )
-                if isinstance(a, ClickInput) and _looks_like_submit(a.selector):
-                    return ActionSequenceResult(
-                        url=url,
-                        actions_total=len(actions),
-                        actions_failed=len(actions),
-                        results=[
-                            ActionResult(
-                                action=ActionType(act.action),
-                                status=ActionStatus.SKIPPED,
-                                selector=_selector_repr(
-                                    getattr(act, "selector", None)
-                                ),
-                                error_message=(
-                                    "safe_mode forbids clicking submit-typed buttons "
-                                    "(form submission heuristic)"
-                                ),
-                            )
-                            for act in actions
-                        ],
-                        correlation_id=cid,
-                    )
+                    for act in actions
+                ],
+                correlation_id=cid,
+            )
+
+        for a in actions:
+            if isinstance(a, EvaluateInput) and not safety.allow_js_evaluation:
+                return _block_all(
+                    "EvaluateInput blocked: safety.allow_js_evaluation=False "
+                    "(set safety.allow_js_evaluation=True to opt in)"
+                )
+            if (
+                isinstance(a, ClickInput)
+                and not safety.allow_form_submit
+                and _looks_like_submit(a.selector)
+            ):
+                return _block_all(
+                    "Submit-button click blocked: safety.allow_form_submit=False "
+                    "(form submission heuristic; set allow_form_submit=True to opt in)"
+                )
 
         should_stop = (
             stop_on_error
@@ -279,18 +299,23 @@ class BrowserActions:
         # Per-sequence dialog state (thread-safe - not shared across sequences)
         dialog_state = _DialogState()
 
-        # Acquire page from session or ephemeral context
-        if session_id and self._sessions is not None:
-            ctx = self._sessions.get(session_id)
-            self._sessions.touch(session_id)
-            page = await ctx.new_page()
-            owner = "session"
-        else:
-            ctx_mgr = self._bm.new_page(block_resources=False)
-            page = await ctx_mgr.__aenter__()
-            owner = "ephemeral"
+        # Initialize cleanup state BEFORE the branch so the finally block is
+        # safe even if page-acquisition raises (e.g. unknown session_id, or
+        # ctx.new_page() fails on a closed browser context).
+        page = None
+        ctx_mgr = None
+        owner = "ephemeral"
 
         try:
+            if session_id and self._sessions is not None:
+                owner = "session"
+                ctx = self._sessions.get(session_id)
+                self._sessions.touch(session_id)
+                page = await ctx.new_page()
+            else:
+                ctx_mgr = self._bm.new_page(block_resources=False)
+                page = await ctx_mgr.__aenter__()
+
             await page.goto(url, wait_until="domcontentloaded")
             page.on("dialog", dialog_state.handle)
             page._web_agent_dialog_state = dialog_state  # type: ignore[attr-defined]
@@ -322,14 +347,37 @@ class BrowserActions:
                                 )
                             )
                         break
+        except Exception as exc:
+            # Acquisition or sequence error -- record it and let cleanup run.
+            failed += 1
+            results.append(
+                ActionResult(
+                    action=ActionType.NAVIGATE,
+                    status=ActionStatus.FAILED,
+                    error_message=f"Sequence aborted: {exc}",
+                )
+            )
+            for remaining in actions[len(results):]:
+                results.append(
+                    ActionResult(
+                        action=ActionType(remaining.action),
+                        status=ActionStatus.SKIPPED,
+                        selector=_selector_repr(
+                            getattr(remaining, "selector", None)
+                        ),
+                    )
+                )
         finally:
-            if owner == "session":
+            if page is not None and owner == "session":
                 try:
                     await page.close()
                 except Exception:  # noqa: BLE001
                     pass
-            else:
-                await ctx_mgr.__aexit__(None, None, None)
+            elif ctx_mgr is not None:
+                try:
+                    await ctx_mgr.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
 
         elapsed = (time.perf_counter() - start) * 1000
         return ActionSequenceResult(
@@ -344,7 +392,16 @@ class BrowserActions:
         )
 
     async def execute_action(self, page: Page, action_input: Action) -> ActionResult:
-        """Execute a single action on a page. Catches errors and returns structured result."""
+        """Execute a single action on a page. Catches errors and returns structured result.
+
+        Internal: action handlers may raise :class:`ActionError`,
+        :class:`ActionTimeoutError`, or :class:`SelectorNotFoundError`.
+        These are caught here and converted to structured ActionResult so
+        the caller (typically :meth:`execute_sequence`) sees consistent
+        result-based control flow regardless of failure mode.
+        """
+        from .exceptions import ActionError, ActionTimeoutError, SelectorNotFoundError
+
         action_type = ActionType(action_input.action)
         handler = self._dispatch.get(action_type)
         sel_repr = _selector_repr(getattr(action_input, "selector", None))
@@ -360,7 +417,7 @@ class BrowserActions:
             result = await handler(self, page, action_input)
             result.duration_ms = (time.perf_counter() - start) * 1000
             return result
-        except PlaywrightTimeout as e:
+        except (PlaywrightTimeout, ActionTimeoutError) as e:
             artifacts: list[str] = []
             if self._debug.enabled:
                 artifacts = await self._debug.capture_page(
@@ -374,7 +431,7 @@ class BrowserActions:
                 error_message=str(e),
                 debug_artifacts=artifacts,
             )
-        except Exception as e:
+        except (ActionError, SelectorNotFoundError, Exception) as e:
             artifacts = []
             if self._debug.enabled:
                 artifacts = await self._debug.capture_page(
@@ -418,6 +475,19 @@ class BrowserActions:
             ext = "png" if format == ScreenshotFormat.PNG else "jpg"
             safe_url = "".join(c if c.isalnum() else "_" for c in url)[:50]
             path = str(ss_dir / f"{safe_url}.{ext}")
+        else:
+            # Caller-supplied path -- defend against path traversal.
+            try:
+                path = str(safe_join_path(ss_dir, path))
+            except ValueError as exc:
+                logger.warning("Rejected screenshot path: {e}", e=exc)
+                return ScreenshotResult(
+                    url=url,
+                    path="",
+                    format=format,
+                    status=ActionStatus.FAILED,
+                    correlation_id=cid,
+                )
 
         async def _capture(page: Page) -> None:
             await page.goto(url, wait_until="networkidle")
@@ -572,6 +642,17 @@ class BrowserActions:
         if not path:
             ext = "png" if action.format == ScreenshotFormat.PNG else "jpg"
             path = str(ss_dir / f"screenshot_{int(time.time())}.{ext}")
+        else:
+            # Defend against path-traversal in caller-supplied path.
+            try:
+                path = str(safe_join_path(ss_dir, path))
+            except ValueError as exc:
+                return ActionResult(
+                    action=ActionType.SCREENSHOT,
+                    status=ActionStatus.FAILED,
+                    selector=_selector_repr(action.selector),
+                    error_message=f"Invalid screenshot path: {exc}",
+                )
 
         ss_kwargs: dict[str, Any] = {
             "path": path,
@@ -647,6 +728,8 @@ class BrowserActions:
         )
 
     async def _do_select(self, page: Page, action: SelectInput) -> ActionResult:
+        from .exceptions import ActionError
+
         timeout = self._resolve_timeout(action.timeout)
         sel_repr = _selector_repr(action.selector)
         kwargs: dict[str, Any] = {"timeout": timeout}
@@ -657,11 +740,10 @@ class BrowserActions:
         elif action.index is not None:
             kwargs["index"] = action.index
         else:
-            return ActionResult(
-                action=ActionType.SELECT,
-                status=ActionStatus.FAILED,
+            raise ActionError(
+                "Select action must specify one of: value, label, or index",
+                action="select",
                 selector=sel_repr,
-                error_message="Must specify value, label, or index",
             )
         loc = _resolve_locator(page, action.selector)
         await loc.select_option(**kwargs)

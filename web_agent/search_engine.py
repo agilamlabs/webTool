@@ -24,9 +24,23 @@ class SearchEngine:
         self._config = config
 
     async def search(
-        self, query: str, max_results: int | None = None
+        self,
+        query: str,
+        max_results: int | None = None,
+        *,
+        strict: bool = False,
     ) -> SearchResponse:
-        """Execute a web search, trying Google then DuckDuckGo as fallback."""
+        """Execute a web search, trying Google then DuckDuckGo as fallback.
+
+        Args:
+            query: Search query string.
+            max_results: Maximum number of results.
+            strict: If True, raise :class:`SearchError` when both engines
+                return zero results (instead of returning an empty SearchResponse).
+
+        Raises:
+            SearchError: If ``strict=True`` and both Google and DuckDuckGo fail.
+        """
         max_r = max_results or self._config.search.max_results
 
         # Try Google first
@@ -36,7 +50,19 @@ class SearchEngine:
 
         # Fall back to DuckDuckGo
         logger.info("Google returned no results, falling back to DuckDuckGo")
-        return await self._search_duckduckgo(query, max_r)
+        result = await self._search_duckduckgo(query, max_r)
+        if result.results:
+            return result
+
+        # Both engines failed -- caller may want an exception
+        if strict:
+            from .exceptions import SearchError
+            raise SearchError(
+                f"Both Google and DuckDuckGo returned no results for {query!r}. "
+                "This usually means the search engines blocked the request "
+                "(CAPTCHA / rate-limit) or the query has truly no matches."
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Google
@@ -274,7 +300,13 @@ class SearchEngine:
                 snippet_el = await element.query_selector("a.result__snippet")
                 snippet = await snippet_el.inner_text() if snippet_el else ""
 
-                if title and real_url:
+                # Reject non-http(s) schemes (javascript:, data:, file:)
+                # that DDG redirect targets could theoretically contain.
+                if (
+                    title
+                    and real_url
+                    and real_url.lower().startswith(("http://", "https://"))
+                ):
                     items.append(
                         SearchResultItem(
                             position=idx + 1,

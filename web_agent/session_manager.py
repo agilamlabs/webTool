@@ -71,23 +71,30 @@ class SessionManager:
         token = secrets.token_urlsafe(8)
         session_id = f"{name}-{token}" if name else token
 
-        ctx = await self._bm.create_persistent_context(block_resources=False)
-        ua = None
-        try:
-            # Try to extract the user agent that was set on the context's pages
-            ua_str = await ctx.new_page()
-            ua = await ua_str.evaluate("() => navigator.userAgent")
-            await ua_str.close()
-        except Exception:  # noqa: BLE001
-            ua = None
-
-        info = SessionInfo(session_id=session_id, name=name, user_agent=ua)
-
+        # Hold the lock across the entire creation: build context, probe UA,
+        # register in dict. Prevents the visible-but-unowned context that
+        # would result from a partial creation racing with close_all().
         async with self._lock:
+            ctx = await self._bm.create_persistent_context(block_resources=False)
+            ua = None
+            try:
+                ua_str = await ctx.new_page()
+                ua = await ua_str.evaluate("() => navigator.userAgent")
+                await ua_str.close()
+            except Exception:  # noqa: BLE001
+                ua = None
+
+            info = SessionInfo(
+                session_id=session_id, name=name, user_agent=ua
+            )
             self._sessions[session_id] = ctx
             self._info[session_id] = info
 
-        logger.info("Session created: {sid} (name={name})", sid=session_id, name=name)
+        logger.info(
+            "Session created: {sid} (name={name})",
+            sid=session_id,
+            name=name,
+        )
         return session_id
 
     async def close(self, session_id: str) -> None:
@@ -111,15 +118,23 @@ class SessionManager:
         logger.info("Session closed: {sid}", sid=session_id)
 
     async def close_all(self) -> None:
-        """Close every live session (called from Agent.__aexit__)."""
+        """Close every live session (called from Agent.__aexit__).
+
+        KeyError (session was already closed manually) is logged at DEBUG
+        rather than WARNING so normal teardown stays quiet.
+        """
         async with self._lock:
             sids = list(self._sessions.keys())
 
         for sid in sids:
             try:
                 await self.close(sid)
+            except KeyError:
+                logger.debug("Session {sid} already closed", sid=sid)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Error closing session {sid}: {e}", sid=sid, e=exc)
+                logger.warning(
+                    "Error closing session {sid}: {e}", sid=sid, e=exc
+                )
 
     def get(self, session_id: str) -> BrowserContext:
         """Return the live BrowserContext for ``session_id``.

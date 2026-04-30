@@ -34,7 +34,7 @@ from .correlation import get_correlation_id
 from .debug import DebugCapture
 from .models import DownloadResult, FetchStatus
 from .session_manager import SessionManager
-from .utils import check_domain_allowed, get_random_user_agent
+from .utils import check_domain_allowed, get_random_user_agent, safe_join_path
 
 # Extensions that are web pages (should be saved via page.content(), not expect_download)
 _WEB_PAGE_EXTENSIONS = frozenset({".html", ".htm", ".xhtml", ".mhtml", ".asp", ".aspx", ".php", ".jsp"})
@@ -130,14 +130,17 @@ class Downloader:
                 correlation_id=cid,
             )
 
-        # safe_mode forbids downloads
-        if self._config.safety.safe_mode:
+        # Granular safety: file downloads gated by allow_downloads
+        if not self._config.safety.allow_downloads:
             return DownloadResult(
                 url=url,
                 filepath="",
                 filename="",
                 status=FetchStatus.BLOCKED,
-                error_message="File downloads forbidden by safe_mode",
+                error_message=(
+                    "File downloads blocked: safety.allow_downloads=False "
+                    "(set allow_downloads=True or disable safe_mode to opt in)"
+                ),
                 correlation_id=cid,
             )
 
@@ -163,7 +166,18 @@ class Downloader:
             raw_name = url.split("/")[-1].split("?")[0]
             filename = raw_name if raw_name else "downloaded_file"
 
-        filepath = self._download_dir / filename
+        # Defend against path-traversal in caller-supplied filename
+        try:
+            filepath = safe_join_path(self._download_dir, filename)
+        except ValueError as exc:
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename=filename,
+                status=FetchStatus.BLOCKED,
+                error_message=f"Invalid filename: {exc}",
+                correlation_id=cid,
+            )
 
         # Strategy 1: Try httpx streaming (fastest)
         try:
@@ -202,29 +216,68 @@ class Downloader:
         return result
 
     async def _download_httpx(self, url: str, filepath: Path) -> DownloadResult:
-        """Strategy 1: Stream download using httpx (no browser needed)."""
+        """Strategy 1: Stream download using httpx (no browser needed).
+
+        Re-validates each redirect target against the safety config, so a
+        whitelisted host cannot redirect us to AWS IMDS / RFC1918 / a
+        denied domain (SSRF protection).
+        """
+        from .exceptions import NavigationError
+
         max_bytes = self._config.download.max_file_size_mb * 1024 * 1024
         headers = {
             "User-Agent": get_random_user_agent(),
             "Accept": "*/*",
             "Accept-Encoding": "gzip, deflate, br",
         }
+        safety = self._config.safety
+
+        async def _check_redirect(response: httpx.Response) -> None:
+            """Event hook: re-validate redirect targets against safety config."""
+            if 300 <= response.status_code < 400:
+                next_url = response.headers.get("location", "")
+                if next_url and not check_domain_allowed(next_url, safety):
+                    raise NavigationError(
+                        f"Redirect to disallowed URL blocked: {next_url}",
+                        url=next_url,
+                        status_code=response.status_code,
+                    )
 
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=60.0
+            follow_redirects=True,
+            timeout=60.0,
+            event_hooks={"response": [_check_redirect]},
         ) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 response.raise_for_status()
+                # Final check: even if redirects were allowed, verify the final
+                # resolved URL passes the gate (defense-in-depth).
+                final_url = str(response.url)
+                if final_url != url and not check_domain_allowed(final_url, safety):
+                    raise NavigationError(
+                        f"Final redirect resolved to disallowed URL: {final_url}",
+                        url=final_url,
+                    )
+
                 content_type = response.headers.get("content-type")
                 total = 0
-                with open(filepath, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        f.write(chunk)
-                        total += len(chunk)
-                        if total > max_bytes:
-                            raise ValueError(
-                                f"File exceeds {self._config.download.max_file_size_mb}MB limit"
-                            )
+                try:
+                    with open(filepath, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            f.write(chunk)
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise ValueError(
+                                    f"File exceeds {self._config.download.max_file_size_mb}MB limit"
+                                )
+                except BaseException:
+                    # Clean up partial file before re-raising (Phase D1)
+                    if filepath.exists():
+                        try:
+                            filepath.unlink()
+                        except OSError:
+                            pass
+                    raise
 
         logger.info(
             "Downloaded via httpx: {url} -> {path} ({size} bytes)",

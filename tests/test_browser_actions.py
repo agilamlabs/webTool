@@ -33,7 +33,11 @@ from web_agent.models import (
 
 @pytest.fixture
 def auto_config(tmp_path) -> AppConfig:
-    """Config for automation tests with short timeouts."""
+    """Config for automation tests with short timeouts.
+
+    Enables ``allow_js_evaluation`` so EvaluateInput-based tests work.
+    Production callers must opt in to this flag explicitly (see SafetyConfig).
+    """
     return AppConfig(
         log_level="WARNING",
         browser={
@@ -46,6 +50,9 @@ def auto_config(tmp_path) -> AppConfig:
             "default_action_timeout": 8000,
             "screenshot_dir": str(tmp_path / "screenshots"),
             "stop_on_error": True,
+        },
+        safety={
+            "allow_js_evaluation": True,  # Tests use EvaluateInput
         },
     )
 

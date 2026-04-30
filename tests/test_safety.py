@@ -127,3 +127,80 @@ class TestBudgetTracker:
         sc = SafetyConfig(max_time_per_call_seconds=60.0)
         bt = BudgetTracker(sc)
         bt.check_time()  # no raise
+
+
+class TestGranularSafetyFlags:
+    """Tests for the new allow_js_evaluation, allow_downloads, allow_form_submit flags."""
+
+    def test_allow_js_evaluation_default_false(self) -> None:
+        # Secure-by-default for an LLM-facing tool
+        assert SafetyConfig().allow_js_evaluation is False
+
+    def test_allow_downloads_default_true(self) -> None:
+        assert SafetyConfig().allow_downloads is True
+
+    def test_allow_form_submit_default_true(self) -> None:
+        assert SafetyConfig().allow_form_submit is True
+
+    def test_block_private_ips_default_true(self) -> None:
+        # SSRF protection is on by default
+        assert SafetyConfig().block_private_ips is True
+
+    def test_safe_mode_overrides_all_allow_flags(self) -> None:
+        # Even if user explicitly enables them, safe_mode wins
+        sc = SafetyConfig(
+            safe_mode=True,
+            allow_js_evaluation=True,
+            allow_downloads=True,
+            allow_form_submit=True,
+        )
+        assert sc.allow_js_evaluation is False
+        assert sc.allow_downloads is False
+        assert sc.allow_form_submit is False
+
+    def test_safe_mode_does_not_touch_block_private_ips(self) -> None:
+        # block_private_ips is independent of safe_mode
+        sc = SafetyConfig(safe_mode=True, block_private_ips=False)
+        assert sc.block_private_ips is False
+
+
+class TestLooksLikeSubmitExtension:
+    """The Phase D5 fix: _looks_like_submit should now check text/label/placeholder."""
+
+    def test_submit_via_text_locator(self) -> None:
+        from web_agent.browser_actions import _looks_like_submit
+        from web_agent.models import LocatorSpec
+
+        assert _looks_like_submit(LocatorSpec(text="Sign in"))
+
+    def test_submit_via_label_locator(self) -> None:
+        from web_agent.browser_actions import _looks_like_submit
+        from web_agent.models import LocatorSpec
+
+        assert _looks_like_submit(LocatorSpec(label="Submit"))
+
+    def test_submit_via_placeholder_locator(self) -> None:
+        from web_agent.browser_actions import _looks_like_submit
+        from web_agent.models import LocatorSpec
+
+        assert _looks_like_submit(LocatorSpec(placeholder="Save changes"))
+
+    def test_non_submit_text_not_flagged(self) -> None:
+        from web_agent.browser_actions import _looks_like_submit
+        from web_agent.models import LocatorSpec
+
+        assert not _looks_like_submit(LocatorSpec(text="Read more"))
+
+    def test_role_name_still_works(self) -> None:
+        from web_agent.browser_actions import _looks_like_submit
+        from web_agent.models import LocatorSpec
+
+        assert _looks_like_submit(
+            LocatorSpec(role="button", role_name="Sign In")
+        )
+
+    def test_css_selector_still_works(self) -> None:
+        from web_agent.browser_actions import _looks_like_submit
+
+        assert _looks_like_submit("button[type=submit]")
+        assert not _looks_like_submit("button.cancel")

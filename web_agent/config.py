@@ -133,29 +133,55 @@ class AutomationConfig(BaseSettings):
 
 
 class SafetyConfig(BaseSettings):
-    """Domain allow/deny lists, safe mode, and per-call budget knobs.
+    """Domain allow/deny lists, granular allow_* flags, safe mode, and per-call budget knobs.
 
     Empty ``allowed_domains`` means all hosts are allowed (subject to deny-list).
     Domain patterns use suffix-match semantics: ``example.com`` matches
     ``api.example.com`` and ``www.example.com`` but not ``notexample.com``.
 
-    ``safe_mode`` is a heuristic safety layer:
-        - Refuses file downloads
-        - Refuses ``EvaluateInput`` (custom JavaScript)
-        - Refuses clicks on submit-typed buttons (best-effort selector match)
+    Granular safety flags (each independently configurable):
+
+    - ``allow_js_evaluation`` (default **False**): controls ``EvaluateInput``
+      actions which run arbitrary JavaScript in the browser context. Default
+      False because LLM-supplied JS can exfiltrate cookies / read DOM in
+      authenticated sessions. Opt in explicitly when you need it.
+    - ``allow_downloads`` (default True): controls file-download actions.
+      Disable to enforce read-only browsing.
+    - ``allow_form_submit`` (default True): controls clicks on submit-typed
+      buttons (heuristic match against text/role/selector).
+    - ``block_private_ips`` (default True): SSRF protection -- blocks RFC1918,
+      loopback, link-local (incl. AWS IMDS at 169.254.169.254).
+
+    ``safe_mode`` (default False) is a master kill-switch: when True it
+    overrides the three ``allow_*`` flags to False (regardless of their
+    explicit settings). ``block_private_ips`` is independent of safe_mode.
 
     Budget knobs limit the cost of a single Agent method call:
-        - ``max_pages_per_call``: stops fetching after N pages
-        - ``max_chars_per_call``: stops extracting after total chars exceeded
-        - ``max_time_per_call_seconds``: wall-clock cutoff for the call
+
+    - ``max_pages_per_call``: stops fetching after N pages.
+    - ``max_chars_per_call``: stops extracting after total chars exceeded.
+    - ``max_time_per_call_seconds``: wall-clock cutoff for the call.
     """
 
     allowed_domains: list[str] = Field(default_factory=list)
     denied_domains: list[str] = Field(default_factory=list)
     safe_mode: bool = False
+    allow_js_evaluation: bool = False
+    allow_downloads: bool = True
+    allow_form_submit: bool = True
+    block_private_ips: bool = True
     max_pages_per_call: int = 50
     max_chars_per_call: int = 1_000_000
     max_time_per_call_seconds: float = 300.0
+
+    @model_validator(mode="after")
+    def _apply_safe_mode(self) -> SafetyConfig:
+        """When safe_mode is True, force all allow_* flags to False."""
+        if self.safe_mode:
+            self.allow_js_evaluation = False
+            self.allow_downloads = False
+            self.allow_form_submit = False
+        return self
 
 
 class DebugConfig(BaseSettings):
@@ -251,12 +277,24 @@ class AppConfig(BaseSettings):
 
         Raises:
             FileNotFoundError: If the YAML file does not exist.
+            ConfigError: If the YAML cannot be parsed or its values fail
+                Pydantic validation (wraps yaml.YAMLError + pydantic.ValidationError).
         """
+        from .exceptions import ConfigError
+
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Config file not found: {p}")
-        with open(p, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"Failed to parse YAML config {p}: {exc}") from exc
         if "base_dir" not in data:
             data["base_dir"] = str(p.parent.resolve())
-        return cls(**data)
+        try:
+            return cls(**data)
+        except Exception as exc:
+            raise ConfigError(
+                f"Config validation failed for {p}: {exc}"
+            ) from exc

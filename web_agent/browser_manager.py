@@ -33,44 +33,75 @@ class BrowserManager:
         self._semaphore = asyncio.Semaphore(config.browser.max_contexts)
         self._started = False
         self._pw_cm: object = None  # stealth context manager
+        # Serialize start/stop to prevent the "two concurrent start()" race
+        # that would launch two browsers and leak the first.
+        self._lifecycle_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        """Launch the Chromium browser. Call once at application start."""
-        if self._started:
-            return
+        """Launch the Chromium browser. Idempotent under concurrent calls.
 
-        # Stealth wraps async_playwright() and auto-injects anti-detection
-        # scripts into every context and page created through it.
-        self._pw_cm = self._stealth.use_async(async_playwright())
-        self._playwright = await self._pw_cm.__aenter__()  # type: ignore[union-attr]
+        Raises:
+            BrowserError: If Playwright fails to launch Chromium.
+        """
+        from .exceptions import BrowserError
 
-        launch_args = {
-            "headless": self._config.browser.headless,
-            "slow_mo": self._config.browser.slow_mo,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-            ],
-        }
-        self._browser = await self._playwright.chromium.launch(**launch_args)
-        self._started = True
-        logger.info(
-            "Browser launched (headless={h})", h=self._config.browser.headless
-        )
+        async with self._lifecycle_lock:
+            if self._started:
+                return
+
+            try:
+                # Stealth wraps async_playwright() and auto-injects anti-detection
+                # scripts into every context and page created through it.
+                self._pw_cm = self._stealth.use_async(async_playwright())
+                self._playwright = await self._pw_cm.__aenter__()  # type: ignore[union-attr]
+
+                launch_args = {
+                    "headless": self._config.browser.headless,
+                    "slow_mo": self._config.browser.slow_mo,
+                    "args": [
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-extensions",
+                    ],
+                }
+                self._browser = await self._playwright.chromium.launch(**launch_args)
+                self._started = True
+                logger.info(
+                    "Browser launched (headless={h})",
+                    h=self._config.browser.headless,
+                )
+            except Exception as exc:
+                # Roll back partial state and re-raise as BrowserError so callers
+                # can `except BrowserError` reliably.
+                if self._pw_cm is not None:
+                    try:
+                        await self._pw_cm.__aexit__(None, None, None)  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                self._pw_cm = None
+                self._playwright = None
+                self._browser = None
+                raise BrowserError(f"Failed to launch Chromium: {exc}") from exc
 
     async def stop(self) -> None:
-        """Close the browser and Playwright. Call once at application shutdown."""
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-        if self._pw_cm:
-            await self._pw_cm.__aexit__(None, None, None)  # type: ignore[union-attr]
-            self._playwright = None
-            self._pw_cm = None
-        self._started = False
-        logger.info("Browser closed")
+        """Close the browser and Playwright. Idempotent under concurrent calls."""
+        async with self._lifecycle_lock:
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Error closing browser: {e}", e=exc)
+                self._browser = None
+            if self._pw_cm:
+                try:
+                    await self._pw_cm.__aexit__(None, None, None)  # type: ignore[union-attr]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Error closing Playwright: {e}", e=exc)
+                self._playwright = None
+                self._pw_cm = None
+            self._started = False
+            logger.info("Browser closed")
 
     async def _build_context(
         self,

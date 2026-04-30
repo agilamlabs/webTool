@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import random
+import socket
 import time
 from enum import Enum
 from functools import wraps
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 from urllib.parse import urlparse
 
@@ -223,34 +226,158 @@ def _matches_domain(host: str, pattern: str) -> bool:
     return host == pattern or host.endswith("." + pattern)
 
 
-def check_domain_allowed(url: str, safety: SafetyConfig) -> bool:
+def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if ``ip`` is a true SSRF risk address.
+
+    Covers RFC 1918 / RFC 4193 private ranges, loopback, link-local
+    (including AWS IMDS at 169.254.169.254), and the unspecified address.
+
+    Deliberately excludes ``is_reserved`` (which over-matches NAT64 and
+    other public-traffic mechanisms) and ``is_multicast`` (rarely an SSRF
+    target).
+    """
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_unspecified
+    )
+
+
+def is_private_address(host: str) -> bool:
+    """Return True if ``host`` resolves to a private/loopback/link-local IP.
+
+    Covers RFC1918 (10/8, 172.16/12, 192.168/16), loopback (127/8 and ::1),
+    link-local (169.254/16 incl. AWS IMDS at 169.254.169.254, fe80::/10),
+    and the unspecified address (0.0.0.0, ::).
+
+    If ``host`` is a hostname (not a literal IP), this function attempts
+    DNS resolution and checks the resolved address. On resolution failure
+    it returns False (we don't know -- caller must decide).
+
+    Args:
+        host: Hostname or IP literal.
+
+    Returns:
+        True if the host resolves to a private/restricted address.
+    """
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        return _is_private_ip(ip)
+    except ValueError:
+        # Not a literal IP -- try DNS resolution
+        pass
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+        for info in infos:
+            sockaddr = info[4]
+            ip_str = sockaddr[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if _is_private_ip(ip):
+                    return True
+            except ValueError:
+                continue
+    except (socket.gaierror, OSError):
+        return False
+    return False
+
+
+def check_domain_allowed(
+    url: str, safety: SafetyConfig, *, strict: bool = False
+) -> bool:
     """Return True if ``url``'s host is permitted by safety allow/deny lists.
 
-    Rules:
-        - Empty allow-list => all hosts allowed (subject to deny-list).
-        - Deny-list takes precedence over allow-list.
-        - Pattern matching uses suffix semantics
-          (``example.com`` matches ``api.example.com``).
+    Rules (in order):
+        1. URL must have a parseable host.
+        2. If ``safety.block_private_ips`` is True, reject private/loopback/
+           link-local hosts (including AWS IMDS at 169.254.169.254).
+        3. Deny-list match -> reject.
+        4. Empty allow-list -> allow (subject to above).
+        5. Allow-list match (suffix semantics, e.g. ``example.com``
+           matches ``api.example.com``) -> allow.
 
     Args:
         url: The URL to check.
         safety: SafetyConfig containing allow/deny patterns.
+        strict: If True, raise :class:`DomainNotAllowedError` instead of
+            returning False on rejection. Default False (return bool).
 
     Returns:
         True if allowed, False if blocked.
+
+    Raises:
+        DomainNotAllowedError: If ``strict=True`` and the URL is rejected.
     """
+    from .exceptions import DomainNotAllowedError
+
     host = _normalize_host(url)
-    if not host:
+
+    def _reject(reason: str) -> bool:
+        if strict:
+            raise DomainNotAllowedError(
+                f"Domain rejected: {reason}", url=url, host=host
+            )
         return False
+
+    if not host:
+        return _reject("no host")
+
+    # Private-IP / SSRF protection (when enabled in config).
+    block_private = getattr(safety, "block_private_ips", False)
+    if block_private and is_private_address(host):
+        return _reject(f"private/loopback/link-local IP: {host}")
 
     for pattern in safety.denied_domains:
         if _matches_domain(host, pattern):
-            return False
+            return _reject(f"matches deny-list pattern {pattern!r}")
 
     if not safety.allowed_domains:
         return True
 
-    return any(_matches_domain(host, p) for p in safety.allowed_domains)
+    if any(_matches_domain(host, p) for p in safety.allowed_domains):
+        return True
+    return _reject("not in allow-list")
+
+
+def safe_join_path(base: Path | str, user_path: str) -> Path:
+    """Resolve ``base / user_path`` and ensure it does NOT escape ``base``.
+
+    Defends against path-traversal attacks where ``user_path`` contains
+    ``..`` components, absolute paths, or symlinks pointing outside ``base``.
+
+    Args:
+        base: Base directory (must be a real directory).
+        user_path: Relative path supplied by an external caller.
+
+    Returns:
+        The resolved absolute path, guaranteed to be inside ``base``.
+
+    Raises:
+        ValueError: If the resolved path escapes ``base``, or if ``user_path``
+            is empty or absolute.
+    """
+    if not user_path:
+        raise ValueError("Empty filename / path")
+
+    user_p = Path(user_path)
+    if user_p.is_absolute():
+        raise ValueError(f"Absolute paths are not allowed: {user_path!r}")
+
+    base_resolved = Path(base).resolve()
+    candidate = (base_resolved / user_p).resolve()
+
+    try:
+        candidate.relative_to(base_resolved)
+    except ValueError:
+        raise ValueError(
+            f"Path escapes base directory: {user_path!r} -> {candidate}"
+        )
+
+    return candidate
 
 
 # ---------------------------------------------------------------------------
