@@ -6,15 +6,18 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 ## Features
 
-- **Web Search** -- Google with automatic DuckDuckGo fallback (handles CAPTCHAs)
-- **Page Fetching** -- Renders JavaScript, retries with exponential backoff, detects download URLs
-- **Content Extraction** -- Three-tier fallback: trafilatura (F1 ~0.958) -> BeautifulSoup4 -> raw text
+- **Web Search** -- Free-first provider chain: SearXNG -> DDGS -> Playwright fallback. URL-as-query short-circuits to direct fetch.
+- **Page Fetching** -- Renders JavaScript, retries with exponential backoff, detects download URLs. Optional disk cache (TTL-based)
+- **Content Extraction** -- Three-tier fallback: trafilatura (F1 ~0.958) -> BeautifulSoup4 -> raw text. Markdown rendering populated automatically when trafilatura wins
 - **File Download** -- Three strategies: httpx streaming -> Playwright page save -> Playwright JS download
 - **Browser Automation** -- 12 action types composable into scripted sequences
 - **Semantic Locators** -- Find elements by ARIA role, label, text, or test_id (not just CSS)
 - **Browser Sessions** -- Persistent named contexts retain cookies/login across multi-call workflows
 - **High-Level Recipes** -- `search_and_open_best_result`, `find_and_download_file`, `web_research`
-- **Safety Controls** -- Domain allow/deny lists, safe_mode, per-call budgets (pages/chars/time)
+- **Safety Controls** -- Domain allow/deny lists, granular `allow_*` flags, SSRF protection, per-call budgets
+- **Politeness Layer** -- Per-host rate limiter + robots.txt obedience (both opt-out)
+- **Audit Log** -- Append-only JSONL of every Agent operation (off by default)
+- **Disk Cache** -- TTL cache for fetch + search results, with LRU-by-mtime eviction (off by default)
 - **Retry Profiles** -- Declarative `fast`/`balanced`/`paranoid` retry policies
 - **Debug Mode** -- Auto-capture HTML/screenshot/error JSON on failures
 - **Correlation IDs** -- Trace single requests across all subsystems via auto-injected log fields
@@ -502,6 +505,8 @@ async with Agent(config) as agent:
 ```
 
 Cache keys: URL for fetches, `"search:<query>:<max_results>"` for searches. Only successful fetches and non-empty search responses are cached -- caching errors/empty would lock in transient failures across the TTL window.
+
+Ordering: `robots.txt` check runs **before** the cache lookup so a host changing its `robots.txt` to disallow a path takes effect immediately, even for URLs we cached under more permissive rules. The robots check itself is cached per-host (1h TTL inside `RobotsChecker`), so the practical overhead on cache hits is near-zero. Cache hit -> skip rate-limit + network.
 
 To clear the cache mid-run: `await agent._cache.clear()` (returns count removed). To extend the cache backend (e.g. Redis), implement the `Cache` ABC in `web_agent/cache.py` and pass it directly to `WebFetcher` / `SearchEngine`.
 

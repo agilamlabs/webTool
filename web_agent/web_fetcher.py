@@ -162,8 +162,13 @@ class WebFetcher:
                 correlation_id=cid,
             )
 
-        # Cache lookup (before politeness layer -- saves both rate-limit
-        # tokens and the actual fetch). Cache key is just the URL.
+        # Cache lookup. NOTE: robots.txt has already been checked above --
+        # this is intentional. If robots.txt now disallows a path that we
+        # cached earlier (under more permissive rules), we want the new
+        # disallow to win. Compliance > a few extra robots fetches per
+        # cached URL (those are themselves cached by RobotsChecker).
+        # Cache lookup runs before the rate limiter so a cache hit
+        # doesn't burn a per-host token. Key is just the URL.
         if self._cache is not None:
             cached = await self._cache.get(f"fetch:{url}")
             if cached is not None:
