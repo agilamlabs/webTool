@@ -21,15 +21,3 @@ def sample_article_html() -> str:
     """Load the sample article HTML fixture."""
     path = SAMPLE_DATA_DIR / "sample_article.html"
     return path.read_text(encoding="utf-8")
-
-
-@pytest.fixture
-def minimal_html() -> str:
-    """Minimal HTML with almost no content (for fallback testing)."""
-    return "<html><head><title>Tiny</title></head><body><p>Hi</p></body></html>"
-
-
-@pytest.fixture
-def empty_html() -> str:
-    """Empty HTML document."""
-    return "<html><head></head><body></body></html>"

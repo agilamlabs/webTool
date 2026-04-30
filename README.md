@@ -139,6 +139,7 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
 | `browser` | `headless` | `true` | Run browser without visible window |
+| `browser` | `slow_mo` | `0` | Delay (ms) between Playwright operations -- debugging aid |
 | `browser` | `max_contexts` | `3` | Max concurrent browser contexts |
 | `browser` | `default_timeout` | `30000` | Default action timeout (ms) |
 | `browser` | `navigation_timeout` | `45000` | Page navigation timeout (ms) |
@@ -539,7 +540,7 @@ async with Agent() as agent:
     try:
         result = await agent.search_and_extract(query, strict=True)
     except SearchError as e:
-        print(f"Both Google and DuckDuckGo failed: {e}")
+        print(f"Search provider chain exhausted: {e}")
 ```
 
 ## High-Level Recipes
@@ -830,14 +831,11 @@ CMD ["python", "-m", "web_agent", "search", "example query"]
 ## Testing
 
 ```bash
-# Run all 111 tests
+# Run all 213 tests
 python -m pytest -v
 
-# Unit tests only (no network) -- 90 tests, runs in <1 second
-python -m pytest tests/test_models.py tests/test_content_extractor.py \
-                 tests/test_correlation.py tests/test_retry_policies.py \
-                 tests/test_safety.py tests/test_locators.py \
-                 tests/test_recipes.py -v
+# Unit tests only (no network) -- 192 tests, runs in ~2 seconds
+python -m pytest --ignore=tests/test_agent.py --ignore=tests/test_browser_actions.py -v
 
 # Integration tests (requires network + Chromium) -- 21 tests, ~2 minutes
 python -m pytest tests/test_agent.py tests/test_browser_actions.py -v
@@ -847,7 +845,7 @@ python -m pytest tests/test_agent.py tests/test_browser_actions.py -v
 
 ```
 web_agent/
-  __init__.py            # v1.1.0, public API exports (49 names)
+  __init__.py            # v1.5.0, public API exports (60 names)
   py.typed               # PEP 561 type checking support
   exceptions.py          # Exception hierarchy (12 classes)
   config.py              # Programmatic + env var + YAML configuration
@@ -859,15 +857,21 @@ web_agent/
   browser_manager.py     # Chromium lifecycle, stealth, semaphore + persistent contexts
   browser_actions.py     # 12 automation action handlers + semantic locators
   session_manager.py     # Persistent named BrowserContext sessions
-  search_engine.py       # Google + DuckDuckGo search
-  web_fetcher.py         # Page fetching with retry, safety, debug, sessions
-  content_extractor.py   # trafilatura -> BS4 -> raw fallback chain
+  search_engine.py       # Multi-provider search chain orchestrator (v1.4)
+  search_providers.py    # SearchProvider ABC + SearXNG/DDGS/Playwright impls (v1.4)
+  rate_limiter.py        # Per-host async rate gate (v1.3)
+  robots.py              # robots.txt fetcher + TTL cache (v1.3)
+  audit.py               # Append-only JSONL audit log (v1.3)
+  cache.py               # Disk-backed TTL cache for fetch + search (v1.5)
+  web_fetcher.py         # Page fetching with retry, safety, debug, sessions, cache
+  content_extractor.py   # trafilatura -> BS4 -> raw + markdown rendering (v1.5)
   downloader.py          # Three-strategy file/page download with safety + sessions
   recipes.py             # High-level recipes (search_and_open_best, find_and_download, web_research)
   mcp_server.py          # FastMCP server with 11 tools
   main.py                # CLI (search, fetch, download, interact, screenshot, serve-mcp)
-tests/                   # 111 tests (90 unit + 21 integration)
-config.example.yaml      # Reference configuration
+docker/searxng/          # Self-hosted SearXNG quickstart (compose + tuned settings)
+tests/                   # 213 tests (192 unit + 21 integration)
+config.example.yaml      # Reference configuration (all v1.2-1.5 options annotated)
 sample_data/             # Test fixtures and example action sequences
 ```
 

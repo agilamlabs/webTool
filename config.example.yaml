@@ -11,6 +11,7 @@ output_dir: "./output"
 # ---------------------------------------------------------------------------
 browser:
   headless: true
+  slow_mo: 0                          # ms delay between Playwright ops (debugging aid)
   default_timeout: 30000              # ms
   navigation_timeout: 45000           # ms
   max_contexts: 3                     # concurrency cap

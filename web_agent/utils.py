@@ -143,13 +143,11 @@ class NonRetryableHTTPError(Exception):
         super().__init__(f"HTTP {status_code} for {url}")
 
 
-class RetryableHTTPError(Exception):
-    """HTTP error that may succeed on retry (e.g. 500, 502, 503)."""
-
-    def __init__(self, status_code: int, url: str) -> None:
-        self.status_code = status_code
-        self.url = url
-        super().__init__(f"HTTP {status_code} for {url}")
+# Retryable 5xx errors are raised as plain ``Exception`` from the
+# fetcher and handled by the ``async_retry`` decorator's catch-all
+# branch -- there's no value in a dedicated class today, since no
+# caller distinguishes "retryable HTTP" from other transient
+# exceptions. If that changes, add ``RetryableHTTPError`` back here.
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import ClassVar, Optional
+from typing import ClassVar
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import httpx
@@ -84,7 +84,7 @@ class SearXNGProvider(SearchProvider):
         self,
         base_url: str | None,
         timeout: float = 10.0,
-        rate_limiter: Optional[RateLimiter] = None,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/") if base_url else None
         self._timeout = timeout
@@ -152,7 +152,7 @@ class DDGSProvider(SearchProvider):
 
     name: ClassVar[str] = "ddgs"
 
-    def __init__(self, rate_limiter: Optional[RateLimiter] = None) -> None:
+    def __init__(self, rate_limiter: RateLimiter | None = None) -> None:
         self._rate_limiter = rate_limiter
         self._available: bool | None = None  # lazy probe cache
 
@@ -231,7 +231,7 @@ class PlaywrightProvider(SearchProvider):
         self,
         browser_manager: BrowserManager,
         config: AppConfig,
-        rate_limiter: Optional[RateLimiter] = None,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config

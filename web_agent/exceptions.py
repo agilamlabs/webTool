@@ -40,7 +40,8 @@ class ExtractionError(WebAgentError):
 
 
 class SearchError(WebAgentError):
-    """Search engine failure (Google and DuckDuckGo both failed)."""
+    """Search provider chain exhausted -- every configured provider
+    (SearXNG / DDGS / Playwright) returned no results or errored out."""
 
 
 class DownloadError(WebAgentError):

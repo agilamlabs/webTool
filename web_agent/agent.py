@@ -224,14 +224,17 @@ class Agent:
             query: The search query.
             max_results: Maximum number of results to process.
             session_id: Optional persistent browser session for the fetches.
-            strict: If True, raise :class:`SearchError` when both engines
-                return zero results. Default False (return empty AgentResult).
+            strict: If True, raise :class:`SearchError` when every
+                configured search provider (SearXNG / DDGS / Playwright)
+                returns zero results. Default False (return empty
+                AgentResult).
 
         Returns:
             AgentResult with search results, extracted pages, errors, and timing.
 
         Raises:
-            SearchError: Only when ``strict=True`` and both engines fail.
+            SearchError: Only when ``strict=True`` and the entire
+                provider chain exhausts.
         """
         async with self._call_scope(
             "search_and_extract", {"query": query, "max_results": max_results}

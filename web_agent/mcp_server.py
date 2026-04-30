@@ -117,8 +117,10 @@ async def web_search(
 ) -> AgentResult:
     """Search the web and extract content from the top results.
 
-    Uses Google with automatic DuckDuckGo fallback. Each result page is
-    fetched and its main content extracted (title, description, text).
+    Uses a configurable search provider chain (default: SearXNG ->
+    DDGS -> Playwright browser-driven Google + DDG HTML fallback).
+    Each result page is fetched and its main content extracted
+    (title, description, text, markdown).
 
     Args:
         query: The search query string.
