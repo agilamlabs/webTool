@@ -18,15 +18,33 @@ class ContentExtractor:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
 
-    def extract(self, fetch_result: FetchResult) -> ExtractionResult:
+    def extract(
+        self, fetch_result: FetchResult, *, strict: bool = False
+    ) -> ExtractionResult:
         """Extract structured content from a FetchResult.
 
         Fallback chain:
           1. trafilatura (best quality, F1 ~0.958)
           2. BeautifulSoup4 structural extraction
           3. Raw text stripping (last resort)
+
+        Args:
+            fetch_result: The FetchResult to extract from.
+            strict: If True, raise :class:`ExtractionError` when all three
+                layers fail to produce content (very rare, since raw is
+                a last-resort always-success path). When False, returns
+                an ExtractionResult with extraction_method="none".
+
+        Raises:
+            ExtractionError: If ``strict=True`` and all layers fail.
         """
         if fetch_result.status != FetchStatus.SUCCESS or not fetch_result.html:
+            if strict:
+                from .exceptions import ExtractionError
+                raise ExtractionError(
+                    f"Cannot extract from non-success FetchResult: "
+                    f"status={fetch_result.status}, url={fetch_result.url}"
+                )
             return ExtractionResult(url=fetch_result.url, extraction_method="none")
 
         html = fetch_result.html
@@ -45,8 +63,17 @@ class ContentExtractor:
             return result
         logger.debug("BS4 insufficient for {url}, falling back to raw", url=url)
 
-        # Layer 3: raw text
-        return self._extract_raw(html, url)
+        # Layer 3: raw text (always-success unless catastrophic)
+        raw_result = self._extract_raw(html, url)
+        if strict and (
+            not raw_result.content or len(raw_result.content) < min_len
+        ):
+            from .exceptions import ExtractionError
+            raise ExtractionError(
+                f"All three extraction layers failed for {url} "
+                f"(content_length={raw_result.content_length})"
+            )
+        return raw_result
 
     def _extract_trafilatura(
         self, html: str, url: str

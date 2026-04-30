@@ -328,7 +328,11 @@ class Recipes:
                 total_time_ms=(time.perf_counter() - start) * 1000,
             )
 
-        ranked = sorted(allowed, key=lambda r: self._rank(query, r), reverse=True)
+        # Cache scores so we don't re-tokenize per item during sort + citation build
+        scores: dict[str, float] = {
+            r.url: self._rank(query, r) for r in allowed
+        }
+        ranked = sorted(allowed, key=lambda r: scores[r.url], reverse=True)
         targets = ranked[:max_pages]
 
         # Fetch in parallel (bounded by BrowserManager semaphore inside fetcher)
@@ -367,7 +371,7 @@ class Recipes:
                         title=extracted.title or item.title,
                         snippet=item.snippet,
                         extraction_method=extracted.extraction_method,
-                        relevance_score=self._rank(query, item),
+                        relevance_score=scores[item.url],
                     )
                 )
                 break
@@ -379,7 +383,7 @@ class Recipes:
                     title=extracted.title or item.title,
                     snippet=item.snippet,
                     extraction_method=extracted.extraction_method,
-                    relevance_score=self._rank(query, item),
+                    relevance_score=scores[item.url],
                 )
             )
 

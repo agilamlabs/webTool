@@ -176,6 +176,14 @@ class WebFetcher:
         """Internal fetch with retry and networkidle->load fallback."""
         cfg = self._config.fetch
 
+        # Outer scope -- accumulates debug artifacts across all retry attempts
+        # so failures-then-success leaves the saved file paths visible to the
+        # caller via FetchResult.debug_artifacts.
+        debug_artifacts: list[str] = []
+        # Persist the wait strategy across retries so once networkidle fails
+        # for a given URL, subsequent retries use 'load' directly (Phase D2).
+        wait_strategy = [cfg.wait_until]  # list for nonlocal-style mutation
+
         @async_retry(
             max_retries=cfg.max_retries,
             base_delay=cfg.retry_base_delay,
@@ -184,37 +192,46 @@ class WebFetcher:
         )
         async def _fetch_with_retry() -> FetchResult:
             page: Page
-            page_owner = "ephemeral"
-            debug_artifacts: list[str] = []
-
             if session_id and self._sessions is not None:
                 ctx = self._sessions.get(session_id)
                 self._sessions.touch(session_id)
                 page = await ctx.new_page()
-                page_owner = "session"
                 try:
                     return await self._navigate_and_extract(
-                        page, url, debug_artifacts
+                        page, url, debug_artifacts, wait_strategy
                     )
                 finally:
                     await page.close()
             else:
                 async with self._bm.new_page() as page:
                     return await self._navigate_and_extract(
-                        page, url, debug_artifacts
+                        page, url, debug_artifacts, wait_strategy
                     )
 
-        return await _fetch_with_retry()
+        result = await _fetch_with_retry()
+        # Final aggregated artifacts list -- overrides whatever the inner call
+        # populated, so the caller sees ALL captures across retries.
+        result.debug_artifacts = list(debug_artifacts)
+        return result
 
     async def _navigate_and_extract(
         self,
         page: Page,
         url: str,
         debug_artifacts: list[str],
+        wait_strategy_box: list[str] | None = None,
     ) -> FetchResult:
-        """Perform the actual navigation + content read on an open page."""
+        """Perform the actual navigation + content read on an open page.
+
+        ``wait_strategy_box`` is a single-element list used by ``_do_fetch``
+        to persist the wait strategy across retries: once networkidle fails
+        for this URL, the box is updated to ``"load"`` so subsequent retries
+        skip the doomed networkidle attempt entirely (Phase D2).
+        """
         cfg = self._config.fetch
-        wait_strategy = cfg.wait_until
+        if wait_strategy_box is None:
+            wait_strategy_box = [cfg.wait_until]
+        wait_strategy = wait_strategy_box[0]
         try:
             try:
                 response = await page.goto(url, wait_until=wait_strategy)
@@ -225,14 +242,30 @@ class WebFetcher:
             except PlaywrightTimeout:
                 if wait_strategy == "networkidle":
                     logger.debug(
-                        "networkidle timed out for {url}, retrying with 'load'",
+                        "networkidle timed out for {url}, falling through to 'load' "
+                        "(persisted for subsequent retries)",
                         url=url,
                     )
+                    wait_strategy_box[0] = "load"  # persist across retries
                     response = await page.goto(url, wait_until="load")
                 else:
                     raise
 
             status_code = response.status if response else None
+
+            # Re-validate the URL after Playwright follows any redirects
+            # (defense-in-depth SSRF protection: a whitelisted host could
+            # redirect to a private IP / denied domain).
+            final_url = page.url
+            if final_url != url and not check_domain_allowed(
+                final_url, self._config.safety
+            ):
+                from .exceptions import NavigationError
+                raise NavigationError(
+                    f"Page redirected to disallowed URL: {final_url}",
+                    url=final_url,
+                    status_code=status_code,
+                )
 
             if status_code and status_code in cfg.non_retryable_status_codes:
                 raise NonRetryableHTTPError(status_code, url)
@@ -246,7 +279,6 @@ class WebFetcher:
                 await asyncio.sleep(cfg.extra_wait_ms / 1000)
 
             html = await page.content()
-            final_url = page.url
 
             return FetchResult(
                 url=url,

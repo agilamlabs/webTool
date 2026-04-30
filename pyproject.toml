@@ -1,6 +1,6 @@
 [project]
 name = "web-agent-toolkit"
-version = "1.0.0"
+version = "1.2.0"
 description = "Professional agentic web search, fetch, download, extraction, and browser automation toolkit using Playwright"
 requires-python = ">=3.10"
 license = {text = "MIT"}

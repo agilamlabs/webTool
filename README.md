@@ -338,7 +338,7 @@ In MCP, the equivalent flow is `create_browser_session` -> `web_interact(...sess
 
 ## Safety Controls
 
-`SafetyConfig` provides domain allow/deny lists, safe mode, and per-call budgets:
+`SafetyConfig` provides multiple defense layers: domain allow/deny lists, granular feature flags, SSRF protection, and per-call budgets. Most defaults are secure-out-of-the-box (`block_private_ips=True`, `allow_js_evaluation=False`).
 
 ```python
 from web_agent import Agent, AppConfig
@@ -346,7 +346,11 @@ from web_agent import Agent, AppConfig
 config = AppConfig(safety={
     "allowed_domains": ["wikipedia.org", "arxiv.org"],
     "denied_domains": ["malicious.example.com"],
-    "safe_mode": True,            # blocks downloads, JS eval, submit clicks
+    "safe_mode": False,                   # master kill-switch
+    "allow_js_evaluation": False,         # gates EvaluateInput (default False)
+    "allow_downloads": True,              # gates file downloads
+    "allow_form_submit": True,            # gates submit-button clicks
+    "block_private_ips": True,            # SSRF protection (RFC1918 + IMDS)
     "max_pages_per_call": 10,
     "max_chars_per_call": 500_000,
     "max_time_per_call_seconds": 60.0,
@@ -359,12 +363,39 @@ async with Agent(config) as agent:
 |---|---|---|
 | `allowed_domains` | `[]` (allow all) | Suffix-match patterns; empty allows everything |
 | `denied_domains` | `[]` | Always blocked, takes precedence over allow-list |
-| `safe_mode` | `false` | Blocks file downloads, `EvaluateInput`, submit-button clicks |
+| `safe_mode` | `false` | Master kill-switch: forces all 3 `allow_*` to False |
+| `allow_js_evaluation` | **`false`** | Gates `EvaluateInput` (LLM-supplied JS). Opt in explicitly. |
+| `allow_downloads` | `true` | Gates file downloads via `agent.download()` |
+| `allow_form_submit` | `true` | Gates clicks on submit-typed buttons (heuristic match) |
+| `block_private_ips` | `true` | Blocks RFC1918, loopback, link-local (incl. AWS IMDS at 169.254.169.254) |
 | `max_pages_per_call` | `50` | Stops fetching after N pages |
 | `max_chars_per_call` | `1_000_000` | Stops extracting after total chars exceeded |
 | `max_time_per_call_seconds` | `300` | Wall-clock cutoff per Agent call |
 
+**Path traversal protection**: `Downloader.download(filename=...)` and `ScreenshotInput.path` reject `..` traversal and absolute paths. Filenames must resolve inside the configured `download_dir` / `screenshot_dir`.
+
+**SSRF protection**: When `block_private_ips=True` (default), the toolkit blocks fetches/downloads to RFC1918 ranges, loopback, and link-local addresses. The `Downloader` re-validates every HTTP redirect target so a whitelisted host cannot bounce you to AWS IMDS or an internal-only URL.
+
 Blocked URLs return `FetchStatus.BLOCKED` with a clear `error_message`. Budget exhaustion raises `BudgetExceededError` (caught and added to `errors[]` in `AgentResult`).
+
+### Strict Mode
+
+By default, all `Agent` methods return result models even on failure. Pass `strict=True` to convert failures into typed exceptions:
+
+```python
+from web_agent.exceptions import NavigationError, SearchError, DownloadError
+
+async with Agent() as agent:
+    try:
+        page = await agent.fetch_and_extract(url, strict=True)
+    except NavigationError as e:
+        print(f"Failed: {e} (status={e.status_code})")
+
+    try:
+        result = await agent.search_and_extract(query, strict=True)
+    except SearchError as e:
+        print(f"Both Google and DuckDuckGo failed: {e}")
+```
 
 ## High-Level Recipes
 

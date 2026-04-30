@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 from .agent import Agent
 from .config import (

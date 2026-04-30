@@ -61,6 +61,7 @@ from .models import (
     Citation,
     DownloadResult,
     ExtractionResult,
+    FetchStatus,
     ResearchResult,
     ScreenshotResult,
     SessionInfo,
@@ -129,6 +130,7 @@ class Agent:
         max_results: int | None = None,
         *,
         session_id: Optional[str] = None,
+        strict: bool = False,
     ) -> AgentResult:
         """Full pipeline: search -> fetch top pages -> extract content.
 
@@ -136,9 +138,14 @@ class Agent:
             query: The search query.
             max_results: Maximum number of results to process.
             session_id: Optional persistent browser session for the fetches.
+            strict: If True, raise :class:`SearchError` when both engines
+                return zero results. Default False (return empty AgentResult).
 
         Returns:
             AgentResult with search results, extracted pages, errors, and timing.
+
+        Raises:
+            SearchError: Only when ``strict=True`` and both engines fail.
         """
         with correlation_scope() as cid:
             self._debug.reset()
@@ -147,7 +154,9 @@ class Agent:
             budget = BudgetTracker(self._config.safety)
 
             logger.info("Starting pipeline for query: {q}", q=query)
-            search_response = await self._search.search(query, max_results)
+            search_response = await self._search.search(
+                query, max_results, strict=strict
+            )
             logger.info(
                 "Search returned {n} results", n=search_response.total_results
             )
@@ -235,13 +244,36 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def fetch_and_extract(
-        self, url: str, *, session_id: Optional[str] = None
+        self,
+        url: str,
+        *,
+        session_id: Optional[str] = None,
+        strict: bool = False,
     ) -> ExtractionResult:
-        """Fetch a single URL and extract its content."""
+        """Fetch a single URL and extract its content.
+
+        Args:
+            url: The URL to fetch.
+            session_id: Optional persistent browser session.
+            strict: If True, raise :class:`NavigationError` when the fetch
+                fails (HTTP error, timeout, blocked, etc.). Default False
+                (return ExtractionResult with extraction_method="none").
+
+        Raises:
+            NavigationError: Only when ``strict=True`` and fetch fails.
+        """
+        from .exceptions import NavigationError
+
         with correlation_scope() as cid:
             self._debug.reset()
             logger.info("Fetching and extracting: {url}", url=url)
             fr = await self._fetcher.fetch(url, session_id=session_id)
+            if strict and fr.status != FetchStatus.SUCCESS:
+                raise NavigationError(
+                    f"Fetch failed: {fr.error_message}",
+                    url=fr.url,
+                    status_code=fr.status_code,
+                )
             extraction = self._extractor.extract(fr)
             extraction.correlation_id = cid
             return extraction
@@ -256,13 +288,31 @@ class Agent:
         filename: str | None = None,
         *,
         session_id: Optional[str] = None,
+        strict: bool = False,
     ) -> DownloadResult:
-        """Download a file from a URL."""
+        """Download a file from a URL.
+
+        Args:
+            url: The file URL to download.
+            filename: Optional output filename.
+            session_id: Optional persistent browser session.
+            strict: If True, raise :class:`DownloadError` on failure.
+
+        Raises:
+            DownloadError: Only when ``strict=True`` and the download fails.
+        """
+        from .exceptions import DownloadError
+
         with correlation_scope():
             self._debug.reset()
-            return await self._downloader.download(
+            result = await self._downloader.download(
                 url, filename, session_id=session_id
             )
+            if strict and result.status != FetchStatus.SUCCESS:
+                raise DownloadError(
+                    f"Download failed: {result.error_message}", url=result.url
+                )
+            return result
 
     # ------------------------------------------------------------------
     # Browser Automation
