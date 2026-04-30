@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from web_agent.config import SafetyConfig
 from web_agent.exceptions import DomainNotAllowedError
 from web_agent.utils import (
@@ -95,9 +94,7 @@ class TestCheckDomainBlocksPrivateIPs:
     def test_strict_raises_for_denied_domain(self) -> None:
         sc = SafetyConfig(denied_domains=["evil.example.com"])
         with pytest.raises(DomainNotAllowedError):
-            check_domain_allowed(
-                "https://api.evil.example.com/", sc, strict=True
-            )
+            check_domain_allowed("https://api.evil.example.com/", sc, strict=True)
 
 
 class TestPrivateIpClassifier:
@@ -105,6 +102,7 @@ class TestPrivateIpClassifier:
 
     def test_classifier_excludes_reserved_to_allow_nat64(self) -> None:
         import ipaddress
+
         nat64 = ipaddress.ip_address("64:ff9b::1")
         # is_reserved is True for NAT64; we deliberately don't block on it
         assert nat64.is_reserved

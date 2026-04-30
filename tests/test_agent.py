@@ -9,7 +9,6 @@ They also require network access for live page fetching.
 from __future__ import annotations
 
 import pytest
-
 from web_agent.agent import Agent
 from web_agent.config import AppConfig
 from web_agent.models import FetchStatus
@@ -68,9 +67,7 @@ class TestSearchAndExtract:
     async def test_search_returns_results(self, fast_config: AppConfig) -> None:
         """Search for a common term and verify we get structured results."""
         async with Agent(fast_config) as agent:
-            result = await agent.search_and_extract(
-                "Python programming language", max_results=3
-            )
+            result = await agent.search_and_extract("Python programming language", max_results=3)
 
         assert result.query == "Python programming language"
         assert result.search.total_results > 0
@@ -102,9 +99,7 @@ class TestDownload:
         fast_config.download.download_dir = str(tmp_path)
 
         async with Agent(fast_config) as agent:
-            result = await agent.download(
-                "https://httpbin.org/json", filename="test.json"
-            )
+            result = await agent.download("https://httpbin.org/json", filename="test.json")
 
         assert result.status == FetchStatus.SUCCESS
         assert result.size_bytes > 0

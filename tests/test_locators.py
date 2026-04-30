@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 
-import pytest
-from pydantic import TypeAdapter, ValidationError
-
+from pydantic import TypeAdapter
 from web_agent.models import (
     Action,
     ClickInput,

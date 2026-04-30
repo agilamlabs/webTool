@@ -29,18 +29,42 @@ from .config import AppConfig
 from .correlation import get_correlation_id
 from .debug import DebugCapture
 from .models import FetchResult, FetchStatus
+from .rate_limiter import RateLimiter
+from .robots import RobotsChecker
 from .session_manager import SessionManager
 from .utils import NonRetryableHTTPError, Timer, async_retry, check_domain_allowed
 
 # File extensions that trigger browser downloads instead of rendering
-_DOWNLOAD_EXTENSIONS = frozenset({
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip", ".tar", ".gz", ".rar", ".7z",
-    ".csv", ".tsv",
-    ".mp3", ".mp4", ".avi", ".mov", ".wav",
-    ".exe", ".msi", ".dmg", ".deb", ".rpm",
-    ".iso", ".img",
-})
+_DOWNLOAD_EXTENSIONS = frozenset(
+    {
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".rar",
+        ".7z",
+        ".csv",
+        ".tsv",
+        ".mp3",
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".wav",
+        ".exe",
+        ".msi",
+        ".dmg",
+        ".deb",
+        ".rpm",
+        ".iso",
+        ".img",
+    }
+)
 
 
 def _is_download_url(url: str) -> bool:
@@ -65,11 +89,15 @@ class WebFetcher:
         config: AppConfig,
         sessions: Optional[SessionManager] = None,
         debug: Optional[DebugCapture] = None,
+        rate_limiter: Optional[RateLimiter] = None,
+        robots: Optional[RobotsChecker] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
         self._sessions = sessions
         self._debug = debug or DebugCapture(config)
+        self._rate_limiter = rate_limiter
+        self._robots = robots
 
     async def fetch(
         self,
@@ -115,6 +143,25 @@ class WebFetcher:
                 ),
                 correlation_id=cid,
             )
+
+        # Politeness layer: robots.txt check (before any network I/O)
+        if self._robots is not None and not await self._robots.is_allowed(url):
+            host = urlparse(url).hostname or ""
+            logger.info("robots.txt disallows {url} for {ua}", url=url, ua=self._robots.user_agent)
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status=FetchStatus.BLOCKED,
+                error_message=(
+                    f"robots.txt for {host} disallows this URL "
+                    f"for User-Agent {self._robots.user_agent!r}"
+                ),
+                correlation_id=cid,
+            )
+
+        # Politeness layer: per-host rate limit (may sleep)
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire(urlparse(url).hostname or "")
 
         timer = Timer()
         try:
@@ -208,7 +255,7 @@ class WebFetcher:
                         page, url, debug_artifacts, wait_strategy
                     )
 
-        result = await _fetch_with_retry()
+        result: FetchResult = await _fetch_with_retry()
         # Final aggregated artifacts list -- overrides whatever the inner call
         # populated, so the caller sees ALL captures across retries.
         result.debug_artifacts = list(debug_artifacts)
@@ -234,10 +281,10 @@ class WebFetcher:
         wait_strategy = wait_strategy_box[0]
         try:
             try:
-                response = await page.goto(url, wait_until=wait_strategy)
+                response = await page.goto(url, wait_until=wait_strategy)  # type: ignore[arg-type]
             except PlaywrightError as e:
                 if "download is starting" in str(e).lower():
-                    raise _DownloadStartedError(url)
+                    raise _DownloadStartedError(url) from e
                 raise
             except PlaywrightTimeout:
                 if wait_strategy == "networkidle":
@@ -257,10 +304,9 @@ class WebFetcher:
             # (defense-in-depth SSRF protection: a whitelisted host could
             # redirect to a private IP / denied domain).
             final_url = page.url
-            if final_url != url and not check_domain_allowed(
-                final_url, self._config.safety
-            ):
+            if final_url != url and not check_domain_allowed(final_url, self._config.safety):
                 from .exceptions import NavigationError
+
                 raise NavigationError(
                     f"Page redirected to disallowed URL: {final_url}",
                     url=final_url,
@@ -291,9 +337,7 @@ class WebFetcher:
         except Exception as exc:
             # Capture debug artifacts on any failure path before re-raising
             if self._debug.enabled:
-                artifacts = await self._debug.capture_page(
-                    page, exc, "fetch", context={"url": url}
-                )
+                artifacts = await self._debug.capture_page(page, exc, "fetch", context={"url": url})
                 debug_artifacts.extend(artifacts)
             raise
 

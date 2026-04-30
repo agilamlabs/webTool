@@ -24,7 +24,7 @@ from loguru import logger
 
 from .config import AppConfig
 from .content_extractor import ContentExtractor
-from .correlation import correlation_scope, get_correlation_id
+from .correlation import get_correlation_id
 from .downloader import Downloader
 from .models import (
     Citation,
@@ -37,7 +37,6 @@ from .models import (
 from .search_engine import SearchEngine
 from .utils import BudgetTracker, check_domain_allowed
 from .web_fetcher import WebFetcher, _is_download_url
-
 
 # Domains that get a small relevance bonus in the default ranker
 _WELL_KNOWN_DOMAINS = (
@@ -102,9 +101,7 @@ class Recipes:
 
         q_toks = Recipes._tokenize(query)
         r_toks = Recipes._tokenize(f"{item.title} {item.snippet} {item.displayed_url}")
-        overlap = (
-            len(q_toks & r_toks) / max(1, len(q_toks)) if q_toks else 0.0
-        )
+        overlap = len(q_toks & r_toks) / max(1, len(q_toks)) if q_toks else 0.0
         if scheme == "overlap":
             return overlap
 
@@ -123,7 +120,7 @@ class Recipes:
             subdomain_depth = host.count(".")
             if subdomain_depth > 2:
                 score -= 0.10
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
         # Position tiebreaker
@@ -156,9 +153,7 @@ class Recipes:
 
         # Filter denied domains BEFORE ranking
         allowed = [
-            r
-            for r in search_resp.results
-            if check_domain_allowed(r.url, self._config.safety)
+            r for r in search_resp.results if check_domain_allowed(r.url, self._config.safety)
         ]
 
         if not allowed:
@@ -235,8 +230,7 @@ class Recipes:
             candidates = [
                 r.url
                 for r in search_resp.results
-                if _is_download_url(r.url)
-                and check_domain_allowed(r.url, self._config.safety)
+                if _is_download_url(r.url) and check_domain_allowed(r.url, self._config.safety)
             ]
 
         if not candidates:
@@ -259,13 +253,10 @@ class Recipes:
         """Return the URL path's file extension (lowercase, with dot)."""
         try:
             path = urlparse(url).path.lower()
-            if "/" in path:
-                last = path.rsplit("/", 1)[-1]
-            else:
-                last = path
+            last = path.rsplit("/", 1)[-1] if "/" in path else path
             if "." in last:
                 return "." + last.rsplit(".", 1)[-1]
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return ""
 
@@ -301,14 +292,10 @@ class Recipes:
                 d=depth,
             )
 
-        logger.info(
-            "Recipe: web_research query={q} max_pages={n}", q=query, n=max_pages
-        )
+        logger.info("Recipe: web_research query={q} max_pages={n}", q=query, n=max_pages)
 
         # Pull more results than needed so ranking + filtering have headroom
-        search_resp = await self._search.search(
-            query, max_results=max(max_pages * 2, 10)
-        )
+        search_resp = await self._search.search(query, max_results=max(max_pages * 2, 10))
 
         # Filter denied domains, skip download URLs (research is about reading pages)
         allowed: list[SearchResultItem] = []
@@ -329,9 +316,7 @@ class Recipes:
             )
 
         # Cache scores so we don't re-tokenize per item during sort + citation build
-        scores: dict[str, float] = {
-            r.url: self._rank(query, r) for r in allowed
-        }
+        scores: dict[str, float] = {r.url: self._rank(query, r) for r in allowed}
         ranked = sorted(allowed, key=lambda r: scores[r.url], reverse=True)
         targets = ranked[:max_pages]
 
@@ -342,14 +327,14 @@ class Recipes:
         citations: list[Citation] = []
         summary_pages: list[ExtractionResult] = []
 
-        for item, fr in zip(targets, fetch_results):
+        for item, fr in zip(targets, fetch_results, strict=True):
             if isinstance(fr, BaseException):
                 errors.append(f"Fetch raised for {item.url}: {fr}")
                 continue
             try:
                 budget.check_time()
                 budget.add_page()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(str(exc))
                 break
 
@@ -362,7 +347,7 @@ class Recipes:
 
             try:
                 budget.add_chars(extracted.content_length)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(str(exc))
                 summary_pages.append(extracted)
                 citations.append(

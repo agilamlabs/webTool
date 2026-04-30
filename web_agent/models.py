@@ -25,9 +25,7 @@ class SearchResponse(BaseModel):
     query: str = Field(description="Original search query")
     total_results: int = Field(default=0, description="Number of results parsed")
     results: list[SearchResultItem] = Field(default_factory=list)
-    searched_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    searched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class FetchStatus(str, Enum):
@@ -73,12 +71,8 @@ class ExtractionResult(BaseModel):
         default="none",
         description="Which extractor succeeded: trafilatura|bs4|raw|none",
     )
-    content_length: int = Field(
-        default=0, description="Character count of extracted content"
-    )
-    fetched_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    content_length: int = Field(default=0, description="Character count of extracted content")
+    fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: Optional[str] = Field(default=None)
 
 
@@ -209,14 +203,10 @@ class LocatorSpec(BaseModel):
         default=None,
         description="ARIA role: 'button', 'link', 'textbox', 'checkbox', etc.",
     )
-    role_name: Optional[str] = Field(
-        default=None, description="Accessible name filter for role"
-    )
+    role_name: Optional[str] = Field(default=None, description="Accessible name filter for role")
     text: Optional[str] = Field(default=None, description="Visible text match")
     label: Optional[str] = Field(default=None, description="Form label association")
-    placeholder: Optional[str] = Field(
-        default=None, description="Placeholder attribute"
-    )
+    placeholder: Optional[str] = Field(default=None, description="Placeholder attribute")
     test_id: Optional[str] = Field(default=None, description="data-testid value")
 
     def is_empty(self) -> bool:
@@ -247,9 +237,7 @@ class ClickInput(BaseModel):
     """Click an element by CSS selector or semantic locator."""
 
     action: Literal["click"] = "click"
-    selector: SelectorLike = Field(
-        description="CSS selector or LocatorSpec for the target element"
-    )
+    selector: SelectorLike = Field(description="CSS selector or LocatorSpec for the target element")
     timeout: Optional[int] = Field(default=None, description="Override timeout in ms")
     button: MouseButton = Field(default=MouseButton.LEFT)
     double_click: bool = Field(default=False)
@@ -262,9 +250,7 @@ class TypeInput(BaseModel):
     """Type text into an element keystroke-by-keystroke."""
 
     action: Literal["type"] = "type"
-    selector: SelectorLike = Field(
-        description="CSS selector or LocatorSpec for the input element"
-    )
+    selector: SelectorLike = Field(description="CSS selector or LocatorSpec for the input element")
     timeout: Optional[int] = Field(default=None)
     text: str = Field(description="Text to type")
     delay: int = Field(default=0, description="Delay in ms between key presses")
@@ -275,9 +261,7 @@ class FillInput(BaseModel):
     """Fill an input element with a value (instant, no keystrokes)."""
 
     action: Literal["fill"] = "fill"
-    selector: SelectorLike = Field(
-        description="CSS selector or LocatorSpec for the input element"
-    )
+    selector: SelectorLike = Field(description="CSS selector or LocatorSpec for the input element")
     timeout: Optional[int] = Field(default=None)
     value: str = Field(description="Value to fill")
 
@@ -306,7 +290,9 @@ class ScreenshotInput(BaseModel):
         description="Element to screenshot (CSS or LocatorSpec). None for full page.",
     )
     timeout: Optional[int] = Field(default=None)
-    path: Optional[str] = Field(default=None, description="Output file path (auto-generated if None)")
+    path: Optional[str] = Field(
+        default=None, description="Output file path (auto-generated if None)"
+    )
     full_page: bool = Field(default=False)
     format: ScreenshotFormat = Field(default=ScreenshotFormat.PNG)
     quality: Optional[int] = Field(default=None, description="JPEG quality 0-100")
@@ -337,9 +323,7 @@ class HoverInput(BaseModel):
     """Hover over an element."""
 
     action: Literal["hover"] = "hover"
-    selector: SelectorLike = Field(
-        description="CSS selector or LocatorSpec for the target element"
-    )
+    selector: SelectorLike = Field(description="CSS selector or LocatorSpec for the target element")
     timeout: Optional[int] = Field(default=None)
 
 
@@ -424,9 +408,7 @@ class ActionResult(BaseModel):
     selector: Optional[str] = Field(default=None)
     duration_ms: float = Field(default=0.0)
     error_message: Optional[str] = Field(default=None)
-    data: Optional[dict[str, Any]] = Field(
-        default=None, description="Action-specific return data"
-    )
+    data: Optional[dict[str, Any]] = Field(default=None, description="Action-specific return data")
     debug_artifacts: list[str] = Field(default_factory=list)
 
 
@@ -470,12 +452,8 @@ class SessionInfo(BaseModel):
 
     session_id: str
     name: Optional[str] = None
-    created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-    last_used_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_used_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     page_count: int = Field(default=0)
     user_agent: Optional[str] = None
 

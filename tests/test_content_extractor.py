@@ -33,9 +33,7 @@ class TestTrafilaturaExtraction:
         # Content should contain substantive article text
         assert "web scraping" in result.content.lower() or "playwright" in result.content.lower()
 
-    def test_extracts_title(
-        self, app_config: AppConfig, sample_article_html: str
-    ) -> None:
+    def test_extracts_title(self, app_config: AppConfig, sample_article_html: str) -> None:
         extractor = ContentExtractor(app_config)
         result = extractor.extract(_make_fetch_result(sample_article_html))
 
@@ -138,9 +136,7 @@ class TestEdgeCases:
 
     def test_empty_html(self, app_config: AppConfig) -> None:
         extractor = ContentExtractor(app_config)
-        result = extractor.extract(
-            _make_fetch_result("<html><head></head><body></body></html>")
-        )
+        result = extractor.extract(_make_fetch_result("<html><head></head><body></body></html>"))
 
         # Should still produce a result (possibly with empty content)
         assert result.extraction_method in ("trafilatura", "bs4", "raw", "none")

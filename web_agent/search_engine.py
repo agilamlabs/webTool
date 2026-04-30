@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Optional
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from loguru import logger
@@ -10,6 +11,7 @@ from playwright.async_api import Page
 from .browser_manager import BrowserManager
 from .config import AppConfig
 from .models import SearchResponse, SearchResultItem
+from .rate_limiter import RateLimiter
 
 
 class SearchEngine:
@@ -19,9 +21,15 @@ class SearchEngine:
     falls back to DuckDuckGo HTML which is more scraping-friendly.
     """
 
-    def __init__(self, browser_manager: BrowserManager, config: AppConfig) -> None:
+    def __init__(
+        self,
+        browser_manager: BrowserManager,
+        config: AppConfig,
+        rate_limiter: Optional[RateLimiter] = None,
+    ) -> None:
         self._bm = browser_manager
         self._config = config
+        self._rate_limiter = rate_limiter
 
     async def search(
         self,
@@ -43,13 +51,17 @@ class SearchEngine:
         """
         max_r = max_results or self._config.search.max_results
 
-        # Try Google first
+        # Try Google first (rate-limited per host)
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire("www.google.com")
         result = await self._search_google(query, max_r)
         if result.results:
             return result
 
         # Fall back to DuckDuckGo
         logger.info("Google returned no results, falling back to DuckDuckGo")
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire("html.duckduckgo.com")
         result = await self._search_duckduckgo(query, max_r)
         if result.results:
             return result
@@ -57,6 +69,7 @@ class SearchEngine:
         # Both engines failed -- caller may want an exception
         if strict:
             from .exceptions import SearchError
+
             raise SearchError(
                 f"Both Google and DuckDuckGo returned no results for {query!r}. "
                 "This usually means the search engines blocked the request "
@@ -96,18 +109,14 @@ class SearchEngine:
 
                 # Wait for results container
                 try:
-                    await page.wait_for_selector(
-                        "div#search, div#rso", timeout=15000
-                    )
+                    await page.wait_for_selector("div#search, div#rso", timeout=15000)
                 except Exception:
                     logger.warning("Google SERP selectors not found")
                     return SearchResponse(query=query)
 
                 results = await self._parse_google_results(page, max_results)
 
-            return SearchResponse(
-                query=query, total_results=len(results), results=results
-            )
+            return SearchResponse(query=query, total_results=len(results), results=results)
         except Exception as e:
             logger.warning("Google search failed: {e}", e=e)
             return SearchResponse(query=query)
@@ -139,9 +148,7 @@ class SearchEngine:
 
             consent_form = await page.query_selector("form[action*='consent']")
             if consent_form:
-                accept_btn = await consent_form.query_selector(
-                    "button[type='submit']"
-                )
+                accept_btn = await consent_form.query_selector("button[type='submit']")
                 if accept_btn:
                     await accept_btn.click()
                     await page.wait_for_load_state("domcontentloaded")
@@ -149,17 +156,13 @@ class SearchEngine:
         except Exception as e:
             logger.debug("Consent handling skipped: {e}", e=e)
 
-    async def _parse_google_results(
-        self, page: Page, max_results: int
-    ) -> list[SearchResultItem]:
+    async def _parse_google_results(self, page: Page, max_results: int) -> list[SearchResultItem]:
         """Parse organic results from the Google SERP DOM."""
         items: list[SearchResultItem] = []
 
         result_elements = await page.query_selector_all("div#rso div.g")
         if not result_elements:
-            result_elements = await page.query_selector_all(
-                "div#rso > div[data-hveid]"
-            )
+            result_elements = await page.query_selector_all("div#rso > div[data-hveid]")
 
         for idx, element in enumerate(result_elements):
             if idx >= max_results:
@@ -205,9 +208,7 @@ class SearchEngine:
     # DuckDuckGo (fallback)
     # ------------------------------------------------------------------
 
-    async def _search_duckduckgo(
-        self, query: str, max_results: int
-    ) -> SearchResponse:
+    async def _search_duckduckgo(self, query: str, max_results: int) -> SearchResponse:
         """Search using DuckDuckGo HTML version (no JS required, scraping-friendly)."""
         params = {"q": query}
         if self._config.search.safe_search:
@@ -222,24 +223,18 @@ class SearchEngine:
 
                 # Wait for results
                 try:
-                    await page.wait_for_selector(
-                        "div.results div.result", timeout=15000
-                    )
+                    await page.wait_for_selector("div.results div.result", timeout=15000)
                 except Exception:
                     # Try alternative: links container
                     try:
-                        await page.wait_for_selector(
-                            "div.results a.result__a", timeout=10000
-                        )
+                        await page.wait_for_selector("div.results a.result__a", timeout=10000)
                     except Exception:
                         logger.warning("DuckDuckGo returned no results")
                         return SearchResponse(query=query)
 
                 results = await self._parse_duckduckgo_results(page, max_results)
 
-            return SearchResponse(
-                query=query, total_results=len(results), results=results
-            )
+            return SearchResponse(query=query, total_results=len(results), results=results)
         except Exception as e:
             logger.error("DuckDuckGo search failed: {e}", e=e)
             return SearchResponse(query=query)
@@ -302,11 +297,7 @@ class SearchEngine:
 
                 # Reject non-http(s) schemes (javascript:, data:, file:)
                 # that DDG redirect targets could theoretically contain.
-                if (
-                    title
-                    and real_url
-                    and real_url.lower().startswith(("http://", "https://"))
-                ):
+                if title and real_url and real_url.lower().startswith(("http://", "https://")):
                     items.append(
                         SearchResultItem(
                             position=idx + 1,

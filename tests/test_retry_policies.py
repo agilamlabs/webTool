@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from web_agent.config import AppConfig, FetchConfig
 from web_agent.utils import RetryPolicy, get_retry_policy
 

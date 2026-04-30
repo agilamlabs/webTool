@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
-
 from web_agent.config import AppConfig, SafetyConfig
 from web_agent.exceptions import (
     ActionError,

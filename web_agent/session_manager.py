@@ -81,12 +81,10 @@ class SessionManager:
                 ua_str = await ctx.new_page()
                 ua = await ua_str.evaluate("() => navigator.userAgent")
                 await ua_str.close()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 ua = None
 
-            info = SessionInfo(
-                session_id=session_id, name=name, user_agent=ua
-            )
+            info = SessionInfo(session_id=session_id, name=name, user_agent=ua)
             self._sessions[session_id] = ctx
             self._info[session_id] = info
 
@@ -112,7 +110,7 @@ class SessionManager:
 
         try:
             await ctx.close()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Error closing session {sid}: {e}", sid=session_id, e=exc)
 
         logger.info("Session closed: {sid}", sid=session_id)
@@ -131,10 +129,8 @@ class SessionManager:
                 await self.close(sid)
             except KeyError:
                 logger.debug("Session {sid} already closed", sid=sid)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Error closing session {sid}: {e}", sid=sid, e=exc
-                )
+            except Exception as exc:
+                logger.warning("Error closing session {sid}: {e}", sid=sid, e=exc)
 
     def get(self, session_id: str) -> BrowserContext:
         """Return the live BrowserContext for ``session_id``.

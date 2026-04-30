@@ -371,12 +371,34 @@ async with Agent(config) as agent:
 | `max_pages_per_call` | `50` | Stops fetching after N pages |
 | `max_chars_per_call` | `1_000_000` | Stops extracting after total chars exceeded |
 | `max_time_per_call_seconds` | `300` | Wall-clock cutoff per Agent call |
+| `rate_limit_per_host_rps` | `2.0` | Per-host requests/second cap. Set to `0` to disable. |
+| `respect_robots_txt` | `true` | Fetch and obey each host's robots.txt before requesting pages |
+| `robots_user_agent` | `"web-agent-toolkit"` | UA token sent to robots.txt and matched against rule groups |
 
 **Path traversal protection**: `Downloader.download(filename=...)` and `ScreenshotInput.path` reject `..` traversal and absolute paths. Filenames must resolve inside the configured `download_dir` / `screenshot_dir`.
 
 **SSRF protection**: When `block_private_ips=True` (default), the toolkit blocks fetches/downloads to RFC1918 ranges, loopback, and link-local addresses. The `Downloader` re-validates every HTTP redirect target so a whitelisted host cannot bounce you to AWS IMDS or an internal-only URL.
 
+**Politeness layer**: `RateLimiter` enforces a per-host minimum interval between requests so parallel fetches against a single host don't trip server-side throttles. `RobotsChecker` fetches each host's `robots.txt` once, caches it for an hour, and short-circuits any URL the rules disallow for our user-agent. Disallowed URLs return `FetchStatus.BLOCKED` with `error_message="robots.txt for {host} disallows ..."`.
+
 Blocked URLs return `FetchStatus.BLOCKED` with a clear `error_message`. Budget exhaustion raises `BudgetExceededError` (caught and added to `errors[]` in `AgentResult`).
+
+### Audit Log
+
+`AuditConfig` enables an append-only JSONL log of every public Agent operation. Distinct from regular logging: structured (one JSON object per line), records only public method calls (start + end), and survives restarts.
+
+```python
+from web_agent import AppConfig, Agent
+
+config = AppConfig(audit={"enabled": True, "audit_log_path": "./audit.jsonl"})
+async with Agent(config) as agent:
+    await agent.fetch_and_extract("https://example.com")
+# audit.jsonl now contains one line:
+# {"timestamp": "...", "correlation_id": "...", "method": "fetch_and_extract",
+#  "args": {"url": "https://example.com"}, "status": "success", "elapsed_ms": 432.1}
+```
+
+Failures are logged with `"status": "error"` and `"error": "<repr(exc)>"`. The `correlation_id` field cross-references the entry with regular loguru logs.
 
 ### Strict Mode
 
@@ -566,7 +588,7 @@ Add:
 }
 ```
 
-Restart Claude Desktop. The 5 tools should appear in the tool picker.
+Restart Claude Desktop. The 11 tools should appear in the tool picker.
 
 ### Claude Code Setup
 

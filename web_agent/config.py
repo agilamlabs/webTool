@@ -103,9 +103,28 @@ class DownloadConfig(BaseSettings):
     max_file_size_mb: int = 100
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [
-            ".pdf", ".csv", ".xlsx", ".xls", ".zip", ".json", ".txt",
-            ".doc", ".docx", ".ppt", ".pptx", ".png", ".jpg", ".jpeg",
-            ".gif", ".svg", ".xml", ".html", ".htm", ".md", ".tar", ".gz",
+            ".pdf",
+            ".csv",
+            ".xlsx",
+            ".xls",
+            ".zip",
+            ".json",
+            ".txt",
+            ".doc",
+            ".docx",
+            ".ppt",
+            ".pptx",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".svg",
+            ".xml",
+            ".html",
+            ".htm",
+            ".md",
+            ".tar",
+            ".gz",
         ]
     )
 
@@ -174,6 +193,30 @@ class SafetyConfig(BaseSettings):
     max_chars_per_call: int = 1_000_000
     max_time_per_call_seconds: float = 300.0
 
+    # --- Politeness layer (rate limit + robots.txt) ---
+    rate_limit_per_host_rps: float = Field(
+        default=2.0,
+        description=(
+            "Per-host rate cap in requests/second. Set to 0 to disable. "
+            "Applies to fetch, download, and search operations."
+        ),
+    )
+    respect_robots_txt: bool = Field(
+        default=True,
+        description=(
+            "If True, fetch and obey each host's robots.txt before "
+            "requesting pages. Missing or unreachable robots.txt is "
+            "treated as allow-all."
+        ),
+    )
+    robots_user_agent: str = Field(
+        default="web-agent-toolkit",
+        description=(
+            "User-Agent token used when fetching robots.txt and matched "
+            "against User-agent rule groups inside it."
+        ),
+    )
+
     @model_validator(mode="after")
     def _apply_safe_mode(self) -> SafetyConfig:
         """When safe_mode is True, force all allow_* flags to False."""
@@ -197,6 +240,18 @@ class DebugConfig(BaseSettings):
     capture_html: bool = True
     capture_screenshot: bool = True
     max_artifacts_per_call: int = 5
+
+
+class AuditConfig(BaseSettings):
+    """Append-only JSONL audit log of every Agent operation.
+
+    Distinct from regular logging: only records public Agent calls
+    (start + end + status + elapsed). Useful as a tamper-evident
+    audit trail for AI-agent runs, separate from chatty internal logs.
+    """
+
+    enabled: bool = False
+    audit_log_path: str = "./audit.jsonl"
 
 
 class AppConfig(BaseSettings):
@@ -244,6 +299,7 @@ class AppConfig(BaseSettings):
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     debug: DebugConfig = Field(default_factory=DebugConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
     log_level: str = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")
@@ -263,6 +319,7 @@ class AppConfig(BaseSettings):
         self.download.download_dir = _resolve(self.download.download_dir)
         self.automation.screenshot_dir = _resolve(self.automation.screenshot_dir)
         self.debug.debug_dir = _resolve(self.debug.debug_dir)
+        self.audit.audit_log_path = _resolve(self.audit.audit_log_path)
         return self
 
     @classmethod
@@ -295,6 +352,4 @@ class AppConfig(BaseSettings):
         try:
             return cls(**data)
         except Exception as exc:
-            raise ConfigError(
-                f"Config validation failed for {p}: {exc}"
-            ) from exc
+            raise ConfigError(f"Config validation failed for {p}: {exc}") from exc

@@ -7,10 +7,11 @@ import ipaddress
 import random
 import socket
 import time
+from collections.abc import Callable
 from enum import Enum
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -40,8 +41,7 @@ USER_AGENTS: list[str] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     # Firefox 132 - Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) "
-    "Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
     # Safari 18 - macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/18.0 Safari/605.1.15",
@@ -192,8 +192,7 @@ def get_retry_policy(name: str | RetryPolicy) -> dict[str, float]:
         policy = RetryPolicy(name) if not isinstance(name, RetryPolicy) else name
     except ValueError as exc:
         raise ValueError(
-            f"Unknown retry policy: {name!r}. Choose from: "
-            f"{[p.value for p in RetryPolicy]}"
+            f"Unknown retry policy: {name!r}. Choose from: {[p.value for p in RetryPolicy]}"
         ) from exc
     return dict(_POLICY_KWARGS[policy])
 
@@ -236,12 +235,7 @@ def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     other public-traffic mechanisms) and ``is_multicast`` (rarely an SSRF
     target).
     """
-    return bool(
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_unspecified
-    )
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified)
 
 
 def is_private_address(host: str) -> bool:
@@ -286,9 +280,7 @@ def is_private_address(host: str) -> bool:
     return False
 
 
-def check_domain_allowed(
-    url: str, safety: SafetyConfig, *, strict: bool = False
-) -> bool:
+def check_domain_allowed(url: str, safety: SafetyConfig, *, strict: bool = False) -> bool:
     """Return True if ``url``'s host is permitted by safety allow/deny lists.
 
     Rules (in order):
@@ -318,9 +310,7 @@ def check_domain_allowed(
 
     def _reject(reason: str) -> bool:
         if strict:
-            raise DomainNotAllowedError(
-                f"Domain rejected: {reason}", url=url, host=host
-            )
+            raise DomainNotAllowedError(f"Domain rejected: {reason}", url=url, host=host)
         return False
 
     if not host:
@@ -373,9 +363,7 @@ def safe_join_path(base: Path | str, user_path: str) -> Path:
     try:
         candidate.relative_to(base_resolved)
     except ValueError:
-        raise ValueError(
-            f"Path escapes base directory: {user_path!r} -> {candidate}"
-        )
+        raise ValueError(f"Path escapes base directory: {user_path!r} -> {candidate}") from None
 
     return candidate
 

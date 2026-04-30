@@ -1,2 +1,0 @@
-[console_scripts]
-websearch = src.main:main

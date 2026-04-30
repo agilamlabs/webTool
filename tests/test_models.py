@@ -34,9 +34,7 @@ class TestSearchResultItem:
         assert item.snippet == ""
 
     def test_json_round_trip(self) -> None:
-        item = SearchResultItem(
-            position=2, title="Example", url="https://example.com"
-        )
+        item = SearchResultItem(position=2, title="Example", url="https://example.com")
         json_str = item.model_dump_json()
         restored = SearchResultItem.model_validate_json(json_str)
         assert restored == item
@@ -62,9 +60,7 @@ class TestSearchResponse:
         resp = SearchResponse(
             query="q",
             total_results=1,
-            results=[
-                SearchResultItem(position=1, title="T", url="https://x.com")
-            ],
+            results=[SearchResultItem(position=1, title="T", url="https://x.com")],
         )
         restored = SearchResponse.model_validate_json(resp.model_dump_json())
         assert restored.query == resp.query
@@ -152,9 +148,7 @@ class TestAgentResult:
         search = SearchResponse(
             query="test",
             total_results=1,
-            results=[
-                SearchResultItem(position=1, title="R", url="https://r.com")
-            ],
+            results=[SearchResultItem(position=1, title="R", url="https://r.com")],
         )
         extraction = ExtractionResult(
             url="https://r.com",
@@ -174,9 +168,7 @@ class TestAgentResult:
 
     def test_json_round_trip(self) -> None:
         search = SearchResponse(query="q")
-        result = AgentResult(
-            query="q", search=search, errors=["err1"], total_time_ms=100.0
-        )
+        result = AgentResult(query="q", search=search, errors=["err1"], total_time_ms=100.0)
         restored = AgentResult.model_validate_json(result.model_dump_json())
         assert restored.errors == ["err1"]
         assert restored.total_time_ms == 100.0

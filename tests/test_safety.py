@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
-
 from web_agent.config import SafetyConfig
 from web_agent.exceptions import BudgetExceededError
 from web_agent.utils import (
@@ -195,9 +192,7 @@ class TestLooksLikeSubmitExtension:
         from web_agent.browser_actions import _looks_like_submit
         from web_agent.models import LocatorSpec
 
-        assert _looks_like_submit(
-            LocatorSpec(role="button", role_name="Sign In")
-        )
+        assert _looks_like_submit(LocatorSpec(role="button", role_name="Sign In"))
 
     def test_css_selector_still_works(self) -> None:
         from web_agent.browser_actions import _looks_like_submit

@@ -84,9 +84,7 @@ class DomainNotAllowedError(WebAgentError):
 class BudgetExceededError(WebAgentError):
     """Per-call budget (pages, chars, or wall-clock time) has been exhausted."""
 
-    def __init__(
-        self, message: str, budget_type: str = "", limit: float = 0.0
-    ) -> None:
+    def __init__(self, message: str, budget_type: str = "", limit: float = 0.0) -> None:
         self.budget_type = budget_type
         self.limit = limit
         super().__init__(message)

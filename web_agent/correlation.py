@@ -22,9 +22,10 @@ Example::
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator, Optional
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -32,9 +33,7 @@ from loguru import logger
 # Context variable
 # ---------------------------------------------------------------------------
 
-correlation_id_var: ContextVar[Optional[str]] = ContextVar(
-    "correlation_id", default=None
-)
+correlation_id_var: ContextVar[Optional[str]] = ContextVar("correlation_id", default=None)
 
 
 def get_correlation_id() -> Optional[str]:
@@ -91,7 +90,9 @@ def patch_loguru() -> None:
     if _PATCHED:
         return
 
-    def _add_cid(record: dict) -> None:
+    def _add_cid(record: Any) -> None:
+        # loguru.Record is dict-like with mandatory keys; Any keeps the
+        # typing simple without pulling in loguru's private Record type.
         record["extra"]["cid"] = correlation_id_var.get() or "-"
 
     logger.configure(patcher=_add_cid)
