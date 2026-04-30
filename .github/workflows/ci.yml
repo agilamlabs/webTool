@@ -26,7 +26,7 @@ jobs:
       - name: Install dev dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]" types-PyYAML
+          python -m pip install -e ".[dev]"
 
       - name: Ruff lint
         run: python -m ruff check web_agent tests

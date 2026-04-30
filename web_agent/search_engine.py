@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Optional
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from loguru import logger
@@ -10,6 +11,7 @@ from playwright.async_api import Page
 from .browser_manager import BrowserManager
 from .config import AppConfig
 from .models import SearchResponse, SearchResultItem
+from .rate_limiter import RateLimiter
 
 
 class SearchEngine:
@@ -19,9 +21,15 @@ class SearchEngine:
     falls back to DuckDuckGo HTML which is more scraping-friendly.
     """
 
-    def __init__(self, browser_manager: BrowserManager, config: AppConfig) -> None:
+    def __init__(
+        self,
+        browser_manager: BrowserManager,
+        config: AppConfig,
+        rate_limiter: Optional[RateLimiter] = None,
+    ) -> None:
         self._bm = browser_manager
         self._config = config
+        self._rate_limiter = rate_limiter
 
     async def search(
         self,
@@ -43,13 +51,17 @@ class SearchEngine:
         """
         max_r = max_results or self._config.search.max_results
 
-        # Try Google first
+        # Try Google first (rate-limited per host)
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire("www.google.com")
         result = await self._search_google(query, max_r)
         if result.results:
             return result
 
         # Fall back to DuckDuckGo
         logger.info("Google returned no results, falling back to DuckDuckGo")
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire("html.duckduckgo.com")
         result = await self._search_duckduckgo(query, max_r)
         if result.results:
             return result

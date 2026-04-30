@@ -40,11 +40,13 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 from .agent import Agent
+from .audit import AuditLogger
 from .config import (
     AppConfig,
+    AuditConfig,
     AutomationConfig,
     BrowserConfig,
     DebugConfig,
@@ -90,7 +92,9 @@ from .models import (
     SelectorLike,
     SessionInfo,
 )
+from .rate_limiter import RateLimiter
 from .recipes import Recipes
+from .robots import RobotsChecker
 from .utils import BudgetTracker, RetryPolicy, get_retry_policy
 
 __all__ = [
@@ -101,6 +105,7 @@ __all__ = [
     "Recipes",
     # Configuration
     "AppConfig",
+    "AuditConfig",
     "AutomationConfig",
     "BrowserConfig",
     "DebugConfig",
@@ -117,6 +122,10 @@ __all__ = [
     "RetryPolicy",
     "get_retry_policy",
     "BudgetTracker",
+    # Politeness + audit
+    "AuditLogger",
+    "RateLimiter",
+    "RobotsChecker",
     # Exceptions
     "ActionError",
     "ActionTimeoutError",

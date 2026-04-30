@@ -35,6 +35,8 @@ from .config import AppConfig
 from .correlation import get_correlation_id
 from .debug import DebugCapture
 from .models import DownloadResult, FetchStatus
+from .rate_limiter import RateLimiter
+from .robots import RobotsChecker
 from .session_manager import SessionManager
 from .utils import check_domain_allowed, get_random_user_agent, safe_join_path
 
@@ -120,11 +122,15 @@ class Downloader:
         config: AppConfig,
         sessions: Optional[SessionManager] = None,
         debug: Optional[DebugCapture] = None,
+        rate_limiter: Optional[RateLimiter] = None,
+        robots: Optional[RobotsChecker] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
         self._sessions = sessions
         self._debug = debug or DebugCapture(config)
+        self._rate_limiter = rate_limiter
+        self._robots = robots
         self._download_dir = Path(config.download.download_dir)
 
     async def download(
@@ -185,6 +191,25 @@ class Downloader:
                 ),
                 correlation_id=cid,
             )
+
+        # Politeness layer: robots.txt check
+        if self._robots is not None and not await self._robots.is_allowed(url):
+            host = urlparse(url).hostname or ""
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename="",
+                status=FetchStatus.BLOCKED,
+                error_message=(
+                    f"robots.txt for {host} disallows this URL "
+                    f"for User-Agent {self._robots.user_agent!r}"
+                ),
+                correlation_id=cid,
+            )
+
+        # Politeness layer: per-host rate limit (may sleep)
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire(urlparse(url).hostname or "")
 
         self._download_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,5 +1,64 @@
 # Changelog
 
+## [1.3.0] - 2026-04-30
+
+### New: politeness layer + audit log
+
+- **`RateLimiter`** (`web_agent.rate_limiter`): per-host async rate gate
+  using minimum-interval scheduling. Different hosts proceed
+  concurrently; same-host requests are serialized to
+  `safety.rate_limit_per_host_rps` (default **2.0** rps). Set to `0`
+  to disable.
+- **`RobotsChecker`** (`web_agent.robots`): fetches and obeys each
+  host's `robots.txt` before requesting pages. Uses stdlib
+  `urllib.robotparser` and an httpx fetcher with a 5-second timeout.
+  Per-host TTL cache (default 1 hour). Missing or unreachable
+  `robots.txt` is treated as allow-all. Gated by
+  `safety.respect_robots_txt` (default **True**).
+- **`AuditLogger`** (`web_agent.audit`): append-only JSONL log of every
+  public Agent operation. Each entry: `timestamp`, `correlation_id`,
+  `method`, `args`, `status` (`success` / `error`), `elapsed_ms`,
+  optional `error` repr. Disabled by default; enable via
+  `audit.enabled = True` and `audit.audit_log_path = "..."`.
+
+### Wiring
+
+- `WebFetcher.__init__` and `Downloader.__init__` accept new optional
+  `rate_limiter` and `robots` kwargs. When set, both gates run before
+  any network I/O. `SearchEngine.__init__` accepts `rate_limiter`
+  (per-host limit applies to `www.google.com` and `html.duckduckgo.com`).
+- `Agent` instantiates a single `RateLimiter`, `RobotsChecker`, and
+  `AuditLogger` from `SafetyConfig` / `AuditConfig` and passes them
+  into the subsystems. Each public Agent method now runs inside
+  `_call_scope(...)` which composes `correlation_scope` + audit log
+  into one async-context-manager.
+
+### Config additions
+
+- `SafetyConfig` gains: `rate_limit_per_host_rps: float = 2.0`,
+  `respect_robots_txt: bool = True`, `robots_user_agent: str = "web-agent-toolkit"`.
+- New `AuditConfig` (top-level `audit:` field on `AppConfig`):
+  `enabled: bool = False`, `audit_log_path: str = "./audit.jsonl"`.
+- `AppConfig._resolve_paths` now resolves `audit.audit_log_path`
+  against `base_dir`.
+
+### Tests
+
+Test count: **150 → 171** unit tests (21 new across `test_politeness.py`
+and `test_audit.py`). Integration test count unchanged at 21. Total
+**192** passing.
+
+### Deferred to a follow-up
+
+- **Cache layer** (HTTP fetch / search result cache): scoped out of
+  this release. Would need: cache key generation, FetchResult
+  serialization, TTL + LRU, `from_cache: bool` on result models,
+  integration in 3 places.
+- **Pluggable search providers**: scoped out. Current `SearchEngine`
+  is hardcoded for Google + DuckDuckGo. Refactoring to a
+  `SearchProvider` ABC + registry would be a separate architectural
+  change.
+
 ## [1.2.0] - 2026-04-30
 
 ### Security (Critical fixes from full-project code review)
