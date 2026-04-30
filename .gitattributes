@@ -1,0 +1,28 @@
+# Enforce LF line endings repo-wide.
+#
+# Why: this is a multi-platform Python project. Without explicit rules,
+# Git on Windows can auto-convert LF<->CRLF on checkout/commit
+# (`core.autocrlf=true`), which produces noise in `git status` and
+# can confuse review tools that expect one or the other.
+#
+# Effect: every text file is stored as LF in git AND checked out as LF
+# everywhere -- no more "LF will be replaced by CRLF" warnings on
+# `git add` from Windows machines, and any viewer that walks the raw
+# blob sees the same byte stream the linter / interpreter sees.
+#
+# Existing blobs in the repo are ALREADY LF (verified). This file
+# locks that in for future contributors.
+
+* text=auto eol=lf
+
+# Binary files: never touch line endings.
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.gif         binary
+*.ico         binary
+*.pdf         binary
+*.zip         binary
+*.gz          binary
+*.tar         binary
+*.whl         binary
