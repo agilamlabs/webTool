@@ -1,5 +1,78 @@
 # Changelog
 
+## [1.6.0] - 2026-04-30
+
+### Production-safety hardening (the last two gaps before "ready for use")
+
+#### BrowserActions URL safety (4 new gates)
+
+Browser-automation calls were the only network-touching subsystem
+that didn't fully validate URL state. WebFetcher and Downloader had
+been hardened in v1.2 (pre-check + post-redirect re-check); this
+release closes the same loop on BrowserActions.
+
+1. **`_do_navigate` GOTO pre-check**: ``NavigateInput.url`` is now
+   validated against the safety policy *before* ``page.goto`` is
+   called. Without this, an LLM-supplied automation script could
+   navigate the headless browser to AWS IMDS / RFC1918 / a denied
+   host, bypassing the policy that gates fetch and download.
+2. **`_do_navigate` post-redirect re-check**: every nav direction
+   (GOTO / BACK / FORWARD / RELOAD) re-validates ``page.url``
+   afterwards. A whitelisted host can no longer redirect us to a
+   private IP via 30x.
+3. **`execute_sequence` initial-goto re-check**: the entry-URL goto
+   inside ``execute_sequence`` now re-checks ``page.url`` after
+   landing. Catches redirects on the very first navigation.
+4. **`execute_sequence` per-action drift detection**: after every
+   action in the sequence, ``page.url`` is checked. If a click,
+   form-submit, or JS-driven nav lands on a disallowed domain or
+   private IP, the offending action is downgraded to FAILED, all
+   remaining actions are SKIPPED, and the sequence aborts
+   regardless of ``stop_on_error``.
+5. **`take_screenshot` post-redirect re-check**: ``page.goto`` inside
+   the screenshot capture now re-validates ``page.url`` before the
+   image is written. Prevents leaking a screenshot of a private-
+   network page reached via redirect.
+
+#### Model addition
+
+- ``ScreenshotResult.error_message: str | None`` -- new field. Used
+  by the post-redirect-blocked path to surface the failure reason
+  (previously a blocked screenshot returned ``status=FAILED`` with
+  no explanation).
+
+#### Integration CI lane
+
+The existing lint + unit-test workflow gates every PR. A new
+**integration** job now runs the full Playwright + live-network
+suite (``tests/test_browser_actions.py`` + ``tests/test_agent.py``,
+21 tests, ~2 minutes) on:
+
+- Push to ``main`` (post-merge sanity check)
+- Nightly schedule at 07:00 UTC (catches drift in upstream search
+  engines, CAPTCHA behavior, Playwright browser releases)
+- Manual ``workflow_dispatch``
+
+The integration job is **not** wired to PRs because search engines
+can serve CAPTCHAs from CI's IP ranges, and that flakiness shouldn't
+block legitimate merges. ``continue-on-error: true`` keeps a
+flaky-network run from failing the overall workflow -- the job's
+value is signal, not gating. On failure, ``debug/`` and
+``screenshots/`` are uploaded as a 3-day artifact for diagnosis.
+
+The job uses ``playwright install --with-deps chromium`` so the
+runner picks up Chromium + system libs in one step.
+
+### Tests
+
+- ``tests/test_browser_url_safety.py`` (new): 9 mock-based unit tests
+  covering the 5 new gates above. No browser launch -- they mock
+  ``Page.url`` and ``Page.goto`` to exercise pre-check, post-
+  redirect re-check, and per-action drift paths in isolation.
+
+Test count: 193 -> 202 unit (+9). 214 -> 223 total (192 unit +
+21 integration before; 202 unit + 21 integration now).
+
 ## [1.5.2] - 2026-04-30
 
 ### Hygiene cleanup (10 findings from full-project review)

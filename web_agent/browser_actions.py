@@ -319,6 +319,13 @@ class BrowserActions:
                 page = await ctx_mgr.__aenter__()
 
             await page.goto(url, wait_until="domcontentloaded")
+
+            # Post-navigation re-check: the initial goto may have followed a
+            # redirect to a denied / private-IP host. Defense-in-depth.
+            if not check_domain_allowed(page.url, safety):
+                host = urlparse(page.url).hostname or ""
+                return _block_all(f"Initial navigation redirected to disallowed domain: {host}")
+
             page.on("dialog", dialog_state.handle)
             page._web_agent_dialog_state = dialog_state  # type: ignore[attr-defined]
 
@@ -335,16 +342,45 @@ class BrowserActions:
                     succeeded += 1
                 else:
                     failed += 1
-                    if should_stop:
-                        for remaining in actions[len(results) :]:
-                            results.append(
-                                ActionResult(
-                                    action=ActionType(remaining.action),
-                                    status=ActionStatus.SKIPPED,
-                                    selector=_selector_repr(getattr(remaining, "selector", None)),
-                                )
+
+                # Per-action URL-drift check: detect when an innocuous-looking
+                # action (link click, form submit, JS-driven nav) lands on a
+                # disallowed domain or a private IP. Catches redirect chains
+                # that bypass the explicit GOTO check in _do_navigate.
+                if not check_domain_allowed(page.url, safety):
+                    host = urlparse(page.url).hostname or ""
+                    drift_msg = f"Page drifted to disallowed domain after action: {host}"
+                    # If the action itself was reported as SUCCESS but the
+                    # page ended up somewhere it shouldn't, downgrade.
+                    if result.status == ActionStatus.SUCCESS:
+                        result.status = ActionStatus.FAILED
+                        result.error_message = drift_msg
+                        succeeded -= 1
+                        failed += 1
+                    # Force-stop the sequence regardless of stop_on_error --
+                    # we don't want subsequent actions running on a page we
+                    # shouldn't be on.
+                    for remaining in actions[len(results) :]:
+                        results.append(
+                            ActionResult(
+                                action=ActionType(remaining.action),
+                                status=ActionStatus.SKIPPED,
+                                selector=_selector_repr(getattr(remaining, "selector", None)),
+                                error_message=drift_msg,
                             )
-                        break
+                        )
+                    break
+
+                if result.status != ActionStatus.SUCCESS and should_stop:
+                    for remaining in actions[len(results) :]:
+                        results.append(
+                            ActionResult(
+                                action=ActionType(remaining.action),
+                                status=ActionStatus.SKIPPED,
+                                selector=_selector_repr(getattr(remaining, "selector", None)),
+                            )
+                        )
+                    break
         except Exception as exc:
             # Acquisition or sequence error -- record it and let cleanup run.
             failed += 1
@@ -480,8 +516,16 @@ class BrowserActions:
                     correlation_id=cid,
                 )
 
-        async def _capture(page: Page) -> None:
+        async def _capture(page: Page) -> Optional[str]:
+            """Capture a screenshot. Returns None on success, or an
+            error message string if the post-redirect URL violates the
+            safety policy (in which case no file is written)."""
             await page.goto(url, wait_until="networkidle")
+            # Post-redirect re-check: a whitelisted host can redirect
+            # to a private IP / denied host. Block before screenshotting.
+            if not check_domain_allowed(page.url, self._config.safety):
+                host = urlparse(page.url).hostname or ""
+                return f"Screenshot navigation redirected to disallowed domain: {host}"
             ss_kwargs: dict[str, Any] = {
                 "path": path,
                 "full_page": full_page,
@@ -490,18 +534,30 @@ class BrowserActions:
             if format == ScreenshotFormat.JPEG and quality is not None:
                 ss_kwargs["quality"] = quality
             await page.screenshot(**ss_kwargs)
+            return None
 
+        capture_error: Optional[str] = None
         if session_id and self._sessions is not None:
             ctx = self._sessions.get(session_id)
             self._sessions.touch(session_id)
             page = await ctx.new_page()
             try:
-                await _capture(page)
+                capture_error = await _capture(page)
             finally:
                 await page.close()
         else:
             async with self._bm.new_page(block_resources=False) as page:
-                await _capture(page)
+                capture_error = await _capture(page)
+
+        if capture_error is not None:
+            return ScreenshotResult(
+                url=url,
+                path="",
+                format=format,
+                status=ActionStatus.FAILED,
+                error_message=capture_error,
+                correlation_id=cid,
+            )
 
         size = Path(path).stat().st_size
         logger.info("Screenshot saved: {path} ({size} bytes)", path=path, size=size)
@@ -669,12 +725,27 @@ class BrowserActions:
         )
 
     async def _do_navigate(self, page: Page, action: NavigateInput) -> ActionResult:
+        # GOTO carries a caller-supplied URL -- validate it BEFORE the
+        # network call. Without this check, an LLM-supplied automation
+        # script can navigate the browser to a private IP (SSRF) or
+        # denied host, bypassing the safety policy that gates fetch and
+        # download.
         if action.navigate_action == NavigateDirection.GOTO:
             if not action.url:
                 return ActionResult(
                     action=ActionType.NAVIGATE,
                     status=ActionStatus.FAILED,
                     error_message="URL required for goto navigation",
+                )
+            if not check_domain_allowed(action.url, self._config.safety):
+                host = urlparse(action.url).hostname or ""
+                return ActionResult(
+                    action=ActionType.NAVIGATE,
+                    status=ActionStatus.FAILED,
+                    error_message=(
+                        f"NavigateInput.url not allowed by SafetyConfig: "
+                        f"{host} (caller-supplied URL blocked before network)"
+                    ),
                 )
             await page.goto(action.url, wait_until=action.wait_until)  # type: ignore[arg-type]
         elif action.navigate_action == NavigateDirection.BACK:
@@ -683,6 +754,20 @@ class BrowserActions:
             await page.go_forward()
         elif action.navigate_action == NavigateDirection.RELOAD:
             await page.reload()
+
+        # Post-navigation re-check: every navigation direction can
+        # land on a different URL than expected (redirect from GOTO,
+        # history entry from BACK/FORWARD, server-side redirect on
+        # RELOAD). Re-validate ``page.url`` so a whitelisted host can
+        # never bounce us to AWS IMDS / RFC1918 / a denied domain.
+        if not check_domain_allowed(page.url, self._config.safety):
+            host = urlparse(page.url).hostname or ""
+            return ActionResult(
+                action=ActionType.NAVIGATE,
+                status=ActionStatus.FAILED,
+                error_message=(f"Navigation landed on disallowed domain after redirect: {host}"),
+                data={"url": page.url},
+            )
 
         logger.debug("Navigated: {act} -> {url}", act=action.navigate_action.value, url=page.url)
         return ActionResult(
