@@ -94,6 +94,26 @@ class ContentExtractor:
             if not text:
                 return None
 
+            # Second pass: ask trafilatura for a markdown rendering of
+            # the same page. Cheap (HTML re-parsed once) and the result
+            # is what most LLMs prefer to consume because it preserves
+            # headings, lists, links, and emphasis. Best-effort -- on
+            # failure we leave markdown=None.
+            markdown: Optional[str] = None
+            try:
+                markdown = trafilatura.extract(
+                    html,
+                    url=url,
+                    output_format="markdown",
+                    favor_precision=self._config.extraction.favor_precision,
+                    favor_recall=self._config.extraction.favor_recall,
+                    include_tables=self._config.extraction.include_tables,
+                    include_links=self._config.extraction.include_links,
+                    include_comments=self._config.extraction.include_comments,
+                )
+            except Exception as md_exc:
+                logger.debug("Markdown rendering failed for {url}: {e}", url=url, e=md_exc)
+
             return ExtractionResult(
                 url=url,
                 title=getattr(doc, "title", None),
@@ -102,6 +122,7 @@ class ContentExtractor:
                 date=getattr(doc, "date", None),
                 sitename=getattr(doc, "sitename", None),
                 content=text,
+                markdown=markdown,
                 language=getattr(doc, "language", None),
                 extraction_method="trafilatura",
                 content_length=len(text),

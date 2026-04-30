@@ -26,6 +26,7 @@ from typing import Optional
 from loguru import logger
 
 from .browser_manager import BrowserManager
+from .cache import Cache
 from .config import AppConfig
 from .models import SearchResponse
 from .rate_limiter import RateLimiter
@@ -59,8 +60,10 @@ class SearchEngine:
         browser_manager: BrowserManager,
         config: AppConfig,
         rate_limiter: Optional[RateLimiter] = None,
+        cache: Optional[Cache] = None,
     ) -> None:
         self._config = config
+        self._cache = cache
 
         # Build the full catalog. Only providers listed in
         # config.search.providers (in that order) actually run.
@@ -105,6 +108,16 @@ class SearchEngine:
         """
         max_r = max_results or self._config.search.max_results
 
+        # Cache lookup -- key includes max_results so different result
+        # counts for the same query don't collide.
+        cache_key = f"search:{query}:{max_r}"
+        if self._cache is not None:
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                logger.debug("Cache hit for search: {q}", q=query)
+                cached["from_cache"] = True
+                return SearchResponse(**cached)
+
         last_response = SearchResponse(query=query)
         for provider in self._providers:
             if not provider.is_available:
@@ -122,6 +135,11 @@ class SearchEngine:
                     p=provider.name,
                     n=response.total_results,
                 )
+                # Cache non-empty responses so repeat searches skip the
+                # entire chain. Empty responses are NOT cached -- a real
+                # "no results" lock-in is more annoying than re-querying.
+                if self._cache is not None:
+                    await self._cache.set(cache_key, response.model_dump(mode="json"))
                 return response
             last_response = response
 

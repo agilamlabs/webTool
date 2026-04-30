@@ -1,5 +1,58 @@
 # Changelog
 
+## [1.5.0] - 2026-04-30
+
+### New: disk-backed TTL cache + markdown extraction
+
+Two of the deferred items from 1.4 land here. Both are opt-in (cache
+is disabled by default) or no-cost (markdown is populated for free
+on every successful trafilatura extraction).
+
+#### Cache layer
+
+- ``web_agent/cache.py``: ``Cache`` ABC + ``DiskCache`` concrete
+  implementation. JSON-on-disk, one file per entry keyed by SHA256
+  of the input. Per-entry TTL with stale-on-read deletion. Soft
+  ``max_cache_mb`` budget enforced via LRU-by-mtime eviction on writes.
+- ``CacheConfig``: ``enabled`` (False), ``cache_dir`` (./cache),
+  ``ttl_seconds`` (3600), ``max_cache_mb`` (100). Path resolved
+  against ``base_dir`` like other directory configs.
+- Wired into ``WebFetcher.fetch`` (cache hit returns immediately,
+  skipping rate-limit + robots + network) and
+  ``SearchEngine.search`` (cache hit short-circuits the full provider
+  chain). Both subsystems take a ``cache: Cache | None`` kwarg.
+- Only **successful** fetches and **non-empty** search responses are
+  cached. Errors / empty results would lock in transient failures
+  across the TTL window.
+
+#### Markdown extraction
+
+- ``ExtractionResult.markdown: str | None`` -- new field. Populated
+  whenever ``trafilatura`` is the winning extractor.
+- ``ContentExtractor._extract_trafilatura`` calls
+  ``trafilatura.extract(html, output_format="markdown")`` as a second
+  pass after the metadata-rich ``bare_extraction``. Cheap (HTML re-
+  parsed once) and the result is what most LLMs prefer to consume --
+  preserves headings, lists, links, emphasis without HTML noise.
+- ``markdown`` stays ``None`` when bs4 or raw-text fallbacks win
+  (those layers have no markdown rendering equivalent).
+
+### Models
+
+- ``FetchResult.from_cache: bool`` -- True when served from cache.
+- ``SearchResponse.from_cache: bool`` -- same.
+- ``ExtractionResult.markdown: str | None`` -- markdown rendering.
+
+### Tests
+
+- ``tests/test_cache.py`` (new): 18 tests covering DiskCache
+  (roundtrip, TTL, expiry-on-access, eviction, corrupt-file, lazy-
+  dir-creation) + 4 Agent-integration tests (cache wiring, end-to-end
+  search caching).
+- ``tests/test_content_extractor.py`` extended with 2 markdown tests.
+
+Test count: 173 -> 192 unit (+19). 192 -> 213 total. All green.
+
 ## [1.4.0] - 2026-04-30
 
 ### Search pipeline rebuilt: SearXNG -> DDGS -> Playwright

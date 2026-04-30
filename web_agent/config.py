@@ -289,6 +289,26 @@ class AuditConfig(BaseSettings):
     audit_log_path: str = "./audit.jsonl"
 
 
+class CacheConfig(BaseSettings):
+    """Disk-backed TTL cache for fetch results and search responses.
+
+    When ``enabled``, every successful ``WebFetcher.fetch(url)`` and
+    ``SearchEngine.search(query)`` writes its result to disk; subsequent
+    calls within ``ttl_seconds`` return the cached payload without
+    hitting the network. Best-effort LRU-by-mtime eviction keeps the
+    cache directory under ``max_cache_mb``.
+
+    Disabled by default -- enable explicitly when you want to avoid
+    re-fetching the same pages across runs (research workflows,
+    experiments, dev iteration).
+    """
+
+    enabled: bool = False
+    cache_dir: str = "./cache"
+    ttl_seconds: float = 3600.0
+    max_cache_mb: int = 100
+
+
 class AppConfig(BaseSettings):
     """Top-level configuration for the web_agent toolkit.
 
@@ -335,6 +355,7 @@ class AppConfig(BaseSettings):
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     debug: DebugConfig = Field(default_factory=DebugConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
     log_level: str = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")
@@ -355,6 +376,7 @@ class AppConfig(BaseSettings):
         self.automation.screenshot_dir = _resolve(self.automation.screenshot_dir)
         self.debug.debug_dir = _resolve(self.debug.debug_dir)
         self.audit.audit_log_path = _resolve(self.audit.audit_log_path)
+        self.cache.cache_dir = _resolve(self.cache.cache_dir)
         return self
 
     @classmethod
