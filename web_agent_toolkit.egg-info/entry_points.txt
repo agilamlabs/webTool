@@ -1,3 +1,0 @@
-[console_scripts]
-web-agent = web_agent.main:main
-web-agent-mcp = web_agent.mcp_server:main

@@ -21,12 +21,14 @@ Example::
 
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
 from loguru import logger
+from playwright.async_api import Page
 
 from .browser_manager import BrowserManager
 from .config import AppConfig
@@ -37,17 +39,44 @@ from .session_manager import SessionManager
 from .utils import check_domain_allowed, get_random_user_agent, safe_join_path
 
 # Extensions that are web pages (should be saved via page.content(), not expect_download)
-_WEB_PAGE_EXTENSIONS = frozenset({".html", ".htm", ".xhtml", ".mhtml", ".asp", ".aspx", ".php", ".jsp"})
+_WEB_PAGE_EXTENSIONS = frozenset(
+    {".html", ".htm", ".xhtml", ".mhtml", ".asp", ".aspx", ".php", ".jsp"}
+)
 
 # Extensions that are binary files (expect_download works for these)
-_BINARY_EXTENSIONS = frozenset({
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip", ".tar", ".gz", ".rar", ".7z",
-    ".csv", ".tsv",
-    ".mp3", ".mp4", ".avi", ".mov", ".wav",
-    ".exe", ".msi", ".dmg",
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".bmp", ".webp",
-})
+_BINARY_EXTENSIONS = frozenset(
+    {
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".rar",
+        ".7z",
+        ".csv",
+        ".tsv",
+        ".mp3",
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".wav",
+        ".exe",
+        ".msi",
+        ".dmg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".bmp",
+        ".webp",
+    }
+)
 
 
 def _get_url_extension(url: str) -> str:
@@ -64,9 +93,7 @@ def _is_web_page_url(url: str) -> bool:
     if ext in _WEB_PAGE_EXTENSIONS:
         return True
     # No extension at all usually means a web page
-    if not ext:
-        return True
-    return False
+    return not ext
 
 
 class Downloader:
@@ -154,8 +181,7 @@ class Downloader:
                 filename="",
                 status=FetchStatus.BLOCKED,
                 error_message=(
-                    f"Extension {ext} not in allowed_extensions. "
-                    f"Allowed: {sorted(allowed_exts)}"
+                    f"Extension {ext} not in allowed_extensions. Allowed: {sorted(allowed_exts)}"
                 ),
                 correlation_id=cid,
             )
@@ -191,7 +217,7 @@ class Downloader:
                 url=url,
             )
             if self._debug.enabled:
-                artifacts = self._debug.capture_no_page(
+                self._debug.capture_no_page(
                     e, "httpx_download", context={"url": url, "status": e.response.status_code}
                 )
         except Exception as e:
@@ -201,9 +227,7 @@ class Downloader:
                 e=e,
             )
             if self._debug.enabled:
-                self._debug.capture_no_page(
-                    e, "httpx_download", context={"url": url}
-                )
+                self._debug.capture_no_page(e, "httpx_download", context={"url": url})
 
         # Strategy 2 or 3 depending on URL type
         if _is_web_page_url(url):
@@ -273,10 +297,8 @@ class Downloader:
                 except BaseException:
                     # Clean up partial file before re-raising (Phase D1)
                     if filepath.exists():
-                        try:
+                        with suppress(OSError):
                             filepath.unlink()
-                        except OSError:
-                            pass
                     raise
 
         logger.info(
@@ -324,7 +346,7 @@ class Downloader:
                 error_message=error_msg,
             )
 
-    async def _do_save_page(self, page, url: str, filepath: Path) -> DownloadResult:
+    async def _do_save_page(self, page: Page, url: str, filepath: Path) -> DownloadResult:
         """Inner page-save: navigate and write page.content() to disk."""
         response = await page.goto(url, wait_until="load")
         content_type = None

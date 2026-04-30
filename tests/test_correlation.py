@@ -36,6 +36,7 @@ class TestCorrelationScope:
 
     def test_nested_scopes_reset_to_outer(self) -> None:
         with correlation_scope("outer") as outer_cid:
+            assert outer_cid == "outer"
             assert get_correlation_id() == "outer"
             with correlation_scope("inner") as inner_cid:
                 assert get_correlation_id() == "inner"

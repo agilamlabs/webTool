@@ -12,7 +12,6 @@ the failure.
 from __future__ import annotations
 
 import json
-import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,7 +80,7 @@ class DebugCapture:
                     html = await page.content()
                     html_path.write_text(html, encoding="utf-8")
                     artifacts.append(str(html_path))
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.debug("Debug HTML capture failed: {e}", e=exc)
 
             if self._config.debug.capture_screenshot:
@@ -89,7 +88,7 @@ class DebugCapture:
                 try:
                     await page.screenshot(path=str(png_path), full_page=False)
                     artifacts.append(str(png_path))
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.debug("Debug screenshot capture failed: {e}", e=exc)
 
             json_path = self._next_artifact_path(label, "json")
@@ -104,16 +103,12 @@ class DebugCapture:
                 "page_url": page_url,
                 "error_type": type(error).__name__,
                 "error_message": str(error),
-                "traceback": traceback.format_exception(
-                    type(error), error, error.__traceback__
-                ),
+                "traceback": traceback.format_exception(type(error), error, error.__traceback__),
                 "context": context or {},
             }
-            json_path.write_text(
-                json.dumps(payload, indent=2, default=str), encoding="utf-8"
-            )
+            json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
             artifacts.append(str(json_path))
-        except Exception as outer:  # noqa: BLE001
+        except Exception as outer:
             logger.warning("DebugCapture.capture_page failed: {e}", e=outer)
 
         self._capture_count += len(artifacts)
@@ -152,18 +147,14 @@ class DebugCapture:
                 "label": label,
                 "error_type": type(error).__name__,
                 "error_message": str(error),
-                "traceback": traceback.format_exception(
-                    type(error), error, error.__traceback__
-                ),
+                "traceback": traceback.format_exception(type(error), error, error.__traceback__),
                 "context": context or {},
             }
-            json_path.write_text(
-                json.dumps(payload, indent=2, default=str), encoding="utf-8"
-            )
+            json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
             self._capture_count += 1
             logger.info("Debug capture saved error JSON for {label}", label=label)
             return [str(json_path)]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("DebugCapture.capture_no_page failed: {e}", e=exc)
             return []
 

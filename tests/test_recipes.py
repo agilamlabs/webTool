@@ -11,9 +11,7 @@ from web_agent.recipes import Recipes
 
 
 def _item(position: int, title: str, url: str, snippet: str = "") -> SearchResultItem:
-    return SearchResultItem(
-        position=position, title=title, url=url, snippet=snippet
-    )
+    return SearchResultItem(position=position, title=title, url=url, snippet=snippet)
 
 
 class TestRanking:
@@ -32,12 +30,8 @@ class TestRanking:
         assert s_known > s_unknown
 
     def test_default_token_overlap(self) -> None:
-        relevant = _item(
-            1, "Python web scraping tutorial", "https://example.com/x"
-        )
-        irrelevant = _item(
-            1, "Cooking with mushrooms", "https://example.com/x"
-        )
+        relevant = _item(1, "Python web scraping tutorial", "https://example.com/x")
+        irrelevant = _item(1, "Cooking with mushrooms", "https://example.com/x")
         s_rel = Recipes._rank("python web scraping", relevant)
         s_irr = Recipes._rank("python web scraping", irrelevant)
         assert s_rel > s_irr
@@ -50,9 +44,7 @@ class TestRanking:
         )
 
     def test_overlap_scheme_pure(self) -> None:
-        match = _item(
-            1, "Python tutorial guide", "https://x.com", snippet="learn python"
-        )
+        match = _item(1, "Python tutorial guide", "https://x.com", snippet="learn python")
         nonmatch = _item(1, "Cooking", "https://x.com", snippet="recipes")
         s_match = Recipes._rank("python tutorial", match, "overlap")
         s_nonmatch = Recipes._rank("python tutorial", nonmatch, "overlap")

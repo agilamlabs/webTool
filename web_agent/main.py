@@ -105,9 +105,7 @@ async def run_interact(args: argparse.Namespace) -> None:
     actions = adapter.validate_python(raw_actions)
 
     async with Agent(config) as agent:
-        result = await agent.interact(
-            args.url, actions, stop_on_error=not args.no_stop_on_error
-        )
+        result = await agent.interact(args.url, actions, stop_on_error=not args.no_stop_on_error)
         print(result.model_dump_json(indent=2))
 
 
@@ -117,9 +115,7 @@ async def run_screenshot(args: argparse.Namespace) -> None:
     setup_logging(config.log_level)
 
     async with Agent(config) as agent:
-        result = await agent.screenshot(
-            args.url, path=args.output, full_page=args.full_page
-        )
+        result = await agent.screenshot(args.url, path=args.output, full_page=args.full_page)
         print(result.model_dump_json(indent=2))
 
 
@@ -158,9 +154,7 @@ def main() -> None:
     sp_search.add_argument("--output", default=None, help="Output JSON path")
 
     # fetch
-    sp_fetch = subparsers.add_parser(
-        "fetch", help="Fetch and extract content from a single URL"
-    )
+    sp_fetch = subparsers.add_parser("fetch", help="Fetch and extract content from a single URL")
     sp_fetch.add_argument("url", help="URL to fetch")
 
     # download
@@ -169,9 +163,7 @@ def main() -> None:
     sp_dl.add_argument("--filename", default=None, help="Save as filename")
 
     # interact
-    sp_interact = subparsers.add_parser(
-        "interact", help="Run a scripted browser action sequence"
-    )
+    sp_interact = subparsers.add_parser("interact", help="Run a scripted browser action sequence")
     sp_interact.add_argument("url", help="Starting URL")
     sp_interact.add_argument(
         "--actions", required=True, help="Path to JSON file with action sequence"
@@ -183,14 +175,10 @@ def main() -> None:
     )
 
     # screenshot
-    sp_ss = subparsers.add_parser(
-        "screenshot", help="Take a screenshot of a URL"
-    )
+    sp_ss = subparsers.add_parser("screenshot", help="Take a screenshot of a URL")
     sp_ss.add_argument("url", help="URL to screenshot")
     sp_ss.add_argument("--output", default=None, help="Output file path")
-    sp_ss.add_argument(
-        "--full-page", action="store_true", help="Capture full scrollable page"
-    )
+    sp_ss.add_argument("--full-page", action="store_true", help="Capture full scrollable page")
 
     # serve-mcp
     subparsers.add_parser(

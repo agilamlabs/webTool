@@ -24,10 +24,11 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -68,7 +69,6 @@ from .models import (
 from .session_manager import SessionManager
 from .utils import check_domain_allowed, safe_join_path
 
-
 # Heuristic CSS patterns that look like submit buttons (used by safe_mode)
 _SUBMIT_BUTTON_HINTS = (
     "button[type=submit]",
@@ -81,8 +81,14 @@ _SUBMIT_BUTTON_HINTS = (
 
 
 _SUBMIT_TEXT_KEYWORDS = (
-    "submit", "send", "save", "log in", "sign in", "register",
-    "create account", "continue",
+    "submit",
+    "send",
+    "save",
+    "log in",
+    "sign in",
+    "register",
+    "create account",
+    "continue",
 )
 
 
@@ -104,9 +110,7 @@ def _looks_like_submit(selector: SelectorLike | None) -> bool:
             selector.label,
             selector.placeholder,
         ):
-            if text_field and any(
-                kw in text_field.lower() for kw in _SUBMIT_TEXT_KEYWORDS
-            ):
+            if text_field and any(kw in text_field.lower() for kw in _SUBMIT_TEXT_KEYWORDS):
                 return True
         sel_str = (selector.selector or "").lower()
     else:
@@ -138,9 +142,11 @@ def _resolve_locator(page: Page, spec: SelectorLike) -> Locator:
         return page.locator(spec)
 
     if spec.role:
+        # Playwright types role as a Literal of ARIA roles; we accept any
+        # str at the API boundary and let Playwright validate at runtime.
         if spec.role_name:
-            return page.get_by_role(spec.role, name=spec.role_name)
-        return page.get_by_role(spec.role)
+            return page.get_by_role(spec.role, name=spec.role_name)  # type: ignore[arg-type]
+        return page.get_by_role(spec.role)  # type: ignore[arg-type]
     if spec.test_id:
         return page.get_by_test_id(spec.test_id)
     if spec.label:
@@ -259,9 +265,7 @@ class BrowserActions:
                     ActionResult(
                         action=ActionType(act.action),
                         status=ActionStatus.SKIPPED,
-                        selector=_selector_repr(
-                            getattr(act, "selector", None)
-                        ),
+                        selector=_selector_repr(getattr(act, "selector", None)),
                         error_message=reason,
                     )
                     for act in actions
@@ -286,9 +290,7 @@ class BrowserActions:
                 )
 
         should_stop = (
-            stop_on_error
-            if stop_on_error is not None
-            else self._config.automation.stop_on_error
+            stop_on_error if stop_on_error is not None else self._config.automation.stop_on_error
         )
         start = time.perf_counter()
         results: list[ActionResult] = []
@@ -322,9 +324,7 @@ class BrowserActions:
 
             for action_input in actions:
                 if self._config.automation.slow_mo_actions > 0:
-                    await asyncio.sleep(
-                        self._config.automation.slow_mo_actions / 1000
-                    )
+                    await asyncio.sleep(self._config.automation.slow_mo_actions / 1000)
 
                 result = await self.execute_action(page, action_input)
                 if result.debug_artifacts:
@@ -336,14 +336,12 @@ class BrowserActions:
                 else:
                     failed += 1
                     if should_stop:
-                        for remaining in actions[len(results):]:
+                        for remaining in actions[len(results) :]:
                             results.append(
                                 ActionResult(
                                     action=ActionType(remaining.action),
                                     status=ActionStatus.SKIPPED,
-                                    selector=_selector_repr(
-                                        getattr(remaining, "selector", None)
-                                    ),
+                                    selector=_selector_repr(getattr(remaining, "selector", None)),
                                 )
                             )
                         break
@@ -357,27 +355,21 @@ class BrowserActions:
                     error_message=f"Sequence aborted: {exc}",
                 )
             )
-            for remaining in actions[len(results):]:
+            for remaining in actions[len(results) :]:
                 results.append(
                     ActionResult(
                         action=ActionType(remaining.action),
                         status=ActionStatus.SKIPPED,
-                        selector=_selector_repr(
-                            getattr(remaining, "selector", None)
-                        ),
+                        selector=_selector_repr(getattr(remaining, "selector", None)),
                     )
                 )
         finally:
             if page is not None and owner == "session":
-                try:
+                with contextlib.suppress(Exception):
                     await page.close()
-                except Exception:  # noqa: BLE001
-                    pass
             elif ctx_mgr is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await ctx_mgr.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    pass
 
         elapsed = (time.perf_counter() - start) * 1000
         return ActionSequenceResult(
@@ -414,7 +406,7 @@ class BrowserActions:
 
         start = time.perf_counter()
         try:
-            result = await handler(self, page, action_input)
+            result: ActionResult = await handler(self, page, action_input)
             result.duration_ms = (time.perf_counter() - start) * 1000
             return result
         except (PlaywrightTimeout, ActionTimeoutError) as e:
@@ -459,7 +451,6 @@ class BrowserActions:
         cid = get_correlation_id()
 
         if not check_domain_allowed(url, self._config.safety):
-            host = urlparse(url).hostname or ""
             return ScreenshotResult(
                 url=url,
                 path="",
@@ -537,7 +528,7 @@ class BrowserActions:
         await loc.click(
             button=action.button.value,
             click_count=click_count,
-            modifiers=action.modifiers if action.modifiers else None,
+            modifiers=action.modifiers if action.modifiers else None,  # type: ignore[arg-type]
             timeout=timeout,
         )
         sel_repr = _selector_repr(action.selector)
@@ -685,7 +676,7 @@ class BrowserActions:
                     status=ActionStatus.FAILED,
                     error_message="URL required for goto navigation",
                 )
-            await page.goto(action.url, wait_until=action.wait_until)
+            await page.goto(action.url, wait_until=action.wait_until)  # type: ignore[arg-type]
         elif action.navigate_action == NavigateDirection.BACK:
             await page.go_back()
         elif action.navigate_action == NavigateDirection.FORWARD:
@@ -775,7 +766,9 @@ class BrowserActions:
                     error_message="Selector value required for selector wait",
                 )
             await page.wait_for_selector(
-                action.value, state=action.state, timeout=timeout
+                action.value,
+                state=action.state,  # type: ignore[arg-type]
+                timeout=timeout,
             )
         elif action.target == WaitTarget.URL:
             if not action.value:
@@ -789,7 +782,7 @@ class BrowserActions:
             await page.wait_for_load_state("networkidle", timeout=timeout)
         elif action.target == WaitTarget.LOAD_STATE:
             state = action.value or "load"
-            await page.wait_for_load_state(state, timeout=timeout)
+            await page.wait_for_load_state(state, timeout=timeout)  # type: ignore[arg-type]
         elif action.target == WaitTarget.TEXT:
             if not action.value:
                 return ActionResult(
@@ -832,7 +825,9 @@ class BrowserActions:
     # Dispatch table
     # ------------------------------------------------------------------
 
-    _dispatch: dict = {
+    # Class-level lookup table: ActionType -> handler function (unbound).
+    # Annotated as ClassVar so it's clearly shared state, not a per-instance dict.
+    _dispatch: ClassVar[dict[ActionType, Any]] = {
         ActionType.CLICK: _do_click,
         ActionType.TYPE: _do_type,
         ActionType.FILL: _do_fill,

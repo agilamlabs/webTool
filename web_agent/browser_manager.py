@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 from loguru import logger
 from playwright.async_api import (
@@ -32,7 +33,11 @@ class BrowserManager:
         self._stealth = Stealth()
         self._semaphore = asyncio.Semaphore(config.browser.max_contexts)
         self._started = False
-        self._pw_cm: object = None  # stealth context manager
+        # Stealth-wrapped async_playwright() context manager. Typed as Any
+        # because Stealth.use_async() returns its own internal CM class
+        # whose protocol mypy doesn't see -- runtime always exposes
+        # __aenter__/__aexit__.
+        self._pw_cm: Any = None
         # Serialize start/stop to prevent the "two concurrent start()" race
         # that would launch two browsers and leak the first.
         self._lifecycle_lock = asyncio.Lock()
@@ -53,19 +58,18 @@ class BrowserManager:
                 # Stealth wraps async_playwright() and auto-injects anti-detection
                 # scripts into every context and page created through it.
                 self._pw_cm = self._stealth.use_async(async_playwright())
-                self._playwright = await self._pw_cm.__aenter__()  # type: ignore[union-attr]
+                self._playwright = await self._pw_cm.__aenter__()
 
-                launch_args = {
-                    "headless": self._config.browser.headless,
-                    "slow_mo": self._config.browser.slow_mo,
-                    "args": [
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self._config.browser.headless,
+                    slow_mo=self._config.browser.slow_mo,
+                    args=[
                         "--no-sandbox",
                         "--disable-dev-shm-usage",
                         "--disable-gpu",
                         "--disable-extensions",
                     ],
-                }
-                self._browser = await self._playwright.chromium.launch(**launch_args)
+                )
                 self._started = True
                 logger.info(
                     "Browser launched (headless={h})",
@@ -75,10 +79,8 @@ class BrowserManager:
                 # Roll back partial state and re-raise as BrowserError so callers
                 # can `except BrowserError` reliably.
                 if self._pw_cm is not None:
-                    try:
-                        await self._pw_cm.__aexit__(None, None, None)  # type: ignore[union-attr]
-                    except Exception:
-                        pass
+                    with suppress(Exception):
+                        await self._pw_cm.__aexit__(None, None, None)
                 self._pw_cm = None
                 self._playwright = None
                 self._browser = None
@@ -90,13 +92,13 @@ class BrowserManager:
             if self._browser:
                 try:
                     await self._browser.close()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning("Error closing browser: {e}", e=exc)
                 self._browser = None
             if self._pw_cm:
                 try:
-                    await self._pw_cm.__aexit__(None, None, None)  # type: ignore[union-attr]
-                except Exception as exc:  # noqa: BLE001
+                    await self._pw_cm.__aexit__(None, None, None)
+                except Exception as exc:
                     logger.warning("Error closing Playwright: {e}", e=exc)
                 self._playwright = None
                 self._pw_cm = None
@@ -202,9 +204,7 @@ class BrowserManager:
         block_resources: bool | None = None,
     ) -> AsyncGenerator[Page, None]:
         """Convenience: acquire context -> open page -> yield -> cleanup."""
-        async with self.new_context(
-            user_agent=user_agent, block_resources=block_resources
-        ) as ctx:
+        async with self.new_context(user_agent=user_agent, block_resources=block_resources) as ctx:
             page = await ctx.new_page()
             try:
                 yield page

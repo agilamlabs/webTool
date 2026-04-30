@@ -1,0 +1,63 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Build / Packaging ---
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Testing / Coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- web_agent runtime artifacts ---
+# These directories hold generated output that should never be committed.
+# Sample fixtures live under sample_data/ instead.
+downloads/
+output/
+screenshots/
+debug/
+
+# Loose generated files at the repo root (HTML/PDF/images dropped by tests
+# or by the agent during ad-hoc runs). Anything intentional belongs in
+# sample_data/ and should be added explicitly with `git add -f`.
+/*.html
+/*.pdf
+/*.png
+/*.jpg
+/*.jpeg
+
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+config.local.yaml
+config.local.yml

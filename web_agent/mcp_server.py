@@ -45,8 +45,9 @@ Claude Desktop config (``claude_desktop_config.json``)::
 from __future__ import annotations
 
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
@@ -62,9 +63,7 @@ from .models import (
     ExtractionResult,
     ResearchResult,
     ScreenshotResult,
-    SessionInfo,
 )
-
 
 # ---------------------------------------------------------------------------
 # Lifespan: initialize the Agent once per MCP session (browser stays warm)
@@ -130,9 +129,7 @@ async def web_search(
         AgentResult with search metadata, extracted page contents, and any errors.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.search_and_extract(
-        query, max_results=max_results, session_id=session_id
-    )
+    return await agent.search_and_extract(query, max_results=max_results, session_id=session_id)
 
 
 @mcp.tool()
@@ -203,9 +200,7 @@ async def web_screenshot(
         ScreenshotResult with the file path and image size.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.screenshot(
-        url, path=path, full_page=full_page, session_id=session_id
-    )
+    return await agent.screenshot(url, path=path, full_page=full_page, session_id=session_id)
 
 
 @mcp.tool()
@@ -287,9 +282,7 @@ async def web_search_best(
         ExtractionResult of the top-ranked URL.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.search_and_open_best_result(
-        query, ranking=ranking, session_id=session_id
-    )
+    return await agent.search_and_open_best_result(query, ranking=ranking, session_id=session_id)
 
 
 @mcp.tool()
@@ -313,9 +306,7 @@ async def web_find_and_download(
         DownloadResult with file path, size, and status.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.find_and_download_file(
-        query, file_types=file_types, session_id=session_id
-    )
+    return await agent.find_and_download_file(query, file_types=file_types, session_id=session_id)
 
 
 @mcp.tool()
@@ -342,9 +333,7 @@ async def web_research(
         ResearchResult with citations, summary_pages, budget telemetry, errors.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.web_research(
-        query, depth=depth, max_pages=max_pages, session_id=session_id
-    )
+    return await agent.web_research(query, depth=depth, max_pages=max_pages, session_id=session_id)
 
 
 # ---------------------------------------------------------------------------

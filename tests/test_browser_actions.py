@@ -9,13 +9,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from web_agent.agent import Agent
 from web_agent.config import AppConfig
 from web_agent.models import (
-    ActionSequenceResult,
     ActionStatus,
-    ActionType,
     ClickInput,
     EvaluateInput,
     FillInput,
@@ -23,7 +20,6 @@ from web_agent.models import (
     KeyboardInput,
     NavigateDirection,
     NavigateInput,
-    ScreenshotFormat,
     ScreenshotInput,
     ScrollInput,
     WaitInput,
@@ -126,12 +122,12 @@ class TestScreenshotAction:
         """Full-page screenshot should be at least as large as viewport."""
         async with Agent(auto_config) as agent:
             viewport = await agent.screenshot("https://example.com")
-            full = await agent.screenshot(
-                "https://example.com", full_page=True
-            )
+            full = await agent.screenshot("https://example.com", full_page=True)
 
         assert full.status == ActionStatus.SUCCESS
         assert full.size_bytes > 0
+        # full-page must capture at least the viewport (the docstring promise)
+        assert full.size_bytes >= viewport.size_bytes
 
     @pytest.mark.asyncio
     async def test_screenshot_in_sequence(self, auto_config: AppConfig) -> None:

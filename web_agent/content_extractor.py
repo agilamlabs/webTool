@@ -18,9 +18,7 @@ class ContentExtractor:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
 
-    def extract(
-        self, fetch_result: FetchResult, *, strict: bool = False
-    ) -> ExtractionResult:
+    def extract(self, fetch_result: FetchResult, *, strict: bool = False) -> ExtractionResult:
         """Extract structured content from a FetchResult.
 
         Fallback chain:
@@ -41,6 +39,7 @@ class ContentExtractor:
         if fetch_result.status != FetchStatus.SUCCESS or not fetch_result.html:
             if strict:
                 from .exceptions import ExtractionError
+
                 raise ExtractionError(
                     f"Cannot extract from non-success FetchResult: "
                     f"status={fetch_result.status}, url={fetch_result.url}"
@@ -65,19 +64,16 @@ class ContentExtractor:
 
         # Layer 3: raw text (always-success unless catastrophic)
         raw_result = self._extract_raw(html, url)
-        if strict and (
-            not raw_result.content or len(raw_result.content) < min_len
-        ):
+        if strict and (not raw_result.content or len(raw_result.content) < min_len):
             from .exceptions import ExtractionError
+
             raise ExtractionError(
                 f"All three extraction layers failed for {url} "
                 f"(content_length={raw_result.content_length})"
             )
         return raw_result
 
-    def _extract_trafilatura(
-        self, html: str, url: str
-    ) -> Optional[ExtractionResult]:
+    def _extract_trafilatura(self, html: str, url: str) -> Optional[ExtractionResult]:
         """Primary extractor using trafilatura with metadata."""
         try:
             doc = trafilatura.bare_extraction(
@@ -129,13 +125,13 @@ class ContentExtractor:
             description = None
             meta_desc = soup.find("meta", attrs={"name": "description"})
             if meta_desc:
-                description = meta_desc.get("content", "")  # type: ignore[arg-type]
+                description = meta_desc.get("content", "")
 
             # Author
             author = None
             meta_author = soup.find("meta", attrs={"name": "author"})
             if meta_author:
-                author = meta_author.get("content", "")  # type: ignore[arg-type]
+                author = meta_author.get("content", "")
 
             # Main content: try semantic tags first, then common class/id patterns
             content_tag = (

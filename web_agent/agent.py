@@ -58,7 +58,6 @@ from .models import (
     Action,
     ActionSequenceResult,
     AgentResult,
-    Citation,
     DownloadResult,
     ExtractionResult,
     FetchStatus,
@@ -116,7 +115,7 @@ class Agent:
     async def __aexit__(self, *args: object) -> None:
         try:
             await self._sessions.close_all()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Error closing sessions on exit: {e}", e=exc)
         await self._bm.stop()
 
@@ -154,12 +153,8 @@ class Agent:
             budget = BudgetTracker(self._config.safety)
 
             logger.info("Starting pipeline for query: {q}", q=query)
-            search_response = await self._search.search(
-                query, max_results, strict=strict
-            )
-            logger.info(
-                "Search returned {n} results", n=search_response.total_results
-            )
+            search_response = await self._search.search(query, max_results, strict=strict)
+            logger.info("Search returned {n} results", n=search_response.total_results)
 
             if not search_response.results:
                 return AgentResult(
@@ -188,34 +183,30 @@ class Agent:
                     n=len(file_urls),
                 )
                 for furl in file_urls:
-                    errors.append(
-                        f"File URL skipped (use agent.download()): {furl}"
-                    )
+                    errors.append(f"File URL skipped (use agent.download()): {furl}")
 
             logger.info("Fetching {n} pages...", n=len(page_urls))
-            fetch_results = await self._fetcher.fetch_many(
-                page_urls, session_id=session_id
-            )
+            fetch_results = await self._fetcher.fetch_many(page_urls, session_id=session_id)
 
             pages: list[ExtractionResult] = []
             for fr in fetch_results:
                 try:
                     budget.check_time()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     errors.append(str(exc))
                     break
 
                 if fr.html:
                     try:
                         budget.add_page()
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         errors.append(str(exc))
                         break
                     extraction = self._extractor.extract(fr)
                     extraction.correlation_id = cid
                     try:
                         budget.add_chars(extraction.content_length)
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         errors.append(str(exc))
                         pages.append(extraction)
                         break
@@ -305,13 +296,9 @@ class Agent:
 
         with correlation_scope():
             self._debug.reset()
-            result = await self._downloader.download(
-                url, filename, session_id=session_id
-            )
+            result = await self._downloader.download(url, filename, session_id=session_id)
             if strict and result.status != FetchStatus.SUCCESS:
-                raise DownloadError(
-                    f"Download failed: {result.error_message}", url=result.url
-                )
+                raise DownloadError(f"Download failed: {result.error_message}", url=result.url)
             return result
 
     # ------------------------------------------------------------------
@@ -351,9 +338,7 @@ class Agent:
         with correlation_scope():
             self._debug.reset()
             logger.info("Taking screenshot of {url}", url=url)
-            return await self._actions.take_screenshot(
-                url, path, full_page, session_id=session_id
-            )
+            return await self._actions.take_screenshot(url, path, full_page, session_id=session_id)
 
     # ------------------------------------------------------------------
     # Browser Sessions
@@ -392,9 +377,7 @@ class Agent:
         """Recipe: search, rank results, fetch + extract the top hit."""
         with correlation_scope() as cid:
             self._debug.reset()
-            result = await self._recipes.search_and_open_best_result(
-                query, ranking, session_id
-            )
+            result = await self._recipes.search_and_open_best_result(query, ranking, session_id)
             result.correlation_id = cid
             return result
 
@@ -408,9 +391,7 @@ class Agent:
         """Recipe: search, find the first matching file URL, download it."""
         with correlation_scope() as cid:
             self._debug.reset()
-            result = await self._recipes.find_and_download_file(
-                query, file_types, session_id
-            )
+            result = await self._recipes.find_and_download_file(query, file_types, session_id)
             result.correlation_id = cid
             return result
 
@@ -425,9 +406,7 @@ class Agent:
         """Recipe: search + parallel fetch + extract top N pages, return citations."""
         with correlation_scope() as cid:
             self._debug.reset()
-            result = await self._recipes.web_research(
-                query, depth, max_pages, session_id
-            )
+            result = await self._recipes.web_research(query, depth, max_pages, session_id)
             result.correlation_id = cid
             return result
 
@@ -443,15 +422,11 @@ class Agent:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if output_path is None:
-            safe_query = "".join(
-                c if c.isalnum() else "_" for c in result.query
-            )[:50]
+            safe_query = "".join(c if c.isalnum() else "_" for c in result.query)[:50]
             output_path = out_dir / f"{safe_query}.json"
         else:
             output_path = Path(output_path)
 
-        output_path.write_text(
-            result.model_dump_json(indent=2), encoding="utf-8"
-        )
+        output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         logger.info("Results saved to {path}", path=output_path)
         return output_path

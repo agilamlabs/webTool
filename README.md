@@ -566,7 +566,7 @@ Add:
 }
 ```
 
-Restart Claude Desktop. The 5 tools should appear in the tool picker.
+Restart Claude Desktop. The 11 tools should appear in the tool picker.
 
 ### Claude Code Setup
 

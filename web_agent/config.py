@@ -103,9 +103,28 @@ class DownloadConfig(BaseSettings):
     max_file_size_mb: int = 100
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [
-            ".pdf", ".csv", ".xlsx", ".xls", ".zip", ".json", ".txt",
-            ".doc", ".docx", ".ppt", ".pptx", ".png", ".jpg", ".jpeg",
-            ".gif", ".svg", ".xml", ".html", ".htm", ".md", ".tar", ".gz",
+            ".pdf",
+            ".csv",
+            ".xlsx",
+            ".xls",
+            ".zip",
+            ".json",
+            ".txt",
+            ".doc",
+            ".docx",
+            ".ppt",
+            ".pptx",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".svg",
+            ".xml",
+            ".html",
+            ".htm",
+            ".md",
+            ".tar",
+            ".gz",
         ]
     )
 
@@ -295,6 +314,4 @@ class AppConfig(BaseSettings):
         try:
             return cls(**data)
         except Exception as exc:
-            raise ConfigError(
-                f"Config validation failed for {p}: {exc}"
-            ) from exc
+            raise ConfigError(f"Config validation failed for {p}: {exc}") from exc
