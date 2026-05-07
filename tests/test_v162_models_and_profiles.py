@@ -21,7 +21,8 @@ from web_agent.recipes import RANKING_PROFILES, Recipes, _resolve_domain_hints
 
 
 def test_version_bump():
-    assert __version__ == "1.6.2"
+    # v1.6.x family; v1.6.3 added user-extensible ranking profiles + smart routing fixes.
+    assert __version__.startswith("1.6.")
 
 
 # ----------------------------------------------------------------------

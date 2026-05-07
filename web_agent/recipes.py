@@ -36,7 +36,6 @@ from .models import (
     FormFilterSpec,
     ResearchResult,
     SearchResultItem,
-    ToolSeverity,
 )
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
@@ -189,6 +188,36 @@ class Recipes:
         self._config = config
         self._bm = browser_manager
         self._sessions = sessions
+        # Merge built-in RANKING_PROFILES with user-defined profiles from
+        # AppConfig.ranking_profiles. User-defined wins on collision so a
+        # caller can redefine 'docs' for an internal portal.
+        self._profiles: dict[str, tuple[str, ...]] = {**RANKING_PROFILES}
+        for name, hosts in (config.ranking_profiles or {}).items():
+            self._profiles[name] = tuple(hosts)
+
+    def _resolve_hints(
+        self,
+        prefer_domains: Optional[list[str]],
+        domain_profile: Optional[str],
+    ) -> tuple[str, ...]:
+        """Combine profile + caller hints, consulting the merged profile dict.
+
+        Built-in profiles can be overridden by user-defined ones via
+        ``AppConfig.ranking_profiles``. Unknown profile names log a debug
+        message and are otherwise ignored.
+        """
+        profile_hints: tuple[str, ...] = ()
+        if domain_profile:
+            if domain_profile in self._profiles:
+                profile_hints = self._profiles[domain_profile]
+            else:
+                logger.debug(
+                    "Unknown ranking profile {p!r} (known: {known}); ignoring",
+                    p=domain_profile,
+                    known=sorted(self._profiles.keys()),
+                )
+        user_hints = tuple(prefer_domains or ())
+        return profile_hints + user_hints
 
     # ------------------------------------------------------------------
     # Ranking
@@ -304,7 +333,7 @@ class Recipes:
                 correlation_id=get_correlation_id(),
             )
 
-        prefs = _resolve_domain_hints(prefer_domains, domain_profile)
+        prefs = self._resolve_hints(prefer_domains, domain_profile)
         ranked = sorted(
             allowed,
             key=lambda r: self._rank(query, r, ranking, prefer_domains=prefs),
@@ -431,9 +460,10 @@ class Recipes:
             ResearchResult with citations, summary pages, budget telemetry,
             warnings, download_candidates, and per-URL diagnostics.
         """
+        from .agent import _MessageBag
+
         start = time.perf_counter()
-        errors: list[str] = []
-        warnings: list[str] = []
+        bag = _MessageBag()
         download_candidates: list[SearchResultItem] = []
         diagnostics: list[FetchDiagnostic] = []
         budget = BudgetTracker(self._config.safety)
@@ -453,7 +483,7 @@ class Recipes:
         allowed: list[SearchResultItem] = []
         for r in search_resp.results:
             if not check_domain_allowed(r.url, self._config.safety):
-                warnings.append(f"Domain denied: {r.url}")
+                bag.warn("domain_blocked", f"Domain denied: {r.url}", url=r.url)
                 diagnostics.append(
                     FetchDiagnostic(
                         url=r.url,
@@ -477,22 +507,20 @@ class Recipes:
             allowed.append(r)
 
         if not allowed:
-            from .agent import _to_structured
-
-            errs = ["No allowed pages in search results"]
+            bag.err("no_allowed_pages", "No allowed pages in search results")
             return ResearchResult(
                 query=query,
-                errors=errs,
-                warnings=warnings,
+                errors=bag.errors,
+                warnings=bag.warnings,
                 download_candidates=download_candidates,
                 diagnostics=diagnostics,
-                structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
-                structured_errors=_to_structured(errs, ToolSeverity.ERROR),
+                structured_warnings=bag.structured_warnings,
+                structured_errors=bag.structured_errors,
                 correlation_id=get_correlation_id(),
                 total_time_ms=(time.perf_counter() - start) * 1000,
             )
 
-        prefs = _resolve_domain_hints(prefer_domains, domain_profile)
+        prefs = self._resolve_hints(prefer_domains, domain_profile)
         # Cache scores so we don't re-tokenize per item during sort + citation build
         scores: dict[str, float] = {
             r.url: self._rank(query, r, prefer_domains=prefs) for r in allowed
@@ -509,7 +537,11 @@ class Recipes:
 
         for item, fr in zip(targets, fetch_results, strict=True):
             if isinstance(fr, BaseException):
-                warnings.append(f"Fetch raised for {item.url}: {fr}")
+                bag.warn(
+                    "fetch_exception",
+                    f"Fetch raised for {item.url}: {fr}",
+                    url=item.url,
+                )
                 diagnostics.append(
                     FetchDiagnostic(
                         url=item.url,
@@ -523,11 +555,15 @@ class Recipes:
                 budget.check_time()
                 budget.add_page()
             except Exception as exc:
-                errors.append(str(exc))
+                bag.err("budget_exceeded", str(exc))
                 break
 
             if fr.status != FetchStatus.SUCCESS or not fr.html:
-                warnings.append(f"Failed to fetch {item.url}: {fr.error_message}")
+                bag.warn(
+                    "fetch_failed",
+                    f"Failed to fetch {item.url}: {fr.error_message}",
+                    url=item.url,
+                )
                 # local import to avoid leaking the helper into module top
                 from .agent import _block_reason_for
 
@@ -551,7 +587,7 @@ class Recipes:
             try:
                 budget.add_chars(extracted.content_length)
             except Exception as exc:
-                errors.append(str(exc))
+                bag.err("budget_exceeded", str(exc))
                 summary_pages.append(extracted)
                 diagnostics.append(
                     FetchDiagnostic(
@@ -600,10 +636,11 @@ class Recipes:
             )
 
         # Promote "no usable pages at all" from warnings to a fatal error.
-        if not summary_pages and not errors:
-            errors.append("All page fetches failed; see warnings/diagnostics for detail")
-
-        from .agent import _to_structured
+        if not summary_pages and not bag.errors:
+            bag.err(
+                "all_fetches_failed",
+                "All page fetches failed; see warnings/diagnostics for detail",
+            )
 
         elapsed = (time.perf_counter() - start) * 1000
         return ResearchResult(
@@ -612,12 +649,12 @@ class Recipes:
             summary_pages=summary_pages,
             pages_visited=budget.pages_used,
             chars_extracted=budget.chars_used,
-            errors=errors,
-            warnings=warnings,
+            errors=bag.errors,
+            warnings=bag.warnings,
             download_candidates=download_candidates,
             diagnostics=diagnostics,
-            structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
-            structured_errors=_to_structured(errors, ToolSeverity.ERROR),
+            structured_warnings=bag.structured_warnings,
+            structured_errors=bag.structured_errors,
             correlation_id=get_correlation_id(),
             total_time_ms=elapsed,
         )

@@ -1,21 +1,22 @@
 """MCP (Model Context Protocol) server exposing web_agent as tools for AI clients.
 
 Runs as an MCP server that Claude Desktop, Claude Code, Cursor, and other
-MCP-compatible clients can connect to. Exposes 11 tools:
+MCP-compatible clients can connect to. Exposes 12 tools:
 
-**Single-shot tools** (existing):
+**Single-shot tools**:
 - ``web_search`` -- search + extract top results
-- ``web_fetch`` -- fetch and extract a single URL
+- ``web_fetch`` -- fetch and extract a single URL (smart binary routing)
 - ``web_download`` -- download a file or save a web page
 - ``web_screenshot`` -- screenshot a page
 - ``web_interact`` -- run a scripted browser action sequence
 
-**High-level recipes** (new):
+**High-level recipes**:
 - ``web_search_best`` -- search and open the best-ranked result
 - ``web_find_and_download`` -- search and download the first matching file
 - ``web_research`` -- multi-page research with structured citations
+- ``web_fill_form_and_extract`` -- open page, fill search/filter form, extract content
 
-**Browser sessions** (new) -- retain cookies/login across multiple tool calls:
+**Browser sessions** -- retain cookies/login across multiple tool calls:
 - ``create_browser_session`` -- start a persistent browser session
 - ``close_browser_session`` -- end a session and free its resources
 - ``list_browser_sessions`` -- list live sessions

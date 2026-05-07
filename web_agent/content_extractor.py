@@ -1,9 +1,11 @@
 """Three-tier content extraction: trafilatura -> BeautifulSoup4 -> raw text.
 
-Also supports binary extraction for PDF (pypdf) and XLSX (openpyxl) when
-the optional ``[binary]`` extra is installed. Without those libraries,
-binary extraction returns ``ExtractionResult(extraction_method="none")``
-with a clear install hint -- it never crashes the pipeline.
+Also supports binary extraction for PDF (pypdf), XLSX (openpyxl), DOCX
+(python-docx), and CSV (stdlib). PDF/XLSX/DOCX require the optional
+``[binary]`` extra; CSV works with no additional dependency. Without
+the relevant library, binary extraction returns
+``ExtractionResult(extraction_method="none")`` with a clear install
+hint -- it never crashes the pipeline.
 """
 
 from __future__ import annotations

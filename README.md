@@ -6,15 +6,22 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.2** — follow-up review pass: smart binary routing
-> in `fetch_and_extract` (HEAD-based detection of extensionless PDF/XLSX URLs),
-> streaming binary fetches with `max_file_size_mb` cap, browser-session
-> cookies reused for authenticated `fetch_binary`, CSV + DOCX extraction
-> alongside PDF/XLSX (`[binary]` extra), named ranking profiles
-> (`official_sources` / `docs` / `research` / `news` / `files`), structured
-> `ToolError` / `ToolWarning` models, MCP exposure of all new controls,
-> Python 3.13 in CI, default `wait_until=domcontentloaded`. See
-> [CHANGELOG.md](CHANGELOG.md).
+> **What's new in 1.6.3** — follow-up review pass on v1.6.2: direct-URL
+> branch in `search_and_extract` now uses smart binary routing; search
+> results parallel-HEAD-probed for extensionless PDFs/XLSX/DOCX (regulator
+> `/download?id=42` URLs); `classify_url` accepts `session_id` for
+> authenticated probes; structured warnings/errors recorded with stable
+> codes at the source (no more brittle prefix matching);
+> `AppConfig.ranking_profiles` makes ranking profiles user-extensible and
+> overridable. See [CHANGELOG.md](CHANGELOG.md).
+>
+> **v1.6.2** added: smart binary routing in `fetch_and_extract` (HEAD-based
+> detection of extensionless PDF/XLSX URLs), streaming binary fetches with
+> `max_file_size_mb` cap, browser-session cookies reused for authenticated
+> `fetch_binary`, CSV + DOCX extraction (`[binary]` extra), named ranking
+> profiles (`official_sources` / `docs` / `research` / `news` / `files`),
+> structured `ToolError`/`ToolWarning`, MCP exposure, Python 3.13 in CI,
+> default `wait_until=domcontentloaded`.
 >
 > v1.6.1 added: warnings/errors split, `download_candidates`, per-URL
 > `FetchDiagnostic`, search-engine URL unwrap, `fill_form_and_extract` recipe.
@@ -40,7 +47,7 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 - **Screenshots** -- Viewport, full-page, or element-specific captures
 - **Anti-Detection** -- playwright-stealth, user-agent rotation, resource blocking
 - **Structured Output** -- All results are Pydantic v2 models serializable to JSON
-- **MCP Server** -- 11 tools exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client
+- **MCP Server** -- 12 tools exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client
 
 ## Installation
 
@@ -165,7 +172,7 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `search` | `max_results` | `10` | Number of search results to return |
 | `search` | `language` | `"en"` | Search language |
 | `search` | `region` | `"us"` | Search region |
-| `fetch` | `wait_until` | `"networkidle"` | Wait condition (`networkidle`, `load`, `domcontentloaded`) |
+| `fetch` | `wait_until` | `"domcontentloaded"` | Wait condition (`domcontentloaded`, `load`, `networkidle`); changed in 1.6.2 from `networkidle` for robustness against pages that poll/analytics |
 | `fetch` | `retry_policy` | `"balanced"` | Profile: `fast` / `balanced` / `paranoid` |
 | `fetch` | `max_retries` | `3` | Retry count (overrides policy when set) |
 | `fetch` | `retry_base_delay` | `1.0` | Base delay (seconds) for exponential backoff |
@@ -803,7 +810,7 @@ Add:
 }
 ```
 
-Restart Claude Desktop. The 11 tools should appear in the tool picker.
+Restart Claude Desktop. The 12 tools should appear in the tool picker.
 
 ### Claude Code Setup
 
@@ -925,7 +932,7 @@ WEB_AGENT_CACHE__ENABLED = "true"
 WEB_AGENT_CACHE__CACHE_DIR = "/var/cache/openclaw/web_agent"
 ```
 
-OpenClaw will auto-discover all 11 tools (`web_search`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the 3 recipes, plus the 3 session-management tools).
+OpenClaw will auto-discover all 12 tools (`web_search`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the 4 recipes including `web_fill_form_and_extract`, plus the 3 session-management tools).
 
 **Path B: As a Python library** (for OpenClaw skills / custom hooks where you need fine control):
 
@@ -1082,7 +1089,7 @@ web_agent/
   content_extractor.py   # trafilatura -> BS4 -> raw + markdown rendering (v1.5)
   downloader.py          # Three-strategy file/page download with safety + sessions
   recipes.py             # High-level recipes (search_and_open_best, find_and_download, web_research)
-  mcp_server.py          # FastMCP server with 11 tools
+  mcp_server.py          # FastMCP server with 12 tools
   main.py                # CLI (search, fetch, download, interact, screenshot, serve-mcp)
 docker/searxng/          # Self-hosted SearXNG quickstart (compose + tuned settings)
 tests/                   # 213 tests (192 unit + 21 integration)

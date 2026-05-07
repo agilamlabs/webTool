@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.2**
+- Latest version: **1.6.3**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -144,6 +144,22 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.3 added
+
+- **Smart routing in `search_and_extract`'s direct-URL path.** Previously
+  the URL-as-query branch called `fetch` directly; now it runs the same
+  classification + routing as `fetch_and_extract`.
+- **Parallel HEAD-probe of search results.** `_url_ext_classification`
+  splits results into `binary` / `html` / `unknown`; only `unknown`
+  URLs are probed, in parallel via `asyncio.gather` (one RTT total).
+- **`classify_url(url, *, session_id=...)`.** HEAD probe inherits
+  Playwright session cookies for authenticated extensionless documents.
+- **`_MessageBag`** records ToolMessage codes at the call site (no more
+  prefix-string classification on the hot path).
+- **`AppConfig.ranking_profiles: dict[str, list[str]]`** lets callers
+  add or override ranking profiles without touching source. Merged with
+  built-in `RANKING_PROFILES` at `Recipes.__init__`; user wins on collision.
 
 ## What v1.6.2 added
 

@@ -41,6 +41,7 @@ Example::
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -82,7 +83,7 @@ from .robots import RobotsChecker
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
-from .web_fetcher import WebFetcher, _is_download_url
+from .web_fetcher import WebFetcher, _is_download_url, _url_ext_classification
 
 
 def _query_is_url(query: str) -> bool:
@@ -149,10 +150,10 @@ def _block_reason_for(fr: FetchResult) -> Optional[str]:
     return _BLOCK_REASON_BY_STATUS.get(fr.status)
 
 
-# Mapping from message-prefix substring to (code, prefix-strip-length).
-# Used by _classify_message below to lift human-readable warnings/errors
-# into structured form without touching every append site. Order matters:
-# the first matching prefix wins.
+# Mapping from message-prefix substring to a stable code. Retained ONLY
+# for the back-compat _classify_message helper -- the hot path now uses
+# _MessageBag which assigns codes at the source. New callers should not
+# rely on prefix-based code derivation.
 _MESSAGE_PREFIX_CODES: tuple[tuple[str, str], ...] = (
     ("Domain blocked:", "domain_blocked"),
     ("Domain denied:", "domain_blocked"),
@@ -171,17 +172,15 @@ _MESSAGE_PREFIX_CODES: tuple[tuple[str, str], ...] = (
 def _classify_message(msg: str) -> tuple[str, Optional[str]]:
     """Best-effort lift of a free-form message into a (code, url) pair.
 
-    Returns a stable code based on prefix matching plus the first URL
-    found in the message (or None). Used to derive
-    ``structured_warnings`` / ``structured_errors`` from the existing
-    ``warnings`` / ``errors`` lists without duplicating every append.
+    Kept for back-compat (a few external callers may have built on top
+    of it); the agent itself no longer relies on this hot-path string
+    classifier. Use :class:`_MessageBag` to record codes at the source.
     """
     code = "unknown"
     for prefix, c in _MESSAGE_PREFIX_CODES:
         if prefix in msg:
             code = c
             break
-    # Pull the first http(s) URL out of the message, if present.
     url: Optional[str] = None
     for token in msg.split():
         token = token.rstrip(".,;:")
@@ -192,12 +191,60 @@ def _classify_message(msg: str) -> tuple[str, Optional[str]]:
 
 
 def _to_structured(messages: list[str], severity: ToolSeverity) -> list[ToolMessage]:
-    """Lift each free-form message into a ToolMessage at the given severity."""
+    """Back-compat helper: lift each free-form message into a ToolMessage."""
     out: list[ToolMessage] = []
     for m in messages:
         code, url = _classify_message(m)
         out.append(ToolMessage(code=code, message=m, url=url, severity=severity))
     return out
+
+
+class _MessageBag:
+    """Internal collector that records warnings / errors with structured codes.
+
+    The hot path (search_and_extract, web_research) records codes at the
+    source via :meth:`warn` / :meth:`err`, instead of round-tripping
+    through prefix-based classification. Both string and structured
+    representations stay in sync because they're produced together.
+
+    Attributes:
+        warnings: Legacy free-form string list (kept for back-compat).
+        errors: Same shape as warnings, for fatal issues.
+        structured_warnings: ToolMessage list at WARNING severity.
+        structured_errors: ToolMessage list at ERROR severity.
+    """
+
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+        self.errors: list[str] = []
+        self.structured_warnings: list[ToolMessage] = []
+        self.structured_errors: list[ToolMessage] = []
+
+    def warn(
+        self,
+        code: str,
+        message: str,
+        *,
+        url: Optional[str] = None,
+        severity: ToolSeverity = ToolSeverity.WARNING,
+    ) -> None:
+        self.warnings.append(message)
+        self.structured_warnings.append(
+            ToolMessage(code=code, message=message, url=url, severity=severity)
+        )
+
+    def err(
+        self,
+        code: str,
+        message: str,
+        *,
+        url: Optional[str] = None,
+        severity: ToolSeverity = ToolSeverity.ERROR,
+    ) -> None:
+        self.errors.append(message)
+        self.structured_errors.append(
+            ToolMessage(code=code, message=message, url=url, severity=severity)
+        )
 
 
 class Agent:
@@ -364,8 +411,7 @@ class Agent:
         ) as cid:
             self._debug.reset()
             start = time.perf_counter()
-            errors: list[str] = []
-            warnings: list[str] = []
+            bag = _MessageBag()
             download_candidates: list[SearchResultItem] = []
             diagnostics: list[FetchDiagnostic] = []
             budget = BudgetTracker(self._config.safety)
@@ -386,9 +432,23 @@ class Agent:
                     # fall through to the regular search path below
                 else:
                     logger.info("Query is a URL, skipping search: {q}", q=query)
-                    fr = await self._fetcher.fetch(query, session_id=session_id)
+                    # Smart routing: PDF/XLSX/DOCX/CSV URLs go through the
+                    # binary extractor; HEAD probe handles extensionless
+                    # documents (regulator dashboards etc.).
+                    classification = "html"
+                    if _is_download_url(query):
+                        classification = "binary"
+                    elif self._config.safety.probe_binary_urls:
+                        classification = await self._fetcher.classify_url(
+                            query, session_id=session_id
+                        )
+                    if classification == "binary":
+                        fr = await self._fetcher.fetch_binary(query, session_id=session_id)
+                    else:
+                        fr = await self._fetcher.fetch(query, session_id=session_id)
+
                     url_pages: list[ExtractionResult] = []
-                    if fr.html:
+                    if fr.status == FetchStatus.SUCCESS and (fr.html or fr.binary):
                         extracted = self._extractor.extract(fr)
                         extracted.correlation_id = cid
                         url_pages.append(extracted)
@@ -405,7 +465,11 @@ class Agent:
                             )
                         )
                     else:
-                        errors.append(f"Failed to fetch {query}: {fr.error_message or 'unknown'}")
+                        bag.err(
+                            "fetch_failed",
+                            f"Failed to fetch {query}: {fr.error_message or 'unknown'}",
+                            url=query,
+                        )
                         diagnostics.append(
                             FetchDiagnostic(
                                 url=query,
@@ -422,12 +486,12 @@ class Agent:
                         query=query,
                         search=SearchResponse(query=query),
                         pages=url_pages,
-                        errors=errors,
-                        warnings=warnings,
+                        errors=bag.errors,
+                        warnings=bag.warnings,
                         download_candidates=download_candidates,
                         diagnostics=diagnostics,
-                        structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
-                        structured_errors=_to_structured(errors, ToolSeverity.ERROR),
+                        structured_warnings=bag.structured_warnings,
+                        structured_errors=bag.structured_errors,
                         total_time_ms=(time.perf_counter() - start) * 1000,
                         correlation_id=cid,
                     )
@@ -437,16 +501,16 @@ class Agent:
             logger.info("Search returned {n} results", n=search_response.total_results)
 
             if not search_response.results:
-                errs = ["No search results found"]
+                bag.err("no_search_results", "No search results found")
                 return AgentResult(
                     query=query,
                     search=search_response,
-                    errors=errs,
-                    warnings=warnings,
+                    errors=bag.errors,
+                    warnings=bag.warnings,
                     download_candidates=download_candidates,
                     diagnostics=diagnostics,
-                    structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
-                    structured_errors=_to_structured(errs, ToolSeverity.ERROR),
+                    structured_warnings=bag.structured_warnings,
+                    structured_errors=bag.structured_errors,
                     total_time_ms=(time.perf_counter() - start) * 1000,
                     correlation_id=cid,
                 )
@@ -456,9 +520,10 @@ class Agent:
             # download_candidate, or (c) a warning + diagnostic.
             page_items: list[SearchResultItem] = []
             file_items: list[SearchResultItem] = []
+            unknown_items: list[SearchResultItem] = []
             for r in search_response.results:
                 if not check_domain_allowed(r.url, self._config.safety):
-                    warnings.append(f"Domain blocked: {r.url}")
+                    bag.warn("domain_blocked", f"Domain blocked: {r.url}", url=r.url)
                     diagnostics.append(
                         FetchDiagnostic(
                             url=r.url,
@@ -468,13 +533,41 @@ class Agent:
                         )
                     )
                     continue
-                if _is_download_url(r.url):
+                ext_class = _url_ext_classification(r.url)
+                if ext_class == "binary":
                     file_items.append(r)
-                else:
+                elif ext_class == "html":
                     page_items.append(r)
+                else:
+                    unknown_items.append(r)
+
+            # NEW in 1.6.3: parallel HEAD-probe extensionless URLs so
+            # extensionless PDFs / XLSX from search results are routed
+            # to fetch_binary instead of failing in HTML extraction.
+            # Bounded to one round-trip's worth of latency via gather.
+            if unknown_items and self._config.safety.probe_binary_urls:
+                probe_tasks = [
+                    self._fetcher.classify_url(item.url, session_id=session_id)
+                    for item in unknown_items
+                ]
+                probe_results: list[Any] = await asyncio.gather(
+                    *probe_tasks, return_exceptions=True
+                )
+                for item, classification in zip(unknown_items, probe_results, strict=True):
+                    if isinstance(classification, BaseException):
+                        # Probe failure -> default to HTML, will be caught downstream
+                        page_items.append(item)
+                    elif classification == "binary":
+                        file_items.append(item)
+                    else:
+                        # 'html' or 'unknown' -> treat as HTML
+                        page_items.append(item)
+            else:
+                # probe disabled -> extensionless URLs default to HTML
+                page_items.extend(unknown_items)
 
             # Handle file URLs: surface as structured candidates, optionally
-            # extract inline if extract_files=True (PDF/XLSX path).
+            # extract inline if extract_files=True (PDF/XLSX/DOCX/CSV path).
             pages: list[ExtractionResult] = []
             if file_items:
                 if extract_files:
@@ -487,7 +580,7 @@ class Agent:
                             budget.check_time()
                             budget.add_page()
                         except Exception as exc:
-                            errors.append(str(exc))
+                            bag.err("budget_exceeded", str(exc))
                             break
                         bin_fr = await self._fetcher.fetch_binary(
                             fr_item.url, session_id=session_id
@@ -508,9 +601,11 @@ class Agent:
                                 )
                             )
                         else:
-                            warnings.append(
+                            bag.warn(
+                                "binary_extraction_failed",
                                 f"Binary extraction failed for {fr_item.url}: "
-                                f"{bin_fr.error_message or 'no content'}"
+                                f"{bin_fr.error_message or 'no content'}",
+                                url=fr_item.url,
                             )
                             diagnostics.append(
                                 FetchDiagnostic(
@@ -526,11 +621,15 @@ class Agent:
                 else:
                     download_candidates.extend(file_items)
                     if len(file_items) == 1:
-                        warnings.append("1 downloadable file URL skipped; see download_candidates")
+                        bag.warn(
+                            "download_skipped",
+                            "1 downloadable file URL skipped; see download_candidates",
+                        )
                     else:
-                        warnings.append(
+                        bag.warn(
+                            "download_skipped",
                             f"{len(file_items)} downloadable file URLs skipped; "
-                            f"see download_candidates"
+                            f"see download_candidates",
                         )
                     for fi in file_items:
                         diagnostics.append(
@@ -551,7 +650,7 @@ class Agent:
                 try:
                     budget.check_time()
                 except Exception as exc:
-                    errors.append(str(exc))
+                    bag.err("budget_exceeded", str(exc))
                     break
 
                 provider = url_to_provider.get(fr.url, "unknown")
@@ -560,14 +659,14 @@ class Agent:
                     try:
                         budget.add_page()
                     except Exception as exc:
-                        errors.append(str(exc))
+                        bag.err("budget_exceeded", str(exc))
                         break
                     extraction = self._extractor.extract(fr)
                     extraction.correlation_id = cid
                     try:
                         budget.add_chars(extraction.content_length)
                     except Exception as exc:
-                        errors.append(str(exc))
+                        bag.err("budget_exceeded", str(exc))
                         pages.append(extraction)
                         diagnostics.append(
                             FetchDiagnostic(
@@ -596,7 +695,11 @@ class Agent:
                         )
                     )
                 else:
-                    warnings.append(f"Failed to fetch {fr.url}: {fr.error_message}")
+                    bag.warn(
+                        "fetch_failed",
+                        f"Failed to fetch {fr.url}: {fr.error_message}",
+                        url=fr.url,
+                    )
                     diagnostics.append(
                         FetchDiagnostic(
                             url=fr.url,
@@ -613,15 +716,18 @@ class Agent:
             # Promote "no usable pages at all" from warnings to a fatal
             # error so callers checking `if not result.errors` behave
             # correctly.
-            if not pages and page_urls and not errors:
-                errors.append("All page fetches failed; see warnings/diagnostics for detail")
+            if not pages and page_urls and not bag.errors:
+                bag.err(
+                    "all_fetches_failed",
+                    "All page fetches failed; see warnings/diagnostics for detail",
+                )
 
             elapsed = (time.perf_counter() - start) * 1000
             logger.info(
                 "Pipeline complete: {n} pages, {w} warnings, {e} errors in {t:.0f}ms",
                 n=len(pages),
-                w=len(warnings),
-                e=len(errors),
+                w=len(bag.warnings),
+                e=len(bag.errors),
                 t=elapsed,
             )
 
@@ -629,12 +735,12 @@ class Agent:
                 query=query,
                 search=search_response,
                 pages=pages,
-                errors=errors,
-                warnings=warnings,
+                errors=bag.errors,
+                warnings=bag.warnings,
                 download_candidates=download_candidates,
                 diagnostics=diagnostics,
-                structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
-                structured_errors=_to_structured(errors, ToolSeverity.ERROR),
+                structured_warnings=bag.structured_warnings,
+                structured_errors=bag.structured_errors,
                 total_time_ms=elapsed,
                 correlation_id=cid,
             )
@@ -686,7 +792,7 @@ class Agent:
             if _is_download_url(url):
                 classification = "binary"
             elif binary_probe and self._config.safety.probe_binary_urls:
-                classification = await self._fetcher.classify_url(url)
+                classification = await self._fetcher.classify_url(url, session_id=session_id)
 
             if classification == "binary":
                 fr = await self._fetcher.fetch_binary(url, session_id=session_id)
