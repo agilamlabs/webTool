@@ -381,6 +381,17 @@ class AppConfig(BaseSettings):
     log_level: str = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")
+    ranking_profiles: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "User-defined ranking profiles, merged with the built-in "
+            "RANKING_PROFILES (official_sources / docs / research / "
+            "news / files). Same shape as the built-in dict: "
+            "{name: [host1, host2, ...]}. User-defined profiles "
+            "OVERRIDE built-ins on name collision -- callers can "
+            "redefine 'docs' for an internal docs portal, for example."
+        ),
+    )
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> AppConfig:

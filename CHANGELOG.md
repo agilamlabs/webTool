@@ -1,5 +1,124 @@
 # Changelog
 
+## [1.6.3] - 2026-05-07
+
+### Follow-up to v1.6.2: 8-issue review pass
+
+Tightens the smart-routing + structured-error work that landed in
+v1.6.1/v1.6.2. Backward-compatible -- no breaking changes.
+
+#### Smart routing now covers the direct-URL search path (#1)
+
+`Agent.search_and_extract("https://x.com/report.pdf")` previously
+called `WebFetcher.fetch` directly in the URL-as-query branch and
+fell through to a NETWORK_ERROR for known download URLs. The branch
+now runs the same classification + routing logic as
+`fetch_and_extract`: known download extensions and HEAD-probed
+extensionless documents go through `fetch_binary`; HTML stays on
+the browser path.
+
+#### Search results probed for extensionless binaries (#2)
+
+In normal search mode, results were split into file_items / page_items
+using URL-extension only. Extensionless PDFs from search results
+(common with regulator dashboards: `/download?id=42`) silently fell
+into HTML extraction and produced empty pages.
+
+The split now uses a three-way classifier:
+- Known download extension -> `binary` (immediate)
+- Known HTML extension (`.html`, `.aspx`, `.php`, `.jsp`, `.asp`,
+  `.htm`, `.xhtml`, `.shtml`, `.phtml`, `.cgi`) -> `html` (immediate)
+- Otherwise -> `unknown` (HEAD-probed)
+
+Unknown URLs are HEAD-probed in parallel via `asyncio.gather`, so
+the latency cost is one round-trip total -- not one per result.
+Probe failures default to HTML and the URL falls through to the
+existing fetch path.
+
+When `extract_files=True`, newly-detected extensionless binaries are
+extracted inline; otherwise they land in `download_candidates`.
+
+#### `classify_url` accepts `session_id` (#3)
+
+`WebFetcher.classify_url(url, *, session_id=None)`: when supplied,
+the HEAD probe inherits cookies from the Playwright session via the
+existing `_cookies_for_session` path. Authenticated extensionless
+document URLs (intranet downloads, regulator dashboards) now pass
+the same auth gate as `fetch_binary`.
+
+#### Structured warnings/errors recorded at the source (#4)
+
+The hot path no longer relies on prefix-string classification to
+derive structured codes after the fact. New internal `_MessageBag`
+class with `.warn(code, message, url)` and `.err(code, message, url)`
+methods that maintain both string and `ToolMessage` lists in lockstep,
+populating `code` at the call site.
+
+`AgentResult.structured_warnings[*].code` is now always one of:
+`domain_blocked`, `fetch_failed`, `fetch_exception`, `download_skipped`,
+`binary_extraction_failed`, `budget_exceeded`, `no_search_results`,
+`no_allowed_pages`, `all_fetches_failed`. The legacy prefix
+classifier (`_classify_message` / `_to_structured`) is retained as a
+back-compat helper but is no longer used by the agent itself, so
+unrecognized message text no longer leaks `code="unknown"` into
+results.
+
+#### User-extensible ranking profiles (#8)
+
+New `AppConfig.ranking_profiles: dict[str, list[str]] = {}`. Combined
+with the built-in `RANKING_PROFILES` at `Recipes.__init__` time;
+user-defined profiles override built-ins on name collision so callers
+can redefine, e.g., `"docs"` for an internal portal.
+
+```python
+config = AppConfig(ranking_profiles={
+    "internal_kb": ["wiki.acme.io", "kb.acme.io"],
+    "docs": ["my-docs.acme.io"],   # overrides built-in 'docs'
+})
+async with Agent(config) as agent:
+    result = await agent.web_research(
+        "rate-limiter design",
+        domain_profile="internal_kb",
+    )
+```
+
+`Recipes._resolve_hints` (instance method) consults the merged dict;
+the legacy free function `_resolve_domain_hints` stays for back-compat
+but only sees built-ins.
+
+#### Stale doc cleanup (#5, #6, #7)
+
+- README config table: `wait_until` default now correctly shows
+  `domcontentloaded` (was `networkidle` -- doc lag from v1.6.2).
+- README MCP section + `mcp_server.py` module docstring: 11 -> 12
+  tools, with `web_fill_form_and_extract` listed.
+- `content_extractor.py` top docstring updated: PDF/XLSX -> PDF/XLSX/
+  DOCX/CSV.
+- `pyproject.toml` `[binary]` extra comment updated to reflect DOCX
+  inclusion.
+
+### Test additions
+
+- `tests/test_v163_routing.py`: 13 tests for `_url_ext_classification`,
+  `classify_url(session_id=...)`, direct-URL routing, and search-result
+  parallel probe behavior (probed / not probed / probe disabled /
+  promotion to download_candidate).
+- `tests/test_v163_messagebag_profiles.py`: 11 tests for `_MessageBag`
+  semantics, no-`unknown`-leakage regression, and user-extensible
+  ranking profiles (merging, override, unknown-profile silent ignore).
+
+Total: 319/319 unit tests passing (v1.6.2 was 295; +24).
+
+### Backward compatibility
+
+- All new fields/params default to empty/None.
+- `_classify_message` / `_to_structured` retained for external callers.
+- `_resolve_domain_hints` (free function) retained, now only sees
+  built-in profiles.
+- `classify_url(url)` (positional only) still works -- the new
+  `session_id` is keyword-only.
+- Old JSON dumps still parse against the v1.6.3 model.
+
 ## [1.6.2] - 2026-05-07
 
 ### Follow-up to v1.6.1: 12-issue review pass

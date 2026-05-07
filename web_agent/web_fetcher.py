@@ -117,6 +117,41 @@ def _disposition_is_attachment(disposition: str | None) -> bool:
     return "attachment" in disposition.lower()
 
 
+# Common HTML page extensions. URLs with these extensions are clearly
+# HTML and don't need a HEAD probe -- skipping them keeps search-result
+# pre-classification cheap.
+_HTML_EXTENSIONS = frozenset(
+    {
+        ".html",
+        ".htm",
+        ".xhtml",
+        ".aspx",
+        ".asp",
+        ".php",
+        ".jsp",
+        ".cgi",
+        ".shtml",
+        ".phtml",
+    }
+)
+
+
+def _url_ext_classification(url: str) -> str:
+    """Classify a URL by its extension alone, without any network I/O.
+
+    Returns ``'binary'`` for known download extensions (PDF/XLSX/etc.),
+    ``'html'`` for known HTML extensions (.html/.aspx/etc.), and
+    ``'unknown'`` for everything else (including extensionless URLs).
+    Used as the fast pre-filter before HEAD probing.
+    """
+    path = urlparse(url).path.lower()
+    if any(path.endswith(ext) for ext in _DOWNLOAD_EXTENSIONS):
+        return "binary"
+    if any(path.endswith(ext) for ext in _HTML_EXTENSIONS):
+        return "html"
+    return "unknown"
+
+
 class WebFetcher:
     """Fetches web pages using Playwright with retry, safety, and debug support.
 
@@ -423,20 +458,33 @@ class WebFetcher:
         tasks = [self.fetch(url, session_id=session_id) for url in urls]
         return list(await asyncio.gather(*tasks))
 
-    async def classify_url(self, url: str) -> str:
+    async def classify_url(
+        self,
+        url: str,
+        *,
+        session_id: Optional[str] = None,
+    ) -> str:
         """Return ``'binary' | 'html' | 'unknown'`` for a URL.
 
         Cheap classification used by :meth:`Agent.fetch_and_extract` to
         decide whether to route to :meth:`fetch_binary` or :meth:`fetch`.
 
         Resolution order:
-          1. URL extension matches a known download extension -> ``'binary'``
+          1. URL extension matches a known download/HTML pattern -> direct answer
           2. Content-Type/Content-Disposition probe via HEAD (skipped when
              :attr:`SafetyConfig.probe_binary_urls` is False)
           3. ``'unknown'`` otherwise (caller should default to HTML).
+
+        Args:
+            url: The URL to classify.
+            session_id: Optional persistent session whose cookies should
+                be applied to the HEAD probe. Required when probing
+                authenticated extensionless document URLs (regulator
+                dashboards, intranet downloads).
         """
-        if _is_download_url(url):
-            return "binary"
+        ext_class = _url_ext_classification(url)
+        if ext_class != "unknown":
+            return ext_class
         if not self._config.safety.probe_binary_urls:
             return "unknown"
 
@@ -446,7 +494,7 @@ class WebFetcher:
         try:
             import httpx
 
-            cookie_jar = await self._cookies_for_session(None)
+            cookie_jar = await self._cookies_for_session(session_id)
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=10.0,
