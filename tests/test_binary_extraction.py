@@ -38,9 +38,7 @@ def test_is_xlsx_by_content_type():
         url="https://x.com/a",
         final_url="https://x.com/a",
         status=FetchStatus.SUCCESS,
-        content_type=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
+        content_type=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
     )
     assert _is_xlsx(fr) is True
 

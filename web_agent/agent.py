@@ -100,11 +100,11 @@ def _query_is_url(query: str) -> bool:
 # our own search instead of fetching the SERP HTML (which is rarely
 # useful and triggers anti-bot measures on the SERP host).
 _SEARCH_ENGINE_HOST_PATTERNS = (
-    "google.",       # google.com, google.co.uk, etc.
+    "google.",  # google.com, google.co.uk, etc.
     "bing.com",
     "duckduckgo.com",
     "search.brave.com",
-    "searx.",        # searx.* (searx.tiekoetter.com, searx.be, etc.)
+    "searx.",  # searx.* (searx.tiekoetter.com, searx.be, etc.)
     "searxng.",
 )
 
@@ -468,9 +468,7 @@ class Agent:
                 else:
                     download_candidates.extend(file_items)
                     if len(file_items) == 1:
-                        warnings.append(
-                            "1 downloadable file URL skipped; see download_candidates"
-                        )
+                        warnings.append("1 downloadable file URL skipped; see download_candidates")
                     else:
                         warnings.append(
                             f"{len(file_items)} downloadable file URLs skipped; "
@@ -772,9 +770,7 @@ class Agent:
         where content is gated behind a search box and/or filter controls.
         See :class:`FormFilterSpec` for the locator/value contract.
         """
-        async with self._call_scope(
-            "fill_form_and_extract", {"url": url}
-        ) as cid:
+        async with self._call_scope("fill_form_and_extract", {"url": url}) as cid:
             self._debug.reset()
             result = await self._recipes.fill_form_and_extract(url, spec, session_id=session_id)
             result.correlation_id = cid

@@ -90,9 +90,7 @@ class ContentExtractor:
             if strict:
                 from .exceptions import ExtractionError
 
-                raise ExtractionError(
-                    f"FetchResult has neither html nor binary: url={url}"
-                )
+                raise ExtractionError(f"FetchResult has neither html nor binary: url={url}")
             return ExtractionResult(url=url, extraction_method="none")
 
         html = fetch_result.html
@@ -212,10 +210,7 @@ class ContentExtractor:
             for sheet in wb.worksheets:
                 rows: list[str] = [f"# Sheet: {sheet.title}"]
                 for row in sheet.iter_rows(values_only=True):
-                    cells = [
-                        "" if cell is None else str(cell)
-                        for cell in row
-                    ]
+                    cells = ["" if cell is None else str(cell) for cell in row]
                     if any(cells):
                         rows.append("\t".join(cells))
                 if len(rows) > 1:

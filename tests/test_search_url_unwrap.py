@@ -39,10 +39,7 @@ def test_unwrap_brave():
 
 
 def test_unwrap_searxng():
-    assert (
-        _unwrap_search_url("https://searx.tiekoetter.com/search?q=meta")
-        == "meta"
-    )
+    assert _unwrap_search_url("https://searx.tiekoetter.com/search?q=meta") == "meta"
 
 
 def test_unwrap_returns_none_for_plain_url():
