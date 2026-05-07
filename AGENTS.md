@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.1**
+- Latest version: **1.6.2**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -144,6 +144,29 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.2 added
+
+- **Smart binary routing.** `Agent.fetch_and_extract(url)` HEAD-probes
+  extensionless URLs (`SafetyConfig.probe_binary_urls=True` by default)
+  and routes detected binaries to `WebFetcher.fetch_binary`.
+- **Streaming + size cap.** `fetch_binary` streams response chunks and
+  enforces `DownloadConfig.max_file_size_mb`.
+- **Session cookies.** `fetch_binary(session_id=...)` copies cookies
+  from the Playwright `BrowserContext` into httpx for authenticated
+  document fetches.
+- **CSV + DOCX extraction.** `ContentExtractor` adds `_extract_csv`
+  (stdlib, no dep) and `_extract_docx` (python-docx, in `[binary]`).
+  Dispatch in `extract()` via `_is_csv` / `_is_docx`.
+- **Ranking profiles.** Named host lists in `recipes.RANKING_PROFILES`
+  reachable via `domain_profile=` param on the recipes.
+- **Structured `ToolMessage`.** New `AgentResult.structured_warnings`
+  and `structured_errors` lists alongside the legacy strings.
+- **MCP surface.** `web_search(extract_files=...)`,
+  `web_search_best(prefer_domains=..., domain_profile=...)`,
+  `web_research(...)`, new `web_fill_form_and_extract` tool.
+- **Defaults.** `FetchConfig.wait_until="domcontentloaded"` (was
+  `"networkidle"`); CI tests Python 3.13 alongside 3.10 and 3.12.
 
 ## When in doubt
 

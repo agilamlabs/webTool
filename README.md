@@ -6,14 +6,19 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.1** — failure-surface hardening for agent callers:
-> warnings split from fatal errors, structured `download_candidates` for
-> skipped file URLs, per-URL `FetchDiagnostic` (status / provider / block_reason),
-> built-in PDF + XLSX extraction (`pip install web-agent-toolkit[binary]`),
-> caller-supplied `prefer_domains` ranking hints, auto-unwrap of search-engine
-> SERP URLs, and a new `fill_form_and_extract` recipe for dynamic calendar /
-> regulator-filings pages. See [CHANGELOG.md](CHANGELOG.md) and the
-> [Failure-Surface Diagnostics](#failure-surface-diagnostics) section.
+> **What's new in 1.6.2** — follow-up review pass: smart binary routing
+> in `fetch_and_extract` (HEAD-based detection of extensionless PDF/XLSX URLs),
+> streaming binary fetches with `max_file_size_mb` cap, browser-session
+> cookies reused for authenticated `fetch_binary`, CSV + DOCX extraction
+> alongside PDF/XLSX (`[binary]` extra), named ranking profiles
+> (`official_sources` / `docs` / `research` / `news` / `files`), structured
+> `ToolError` / `ToolWarning` models, MCP exposure of all new controls,
+> Python 3.13 in CI, default `wait_until=domcontentloaded`. See
+> [CHANGELOG.md](CHANGELOG.md).
+>
+> v1.6.1 added: warnings/errors split, `download_candidates`, per-URL
+> `FetchDiagnostic`, search-engine URL unwrap, `fill_form_and_extract` recipe.
+> See the [Failure-Surface Diagnostics](#failure-surface-diagnostics) section.
 
 ## Features
 

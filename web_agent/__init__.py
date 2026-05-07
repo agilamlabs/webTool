@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -95,6 +95,10 @@ from .models import (
     SearchResultItem,
     SelectorLike,
     SessionInfo,
+    ToolError,
+    ToolMessage,
+    ToolSeverity,
+    ToolWarning,
 )
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
@@ -180,4 +184,8 @@ __all__ = [
     "SearchResultItem",
     "SelectorLike",
     "SessionInfo",
+    "ToolError",
+    "ToolMessage",
+    "ToolSeverity",
+    "ToolWarning",
 ]

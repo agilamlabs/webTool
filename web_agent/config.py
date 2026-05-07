@@ -99,7 +99,18 @@ class FetchConfig(BaseSettings):
     retry field, it overrides the policy.
     """
 
-    wait_until: str = "networkidle"
+    wait_until: str = Field(
+        default="domcontentloaded",
+        description=(
+            "Playwright wait condition for page navigation. Default "
+            "'domcontentloaded' (DOM parsed) is fast and robust against "
+            "pages with analytics/polling that prevent 'networkidle' from "
+            "ever firing. Set to 'networkidle' for JS-heavy sites where "
+            "content arrives after the initial DOM, or pair with "
+            "extra_wait_ms / wait_for_selector to give async hydration "
+            "time. Options: 'domcontentloaded' | 'load' | 'networkidle'."
+        ),
+    )
     wait_for_selector: Optional[str] = None
     extra_wait_ms: int = 0
     retry_policy: str = "balanced"  # fast | balanced | paranoid
@@ -224,6 +235,17 @@ class SafetyConfig(BaseSettings):
     allow_downloads: bool = True
     allow_form_submit: bool = True
     block_private_ips: bool = True
+    probe_binary_urls: bool = Field(
+        default=True,
+        description=(
+            "When True, fetch_and_extract sends a HEAD request for URLs "
+            "that don't have a known download extension to detect "
+            "extensionless PDFs / XLSX / DOCX served via Content-Type "
+            "or Content-Disposition headers. Adds one round-trip per "
+            "fetch but recovers many real-world document URLs. Disable "
+            "to skip the probe and rely solely on URL extension."
+        ),
+    )
     max_pages_per_call: int = 50
     max_chars_per_call: int = 1_000_000
     max_time_per_call_seconds: float = 300.0

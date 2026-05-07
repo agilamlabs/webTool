@@ -48,8 +48,10 @@ dev = [
 # the extractors return ExtractionResult(extraction_method="none") + a clear
 # install hint instead of crashing.
 binary = [
-    "pypdf>=4.0.0",
-    "openpyxl>=3.1.0",
+    "pypdf>=4.0.0",        # PDF
+    "openpyxl>=3.1.0",     # XLSX
+    "python-docx>=1.1.0",  # DOCX
+    # CSV extraction uses stdlib `csv`, no extra dependency required.
 ]
 
 [tool.setuptools.packages.find]
