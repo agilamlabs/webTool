@@ -124,6 +124,7 @@ class SearXNGProvider(SearchProvider):
                     url=url,
                     displayed_url=urlparse(url).hostname or "",
                     snippet=(item.get("content") or "").strip(),
+                    provider=self.name,
                 )
             )
         logger.info("SearXNG returned {n} results", n=len(items))
@@ -199,6 +200,7 @@ class DDGSProvider(SearchProvider):
                     url=url,
                     displayed_url=urlparse(url).hostname or "",
                     snippet=(item.get("body") or "").strip(),
+                    provider=self.name,
                 )
             )
         logger.info("DDGS returned {n} results", n=len(items))
@@ -360,6 +362,7 @@ class PlaywrightProvider(SearchProvider):
                             url=href,
                             displayed_url=displayed_url.strip(),
                             snippet=snippet.strip(),
+                            provider=self.name,
                         )
                     )
             except Exception as exc:
@@ -449,6 +452,7 @@ class PlaywrightProvider(SearchProvider):
                             url=real_url,
                             displayed_url=displayed_url,
                             snippet=snippet.strip(),
+                            provider=self.name,
                         )
                     )
             except Exception as exc:

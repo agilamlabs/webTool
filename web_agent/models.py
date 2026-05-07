@@ -17,6 +17,14 @@ class SearchResultItem(BaseModel):
     url: str = Field(description="Target URL of the result")
     displayed_url: str = Field(default="", description="Green URL shown in snippet")
     snippet: str = Field(default="", description="Description snippet text")
+    provider: str = Field(
+        default="unknown",
+        description=(
+            "Search provider that surfaced this result: "
+            "'searxng' | 'ddgs' | 'playwright' | 'unknown'. "
+            "Populated by SearchEngine; useful for FetchDiagnostic."
+        ),
+    )
 
 
 class SearchResponse(BaseModel):
@@ -50,6 +58,19 @@ class FetchResult(BaseModel):
     status_code: Optional[int] = Field(default=None)
     status: FetchStatus
     html: Optional[str] = Field(default=None, description="Raw HTML content")
+    binary: Optional[bytes] = Field(
+        default=None,
+        description=(
+            "Raw binary payload for non-HTML resources (PDF, XLSX). "
+            "Populated only when the binary fetch path is used (see "
+            "Agent.search_and_extract(extract_files=True)). Mutually "
+            "exclusive with html: when binary is set, html is None."
+        ),
+    )
+    content_type: Optional[str] = Field(
+        default=None,
+        description="HTTP Content-Type header captured during binary fetch",
+    )
     error_message: Optional[str] = Field(default=None)
     response_time_ms: float = Field(default=0.0)
     correlation_id: Optional[str] = Field(
@@ -107,13 +128,77 @@ class DownloadResult(BaseModel):
     debug_artifacts: list[str] = Field(default_factory=list)
 
 
+class FetchDiagnostic(BaseModel):
+    """Per-URL fetch outcome surfaced by AgentResult / ResearchResult.
+
+    Lets callers programmatically inspect *why* each URL succeeded or
+    failed without parsing free-form error strings. One diagnostic is
+    emitted per URL the pipeline considered (including blocked / skipped
+    ones), in the order the pipeline saw them.
+    """
+
+    url: str
+    final_url: Optional[str] = Field(
+        default=None, description="URL after redirects (None if never fetched)"
+    )
+    status: FetchStatus
+    status_code: Optional[int] = Field(default=None)
+    provider: str = Field(
+        default="unknown",
+        description="Search provider that surfaced the URL, or 'direct' for caller-supplied",
+    )
+    block_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Reason the URL was not extracted, when applicable: "
+            "'domain_blocked' | 'robots_disallowed' | 'rate_limited' | "
+            "'timeout' | 'http_error' | 'network_error' | "
+            "'download_skipped' | None"
+        ),
+    )
+    content_length: int = Field(
+        default=0,
+        description="Character count of extracted content, 0 if extraction did not run",
+    )
+    response_time_ms: float = Field(default=0.0)
+    from_cache: bool = Field(default=False)
+
+
 class AgentResult(BaseModel):
     """Full pipeline result: search + fetch + extract."""
 
     query: str
     search: SearchResponse
     pages: list[ExtractionResult] = Field(default_factory=list)
-    errors: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Fatal issues that prevent the call from being usable: "
+            "'No search results found', 'all fetches failed', etc. "
+            "If non-empty the caller should treat the call as failed."
+        ),
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-fatal issues that did not block the overall pipeline: "
+            "'domain blocked', 'skipped download URL', 'partial fetch'. "
+            "Informational only -- the call still produced usable output."
+        ),
+    )
+    download_candidates: list[SearchResultItem] = Field(
+        default_factory=list,
+        description=(
+            "Search results that point to downloadable files (PDF/XLSX/DOC/etc.) "
+            "and were skipped by the HTML extraction pipeline. Pass each url to "
+            "Agent.download(), or call search_and_extract(extract_files=True) to "
+            "extract their text inline."
+        ),
+    )
+    diagnostics: list[FetchDiagnostic] = Field(
+        default_factory=list,
+        description="Per-URL fetch outcomes (status, provider, block_reason, length).",
+    )
     total_time_ms: float = Field(default=0.0)
     correlation_id: Optional[str] = Field(default=None)
 
@@ -511,6 +596,66 @@ class ResearchResult(BaseModel):
     summary_pages: list[ExtractionResult] = Field(default_factory=list)
     pages_visited: int = Field(default=0)
     chars_extracted: int = Field(default=0)
-    errors: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Fatal issues that prevent the research call from being usable.",
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Non-fatal issues (blocked domains, skipped downloads, partial fetches).",
+    )
+    download_candidates: list[SearchResultItem] = Field(
+        default_factory=list,
+        description="Downloadable file URLs surfaced by the search but skipped by extraction.",
+    )
+    diagnostics: list[FetchDiagnostic] = Field(
+        default_factory=list,
+        description="Per-URL fetch outcomes for the URLs the recipe attempted.",
+    )
     correlation_id: Optional[str] = None
     total_time_ms: float = Field(default=0.0)
+
+
+# =========================================================================
+# Form-Filter Recipe (Phase 7 / v1.6.1)
+# =========================================================================
+
+
+class FormFilterSpec(BaseModel):
+    """Declarative spec for filling a search/filter form before extracting content.
+
+    Used by :meth:`Agent.fill_form_and_extract` to drive dynamic calendar
+    pages (regulator filings, conference schedules, event listings) where
+    content is gated behind a search box and/or filter controls. The
+    caller supplies semantic locators; the recipe runs the actions and
+    returns the extracted post-submit content.
+    """
+
+    query_selector: Optional[SelectorLike] = Field(
+        default=None,
+        description="Search-box locator. Skipped when None or query_value is None.",
+    )
+    query_value: Optional[str] = Field(
+        default=None,
+        description="Text to fill into query_selector.",
+    )
+    filters: list[tuple[SelectorLike, str]] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of (locator, value) pairs to fill before submit. "
+            "Locator may resolve to a <select>, <input>, or any focus-able "
+            "control; the recipe auto-detects element type."
+        ),
+    )
+    submit_selector: Optional[SelectorLike] = Field(
+        default=None,
+        description="Submit-button locator. When None, the recipe presses Enter on the query input.",
+    )
+    wait_for: Optional[SelectorLike] = Field(
+        default=None,
+        description="Locator that must appear after submit before extraction runs.",
+    )
+    wait_timeout_ms: int = Field(
+        default=15000,
+        description="Maximum time (ms) to wait for wait_for to appear.",
+    )

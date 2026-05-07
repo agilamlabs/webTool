@@ -46,6 +46,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
 
@@ -64,9 +65,13 @@ from .models import (
     AgentResult,
     DownloadResult,
     ExtractionResult,
+    FetchDiagnostic,
+    FetchResult,
     FetchStatus,
+    FormFilterSpec,
     ResearchResult,
     ScreenshotResult,
+    SearchResultItem,
     SessionInfo,
 )
 from .rate_limiter import RateLimiter
@@ -88,6 +93,58 @@ def _query_is_url(query: str) -> bool:
     """
     s = query.strip()
     return s.startswith(("http://", "https://")) and " " not in s
+
+
+# Hosts that act as search-engine SERPs. When a caller passes one of
+# these as a "URL query", we unwrap the embedded ?q= parameter and run
+# our own search instead of fetching the SERP HTML (which is rarely
+# useful and triggers anti-bot measures on the SERP host).
+_SEARCH_ENGINE_HOST_PATTERNS = (
+    "google.",       # google.com, google.co.uk, etc.
+    "bing.com",
+    "duckduckgo.com",
+    "search.brave.com",
+    "searx.",        # searx.* (searx.tiekoetter.com, searx.be, etc.)
+    "searxng.",
+)
+
+
+def _unwrap_search_url(query: str) -> Optional[str]:
+    """If query is a search-engine SERP URL, return the embedded query string.
+
+    Returns None when the URL is not a recognized SERP or has no ``q`` param.
+    Only invoked when ``_query_is_url(query)`` already returned True.
+    """
+    try:
+        parsed = urlparse(query.strip())
+    except Exception:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    if not any(p in host for p in _SEARCH_ENGINE_HOST_PATTERNS):
+        return None
+    qs = parse_qs(parsed.query)
+    raw = qs.get("q") or qs.get("query")
+    if not raw:
+        return None
+    inner = raw[0].strip()
+    return inner or None
+
+
+_BLOCK_REASON_BY_STATUS = {
+    FetchStatus.BLOCKED: "domain_blocked",
+    FetchStatus.TIMEOUT: "timeout",
+    FetchStatus.HTTP_ERROR: "http_error",
+    FetchStatus.NETWORK_ERROR: "network_error",
+}
+
+
+def _block_reason_for(fr: FetchResult) -> Optional[str]:
+    """Map a FetchResult onto a coarse-grained block_reason for diagnostics."""
+    if fr.status == FetchStatus.SUCCESS:
+        return None
+    return _BLOCK_REASON_BY_STATUS.get(fr.status)
 
 
 class Agent:
@@ -177,6 +234,8 @@ class Agent:
             self._extractor,
             self._downloader,
             self._config,
+            browser_manager=self._bm,
+            sessions=self._sessions,
         )
 
     @asynccontextmanager
@@ -217,20 +276,31 @@ class Agent:
         *,
         session_id: Optional[str] = None,
         strict: bool = False,
+        extract_files: bool = False,
     ) -> AgentResult:
         """Full pipeline: search -> fetch top pages -> extract content.
 
         Args:
-            query: The search query.
+            query: The search query, or a bare URL, or a search-engine
+                SERP URL (auto-unwrapped to its embedded ``?q=`` query).
             max_results: Maximum number of results to process.
             session_id: Optional persistent browser session for the fetches.
             strict: If True, raise :class:`SearchError` when every
                 configured search provider (SearXNG / DDGS / Playwright)
                 returns zero results. Default False (return empty
                 AgentResult).
+            extract_files: If True, fetch downloadable files (PDF/XLSX)
+                inline and extract their text into ``pages`` instead of
+                surfacing them in ``download_candidates``. Requires the
+                ``[binary]`` extra (pypdf/openpyxl). Default False.
 
         Returns:
-            AgentResult with search results, extracted pages, errors, and timing.
+            AgentResult with:
+                - ``pages``: extracted text per successfully fetched URL.
+                - ``errors``: fatal issues (all fetches failed, no results).
+                - ``warnings``: non-fatal issues (blocked domains, partial fetches).
+                - ``download_candidates``: skipped file URLs as structured items.
+                - ``diagnostics``: per-URL outcome (status, provider, block_reason).
 
         Raises:
             SearchError: Only when ``strict=True`` and the entire
@@ -242,32 +312,70 @@ class Agent:
             self._debug.reset()
             start = time.perf_counter()
             errors: list[str] = []
+            warnings: list[str] = []
+            download_candidates: list[SearchResultItem] = []
+            diagnostics: list[FetchDiagnostic] = []
             budget = BudgetTracker(self._config.safety)
 
-            # Step 1: URL-as-query short-circuit. If the caller passed a
-            # bare URL instead of a search query, skip the search chain
-            # and fetch + extract the URL directly. Returns an
-            # AgentResult with an empty search response and a single page.
+            # URL-as-query short-circuit. If the caller passed a bare URL
+            # instead of a search query, either unwrap a SERP URL into
+            # its embedded query OR fetch + extract the URL directly.
             from .models import SearchResponse
 
             if _query_is_url(query):
-                logger.info("Query is a URL, skipping search: {q}", q=query)
-                fr = await self._fetcher.fetch(query, session_id=session_id)
-                url_pages: list[ExtractionResult] = []
-                if fr.html:
-                    extracted = self._extractor.extract(fr)
-                    extracted.correlation_id = cid
-                    url_pages.append(extracted)
+                unwrapped = _unwrap_search_url(query)
+                if unwrapped is not None:
+                    logger.info(
+                        "Search-engine SERP URL detected, unwrapping to query: {q}",
+                        q=unwrapped,
+                    )
+                    query = unwrapped
+                    # fall through to the regular search path below
                 else:
-                    errors.append(f"Failed to fetch {query}: {fr.error_message or 'unknown'}")
-                return AgentResult(
-                    query=query,
-                    search=SearchResponse(query=query),
-                    pages=url_pages,
-                    errors=errors,
-                    total_time_ms=(time.perf_counter() - start) * 1000,
-                    correlation_id=cid,
-                )
+                    logger.info("Query is a URL, skipping search: {q}", q=query)
+                    fr = await self._fetcher.fetch(query, session_id=session_id)
+                    url_pages: list[ExtractionResult] = []
+                    if fr.html:
+                        extracted = self._extractor.extract(fr)
+                        extracted.correlation_id = cid
+                        url_pages.append(extracted)
+                        diagnostics.append(
+                            FetchDiagnostic(
+                                url=query,
+                                final_url=fr.final_url,
+                                status=fr.status,
+                                status_code=fr.status_code,
+                                provider="direct",
+                                content_length=extracted.content_length,
+                                response_time_ms=fr.response_time_ms,
+                                from_cache=fr.from_cache,
+                            )
+                        )
+                    else:
+                        errors.append(f"Failed to fetch {query}: {fr.error_message or 'unknown'}")
+                        diagnostics.append(
+                            FetchDiagnostic(
+                                url=query,
+                                final_url=fr.final_url,
+                                status=fr.status,
+                                status_code=fr.status_code,
+                                provider="direct",
+                                block_reason=_block_reason_for(fr),
+                                response_time_ms=fr.response_time_ms,
+                                from_cache=fr.from_cache,
+                            )
+                        )
+                    return AgentResult(
+                        query=query,
+                        search=SearchResponse(query=query),
+                        pages=url_pages,
+                        errors=errors,
+                        warnings=warnings,
+                        download_candidates=download_candidates,
+                        diagnostics=diagnostics,
+                        total_time_ms=(time.perf_counter() - start) * 1000,
+                        correlation_id=cid,
+                    )
 
             logger.info("Starting pipeline for query: {q}", q=query)
             search_response = await self._search.search(query, max_results, strict=strict)
@@ -278,40 +386,119 @@ class Agent:
                     query=query,
                     search=search_response,
                     errors=["No search results found"],
+                    warnings=warnings,
+                    download_candidates=download_candidates,
+                    diagnostics=diagnostics,
                     total_time_ms=(time.perf_counter() - start) * 1000,
                     correlation_id=cid,
                 )
 
-            # Separate file URLs from page URLs and filter blocked domains
-            page_urls: list[str] = []
-            file_urls: list[str] = []
+            # Separate file URLs from page URLs and filter blocked domains.
+            # Each result either becomes (a) a page_url to fetch, (b) a
+            # download_candidate, or (c) a warning + diagnostic.
+            page_items: list[SearchResultItem] = []
+            file_items: list[SearchResultItem] = []
             for r in search_response.results:
                 if not check_domain_allowed(r.url, self._config.safety):
-                    errors.append(f"Domain blocked: {r.url}")
+                    warnings.append(f"Domain blocked: {r.url}")
+                    diagnostics.append(
+                        FetchDiagnostic(
+                            url=r.url,
+                            status=FetchStatus.BLOCKED,
+                            provider=r.provider,
+                            block_reason="domain_blocked",
+                        )
+                    )
                     continue
                 if _is_download_url(r.url):
-                    file_urls.append(r.url)
+                    file_items.append(r)
                 else:
-                    page_urls.append(r.url)
+                    page_items.append(r)
 
-            if file_urls:
-                logger.info(
-                    "Detected {n} file download URLs (skipping fetch, use agent.download())",
-                    n=len(file_urls),
-                )
-                for furl in file_urls:
-                    errors.append(f"File URL skipped (use agent.download()): {furl}")
+            # Handle file URLs: surface as structured candidates, optionally
+            # extract inline if extract_files=True (PDF/XLSX path).
+            pages: list[ExtractionResult] = []
+            if file_items:
+                if extract_files:
+                    logger.info(
+                        "extract_files=True; running binary extraction on {n} file URLs",
+                        n=len(file_items),
+                    )
+                    for fr_item in file_items:
+                        try:
+                            budget.check_time()
+                            budget.add_page()
+                        except Exception as exc:
+                            errors.append(str(exc))
+                            break
+                        bin_fr = await self._fetcher.fetch_binary(
+                            fr_item.url, session_id=session_id
+                        )
+                        if bin_fr.binary:
+                            extraction = self._extractor.extract(bin_fr)
+                            extraction.correlation_id = cid
+                            pages.append(extraction)
+                            diagnostics.append(
+                                FetchDiagnostic(
+                                    url=fr_item.url,
+                                    final_url=bin_fr.final_url,
+                                    status=bin_fr.status,
+                                    status_code=bin_fr.status_code,
+                                    provider=fr_item.provider,
+                                    content_length=extraction.content_length,
+                                    response_time_ms=bin_fr.response_time_ms,
+                                )
+                            )
+                        else:
+                            warnings.append(
+                                f"Binary extraction failed for {fr_item.url}: "
+                                f"{bin_fr.error_message or 'no content'}"
+                            )
+                            diagnostics.append(
+                                FetchDiagnostic(
+                                    url=fr_item.url,
+                                    final_url=bin_fr.final_url,
+                                    status=bin_fr.status,
+                                    status_code=bin_fr.status_code,
+                                    provider=fr_item.provider,
+                                    block_reason=_block_reason_for(bin_fr),
+                                    response_time_ms=bin_fr.response_time_ms,
+                                )
+                            )
+                else:
+                    download_candidates.extend(file_items)
+                    if len(file_items) == 1:
+                        warnings.append(
+                            "1 downloadable file URL skipped; see download_candidates"
+                        )
+                    else:
+                        warnings.append(
+                            f"{len(file_items)} downloadable file URLs skipped; "
+                            f"see download_candidates"
+                        )
+                    for fi in file_items:
+                        diagnostics.append(
+                            FetchDiagnostic(
+                                url=fi.url,
+                                status=FetchStatus.SUCCESS,
+                                provider=fi.provider,
+                                block_reason="download_skipped",
+                            )
+                        )
 
+            page_urls = [p.url for p in page_items]
+            url_to_provider = {p.url: p.provider for p in page_items}
             logger.info("Fetching {n} pages...", n=len(page_urls))
             fetch_results = await self._fetcher.fetch_many(page_urls, session_id=session_id)
 
-            pages: list[ExtractionResult] = []
             for fr in fetch_results:
                 try:
                     budget.check_time()
                 except Exception as exc:
                     errors.append(str(exc))
                     break
+
+                provider = url_to_provider.get(fr.url, "unknown")
 
                 if fr.html:
                     try:
@@ -326,15 +513,59 @@ class Agent:
                     except Exception as exc:
                         errors.append(str(exc))
                         pages.append(extraction)
+                        diagnostics.append(
+                            FetchDiagnostic(
+                                url=fr.url,
+                                final_url=fr.final_url,
+                                status=fr.status,
+                                status_code=fr.status_code,
+                                provider=provider,
+                                content_length=extraction.content_length,
+                                response_time_ms=fr.response_time_ms,
+                                from_cache=fr.from_cache,
+                            )
+                        )
                         break
                     pages.append(extraction)
+                    diagnostics.append(
+                        FetchDiagnostic(
+                            url=fr.url,
+                            final_url=fr.final_url,
+                            status=fr.status,
+                            status_code=fr.status_code,
+                            provider=provider,
+                            content_length=extraction.content_length,
+                            response_time_ms=fr.response_time_ms,
+                            from_cache=fr.from_cache,
+                        )
+                    )
                 else:
-                    errors.append(f"Failed to fetch {fr.url}: {fr.error_message}")
+                    warnings.append(f"Failed to fetch {fr.url}: {fr.error_message}")
+                    diagnostics.append(
+                        FetchDiagnostic(
+                            url=fr.url,
+                            final_url=fr.final_url,
+                            status=fr.status,
+                            status_code=fr.status_code,
+                            provider=provider,
+                            block_reason=_block_reason_for(fr),
+                            response_time_ms=fr.response_time_ms,
+                            from_cache=fr.from_cache,
+                        )
+                    )
+
+            # Promote "no usable pages at all" from warnings to a fatal
+            # error so callers checking `if not result.errors` behave
+            # correctly.
+            if not pages and page_urls and not errors:
+                errors.append("All page fetches failed; see warnings/diagnostics for detail")
 
             elapsed = (time.perf_counter() - start) * 1000
             logger.info(
-                "Pipeline complete: {n} pages extracted in {t:.0f}ms",
+                "Pipeline complete: {n} pages, {w} warnings, {e} errors in {t:.0f}ms",
                 n=len(pages),
+                w=len(warnings),
+                e=len(errors),
                 t=elapsed,
             )
 
@@ -343,6 +574,9 @@ class Agent:
                 search=search_response,
                 pages=pages,
                 errors=errors,
+                warnings=warnings,
+                download_candidates=download_candidates,
+                diagnostics=diagnostics,
                 total_time_ms=elapsed,
                 correlation_id=cid,
             )
@@ -490,13 +724,22 @@ class Agent:
         ranking: str = "default",
         *,
         session_id: Optional[str] = None,
+        prefer_domains: Optional[list[str]] = None,
     ) -> ExtractionResult:
-        """Recipe: search, rank results, fetch + extract the top hit."""
+        """Recipe: search, rank results, fetch + extract the top hit.
+
+        Args:
+            prefer_domains: Optional caller-supplied host hints (e.g.
+                ``["ec.europa.eu", "esma.europa.eu"]``); matching results
+                receive a strong ranking bonus.
+        """
         async with self._call_scope(
             "search_and_open_best_result", {"query": query, "ranking": ranking}
         ) as cid:
             self._debug.reset()
-            result = await self._recipes.search_and_open_best_result(query, ranking, session_id)
+            result = await self._recipes.search_and_open_best_result(
+                query, ranking, session_id, prefer_domains=prefer_domains
+            )
             result.correlation_id = cid
             return result
 
@@ -516,6 +759,27 @@ class Agent:
             result.correlation_id = cid
             return result
 
+    async def fill_form_and_extract(
+        self,
+        url: str,
+        spec: FormFilterSpec,
+        *,
+        session_id: Optional[str] = None,
+    ) -> ExtractionResult:
+        """Recipe: open URL, fill a search/filter form, then extract content.
+
+        Targets dynamic calendar / regulator-filings / event-listing pages
+        where content is gated behind a search box and/or filter controls.
+        See :class:`FormFilterSpec` for the locator/value contract.
+        """
+        async with self._call_scope(
+            "fill_form_and_extract", {"url": url}
+        ) as cid:
+            self._debug.reset()
+            result = await self._recipes.fill_form_and_extract(url, spec, session_id=session_id)
+            result.correlation_id = cid
+            return result
+
     async def web_research(
         self,
         query: str,
@@ -523,14 +787,22 @@ class Agent:
         max_pages: int = 5,
         *,
         session_id: Optional[str] = None,
+        prefer_domains: Optional[list[str]] = None,
     ) -> ResearchResult:
-        """Recipe: search + parallel fetch + extract top N pages, return citations."""
+        """Recipe: search + parallel fetch + extract top N pages, return citations.
+
+        Args:
+            prefer_domains: Optional caller-supplied host hints; matching
+                results receive a strong ranking bonus.
+        """
         async with self._call_scope(
             "web_research",
             {"query": query, "depth": depth, "max_pages": max_pages},
         ) as cid:
             self._debug.reset()
-            result = await self._recipes.web_research(query, depth, max_pages, session_id)
+            result = await self._recipes.web_research(
+                query, depth, max_pages, session_id, prefer_domains=prefer_domains
+            )
             result.correlation_id = cid
             return result
 

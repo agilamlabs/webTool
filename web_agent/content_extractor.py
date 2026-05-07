@@ -1,8 +1,15 @@
-"""Three-tier content extraction: trafilatura -> BeautifulSoup4 -> raw text."""
+"""Three-tier content extraction: trafilatura -> BeautifulSoup4 -> raw text.
+
+Also supports binary extraction for PDF (pypdf) and XLSX (openpyxl) when
+the optional ``[binary]`` extra is installed. Without those libraries,
+binary extraction returns ``ExtractionResult(extraction_method="none")``
+with a clear install hint -- it never crashes the pipeline.
+"""
 
 from __future__ import annotations
 
 from typing import Optional
+from urllib.parse import urlparse
 
 import trafilatura
 from bs4 import BeautifulSoup
@@ -10,6 +17,20 @@ from loguru import logger
 
 from .config import AppConfig
 from .models import ExtractionResult, FetchResult, FetchStatus
+
+
+def _is_pdf(fr: FetchResult) -> bool:
+    ct = (fr.content_type or "").lower()
+    if "application/pdf" in ct:
+        return True
+    return urlparse(fr.final_url or fr.url).path.lower().endswith(".pdf")
+
+
+def _is_xlsx(fr: FetchResult) -> bool:
+    ct = (fr.content_type or "").lower()
+    if "spreadsheetml" in ct or "openxmlformats-officedocument.spreadsheet" in ct:
+        return True
+    return urlparse(fr.final_url or fr.url).path.lower().endswith(".xlsx")
 
 
 class ContentExtractor:
@@ -21,7 +42,11 @@ class ContentExtractor:
     def extract(self, fetch_result: FetchResult, *, strict: bool = False) -> ExtractionResult:
         """Extract structured content from a FetchResult.
 
-        Fallback chain:
+        Dispatches on FetchResult contents:
+          - ``binary`` populated -> PDF or XLSX branch (requires ``[binary]`` extra)
+          - ``html`` populated -> three-tier HTML fallback chain
+
+        HTML fallback chain:
           1. trafilatura (best quality, F1 ~0.958)
           2. BeautifulSoup4 structural extraction
           3. Raw text stripping (last resort)
@@ -36,7 +61,7 @@ class ContentExtractor:
         Raises:
             ExtractionError: If ``strict=True`` and all layers fail.
         """
-        if fetch_result.status != FetchStatus.SUCCESS or not fetch_result.html:
+        if fetch_result.status != FetchStatus.SUCCESS:
             if strict:
                 from .exceptions import ExtractionError
 
@@ -46,8 +71,31 @@ class ContentExtractor:
                 )
             return ExtractionResult(url=fetch_result.url, extraction_method="none")
 
-        html = fetch_result.html
         url = fetch_result.final_url
+
+        # Binary branch: PDF / XLSX. Dispatched on content_type or URL extension.
+        if fetch_result.binary is not None:
+            if _is_pdf(fetch_result):
+                return self._extract_pdf(fetch_result.binary, url)
+            if _is_xlsx(fetch_result):
+                return self._extract_xlsx(fetch_result.binary, url)
+            # Unrecognized binary -- not extractable
+            return ExtractionResult(
+                url=url,
+                extraction_method="none",
+                content=None,
+            )
+
+        if not fetch_result.html:
+            if strict:
+                from .exceptions import ExtractionError
+
+                raise ExtractionError(
+                    f"FetchResult has neither html nor binary: url={url}"
+                )
+            return ExtractionResult(url=url, extraction_method="none")
+
+        html = fetch_result.html
         min_len = self._config.extraction.min_content_length
 
         # Layer 1: trafilatura
@@ -72,6 +120,123 @@ class ContentExtractor:
                 f"(content_length={raw_result.content_length})"
             )
         return raw_result
+
+    # ------------------------------------------------------------------
+    # Binary branches: PDF + XLSX
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_pdf(blob: bytes, url: str) -> ExtractionResult:
+        """Extract text from PDF bytes using pypdf.
+
+        Returns an ExtractionResult with extraction_method='pdf' on success
+        or 'none' on missing-library / encrypted / malformed PDF.
+        """
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            logger.warning(
+                "pypdf not installed; PDF extraction skipped. "
+                "Install with: pip install 'web-agent-toolkit[binary]'"
+            )
+            return ExtractionResult(
+                url=url,
+                extraction_method="none",
+                content=None,
+            )
+
+        try:
+            from io import BytesIO
+
+            reader = PdfReader(BytesIO(blob))
+            if reader.is_encrypted:
+                logger.info("PDF is encrypted, skipping: {url}", url=url)
+                return ExtractionResult(
+                    url=url,
+                    extraction_method="none",
+                    content=None,
+                )
+            parts: list[str] = []
+            for page in reader.pages:
+                try:
+                    parts.append(page.extract_text() or "")
+                except Exception as page_exc:
+                    logger.debug("PDF page extract failed: {e}", e=page_exc)
+            text = "\n\n".join(p for p in parts if p).strip()
+            if not text:
+                return ExtractionResult(
+                    url=url,
+                    extraction_method="none",
+                    content=None,
+                )
+            # Pull /Title from the document info dict if available
+            title: Optional[str] = None
+            try:
+                info = reader.metadata
+                if info is not None and getattr(info, "title", None):
+                    title = str(info.title)
+            except Exception:
+                pass
+            return ExtractionResult(
+                url=url,
+                title=title,
+                content=text,
+                extraction_method="pdf",
+                content_length=len(text),
+            )
+        except Exception as exc:
+            logger.warning("PDF extraction failed for {url}: {e}", url=url, e=exc)
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+
+    @staticmethod
+    def _extract_xlsx(blob: bytes, url: str) -> ExtractionResult:
+        """Extract text from XLSX bytes using openpyxl (TSV-style per sheet)."""
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            logger.warning(
+                "openpyxl not installed; XLSX extraction skipped. "
+                "Install with: pip install 'web-agent-toolkit[binary]'"
+            )
+            return ExtractionResult(
+                url=url,
+                extraction_method="none",
+                content=None,
+            )
+
+        try:
+            from io import BytesIO
+
+            wb = load_workbook(BytesIO(blob), read_only=True, data_only=True)
+            sheet_dumps: list[str] = []
+            for sheet in wb.worksheets:
+                rows: list[str] = [f"# Sheet: {sheet.title}"]
+                for row in sheet.iter_rows(values_only=True):
+                    cells = [
+                        "" if cell is None else str(cell)
+                        for cell in row
+                    ]
+                    if any(cells):
+                        rows.append("\t".join(cells))
+                if len(rows) > 1:
+                    sheet_dumps.append("\n".join(rows))
+            wb.close()
+            text = "\n\n".join(sheet_dumps).strip()
+            if not text:
+                return ExtractionResult(
+                    url=url,
+                    extraction_method="none",
+                    content=None,
+                )
+            return ExtractionResult(
+                url=url,
+                content=text,
+                extraction_method="xlsx",
+                content_length=len(text),
+            )
+        except Exception as exc:
+            logger.warning("XLSX extraction failed for {url}: {e}", url=url, e=exc)
+            return ExtractionResult(url=url, extraction_method="none", content=None)
 
     def _extract_trafilatura(self, html: str, url: str) -> Optional[ExtractionResult]:
         """Primary extractor using trafilatura with metadata."""
