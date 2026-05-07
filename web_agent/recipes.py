@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
+from .browser_manager import BrowserManager
 from .config import AppConfig
 from .content_extractor import ContentExtractor
 from .correlation import get_correlation_id
@@ -30,11 +31,14 @@ from .models import (
     Citation,
     DownloadResult,
     ExtractionResult,
+    FetchDiagnostic,
     FetchStatus,
+    FormFilterSpec,
     ResearchResult,
     SearchResultItem,
 )
 from .search_engine import SearchEngine
+from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
 from .web_fetcher import WebFetcher, _is_download_url
 
@@ -62,6 +66,9 @@ class Recipes:
         extractor: ContentExtractor for content extraction.
         downloader: Downloader for file downloads.
         config: AppConfig for budget/safety configuration.
+        browser_manager: Optional BrowserManager for direct page control
+            (required by :meth:`fill_form_and_extract`).
+        sessions: Optional SessionManager for session-aware page acquisition.
     """
 
     def __init__(
@@ -71,12 +78,16 @@ class Recipes:
         extractor: ContentExtractor,
         downloader: Downloader,
         config: AppConfig,
+        browser_manager: Optional[BrowserManager] = None,
+        sessions: Optional[SessionManager] = None,
     ) -> None:
         self._search = search
         self._fetcher = fetcher
         self._extractor = extractor
         self._downloader = downloader
         self._config = config
+        self._bm = browser_manager
+        self._sessions = sessions
 
     # ------------------------------------------------------------------
     # Ranking
@@ -88,13 +99,27 @@ class Recipes:
         return {tok for tok in re.findall(r"[a-zA-Z0-9]+", text.lower()) if len(tok) >= 2}
 
     @staticmethod
-    def _rank(query: str, item: SearchResultItem, scheme: str = "default") -> float:
+    def _rank(
+        query: str,
+        item: SearchResultItem,
+        scheme: str = "default",
+        prefer_domains: tuple[str, ...] = (),
+    ) -> float:
         """Score a search result.
 
         Schemes:
-            ``default``: query-token overlap + HTTPS bonus + well-known domain bonus + position tiebreaker
+            ``default``: query-token overlap + HTTPS bonus + well-known
+                domain bonus + caller-supplied prefer_domains bonus +
+                position tiebreaker
             ``overlap``: only token overlap
             ``position``: only inverse position
+
+        Args:
+            prefer_domains: Caller-supplied host hints (e.g. ``("ec.europa.eu",
+                "esma.europa.eu")``). Each result whose host matches any
+                hint (exact or as a parent suffix) gets a +0.40 bonus,
+                large enough to dominate the well-known bonus. Only
+                applied for the ``default`` scheme.
         """
         if scheme == "position":
             return 1.0 / max(1, item.position)
@@ -116,6 +141,13 @@ class Recipes:
                 if host == known or host.endswith("." + known):
                     score += 0.20
                     break
+            # Caller-supplied domain hints get a much larger bonus so they
+            # outrank token overlap and well-known domains.
+            for pref in prefer_domains:
+                pref_l = pref.lower().lstrip(".")
+                if host == pref_l or host.endswith("." + pref_l):
+                    score += 0.40
+                    break
             # Small penalty for very deep subdomains
             subdomain_depth = host.count(".")
             if subdomain_depth > 2:
@@ -136,6 +168,7 @@ class Recipes:
         query: str,
         ranking: str = "default",
         session_id: Optional[str] = None,
+        prefer_domains: Optional[list[str]] = None,
     ) -> ExtractionResult:
         """Search for ``query``, rank results, fetch+extract the top hit.
 
@@ -143,6 +176,9 @@ class Recipes:
             query: The search query.
             ranking: Ranking scheme (``default`` | ``overlap`` | ``position``).
             session_id: Optional persistent browser session for the fetch.
+            prefer_domains: Optional caller-supplied host hints (e.g.
+                ``["ec.europa.eu", "esma.europa.eu"]``). Results from
+                these hosts get a strong ranking bonus.
 
         Returns:
             ExtractionResult for the top-ranked URL. If all URLs are blocked
@@ -163,9 +199,10 @@ class Recipes:
                 correlation_id=get_correlation_id(),
             )
 
+        prefs = tuple(prefer_domains or ())
         ranked = sorted(
             allowed,
-            key=lambda r: self._rank(query, r, ranking),
+            key=lambda r: self._rank(query, r, ranking, prefer_domains=prefs),
             reverse=True,
         )
 
@@ -270,6 +307,7 @@ class Recipes:
         depth: int = 1,
         max_pages: int = 5,
         session_id: Optional[str] = None,
+        prefer_domains: Optional[list[str]] = None,
     ) -> ResearchResult:
         """Search and extract content from the top N pages, returning structured citations.
 
@@ -278,12 +316,18 @@ class Recipes:
             depth: Reserved for future expansion. v1 supports depth=1 only.
             max_pages: Maximum number of pages to fetch and extract.
             session_id: Optional persistent browser session.
+            prefer_domains: Optional caller-supplied host hints; matching
+                results get a strong ranking bonus.
 
         Returns:
-            ResearchResult with citations, summary pages, budget telemetry, and errors.
+            ResearchResult with citations, summary pages, budget telemetry,
+            warnings, download_candidates, and per-URL diagnostics.
         """
         start = time.perf_counter()
         errors: list[str] = []
+        warnings: list[str] = []
+        download_candidates: list[SearchResultItem] = []
+        diagnostics: list[FetchDiagnostic] = []
         budget = BudgetTracker(self._config.safety)
 
         if depth != 1:
@@ -301,22 +345,45 @@ class Recipes:
         allowed: list[SearchResultItem] = []
         for r in search_resp.results:
             if not check_domain_allowed(r.url, self._config.safety):
-                errors.append(f"Domain denied: {r.url}")
+                warnings.append(f"Domain denied: {r.url}")
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=r.url,
+                        status=FetchStatus.BLOCKED,
+                        provider=r.provider,
+                        block_reason="domain_blocked",
+                    )
+                )
                 continue
             if _is_download_url(r.url):
+                download_candidates.append(r)
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=r.url,
+                        status=FetchStatus.SUCCESS,
+                        provider=r.provider,
+                        block_reason="download_skipped",
+                    )
+                )
                 continue
             allowed.append(r)
 
         if not allowed:
             return ResearchResult(
                 query=query,
-                errors=errors or ["No allowed pages in search results"],
+                errors=["No allowed pages in search results"],
+                warnings=warnings,
+                download_candidates=download_candidates,
+                diagnostics=diagnostics,
                 correlation_id=get_correlation_id(),
                 total_time_ms=(time.perf_counter() - start) * 1000,
             )
 
+        prefs = tuple(prefer_domains or ())
         # Cache scores so we don't re-tokenize per item during sort + citation build
-        scores: dict[str, float] = {r.url: self._rank(query, r) for r in allowed}
+        scores: dict[str, float] = {
+            r.url: self._rank(query, r, prefer_domains=prefs) for r in allowed
+        }
         ranked = sorted(allowed, key=lambda r: scores[r.url], reverse=True)
         targets = ranked[:max_pages]
 
@@ -329,7 +396,15 @@ class Recipes:
 
         for item, fr in zip(targets, fetch_results, strict=True):
             if isinstance(fr, BaseException):
-                errors.append(f"Fetch raised for {item.url}: {fr}")
+                warnings.append(f"Fetch raised for {item.url}: {fr}")
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=item.url,
+                        status=FetchStatus.NETWORK_ERROR,
+                        provider=item.provider,
+                        block_reason="network_error",
+                    )
+                )
                 continue
             try:
                 budget.check_time()
@@ -339,7 +414,22 @@ class Recipes:
                 break
 
             if fr.status != FetchStatus.SUCCESS or not fr.html:
-                errors.append(f"Failed to fetch {item.url}: {fr.error_message}")
+                warnings.append(f"Failed to fetch {item.url}: {fr.error_message}")
+                # local import to avoid leaking the helper into module top
+                from .agent import _block_reason_for
+
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=item.url,
+                        final_url=fr.final_url,
+                        status=fr.status,
+                        status_code=fr.status_code,
+                        provider=item.provider,
+                        block_reason=_block_reason_for(fr),
+                        response_time_ms=fr.response_time_ms,
+                        from_cache=fr.from_cache,
+                    )
+                )
                 continue
 
             extracted = self._extractor.extract(fr)
@@ -350,6 +440,18 @@ class Recipes:
             except Exception as exc:
                 errors.append(str(exc))
                 summary_pages.append(extracted)
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=item.url,
+                        final_url=fr.final_url,
+                        status=fr.status,
+                        status_code=fr.status_code,
+                        provider=item.provider,
+                        content_length=extracted.content_length,
+                        response_time_ms=fr.response_time_ms,
+                        from_cache=fr.from_cache,
+                    )
+                )
                 citations.append(
                     Citation(
                         url=item.url,
@@ -362,6 +464,18 @@ class Recipes:
                 break
 
             summary_pages.append(extracted)
+            diagnostics.append(
+                FetchDiagnostic(
+                    url=item.url,
+                    final_url=fr.final_url,
+                    status=fr.status,
+                    status_code=fr.status_code,
+                    provider=item.provider,
+                    content_length=extracted.content_length,
+                    response_time_ms=fr.response_time_ms,
+                    from_cache=fr.from_cache,
+                )
+            )
             citations.append(
                 Citation(
                     url=item.url,
@@ -372,6 +486,10 @@ class Recipes:
                 )
             )
 
+        # Promote "no usable pages at all" from warnings to a fatal error.
+        if not summary_pages and not errors:
+            errors.append("All page fetches failed; see warnings/diagnostics for detail")
+
         elapsed = (time.perf_counter() - start) * 1000
         return ResearchResult(
             query=query,
@@ -380,6 +498,154 @@ class Recipes:
             pages_visited=budget.pages_used,
             chars_extracted=budget.chars_used,
             errors=errors,
+            warnings=warnings,
+            download_candidates=download_candidates,
+            diagnostics=diagnostics,
             correlation_id=get_correlation_id(),
             total_time_ms=elapsed,
         )
+
+    # ------------------------------------------------------------------
+    # Recipe 4: fill_form_and_extract (Phase 7 / v1.6.1)
+    # ------------------------------------------------------------------
+
+    async def fill_form_and_extract(
+        self,
+        url: str,
+        spec: FormFilterSpec,
+        session_id: Optional[str] = None,
+    ) -> ExtractionResult:
+        """Open a URL, fill a search/filter form, then extract post-submit content.
+
+        Targets dynamic calendar / regulator-filings / event-listing pages
+        where content is gated behind a search box and/or filter controls.
+        Caller supplies semantic locators in ``spec``; the recipe executes
+        the actions and returns the extracted post-submit content.
+
+        Steps:
+          1. Open ``url`` (using a persistent session when ``session_id`` is set).
+          2. If ``spec.query_selector`` and ``spec.query_value`` are both set,
+             fill the search box.
+          3. For each ``(locator, value)`` in ``spec.filters``, fill the value
+             (auto-detecting <select> vs <input> via element role).
+          4. Submit: click ``spec.submit_selector`` if set, else press Enter
+             on the query input.
+          5. Wait for ``spec.wait_for`` (or ``networkidle``) before reading.
+          6. Run :meth:`ContentExtractor.extract` on the resulting HTML.
+
+        Returns:
+            ExtractionResult. On failure (timeout, locator not found, blocked
+            domain) returns an ExtractionResult with ``extraction_method="none"``.
+        """
+        if self._bm is None:
+            raise RuntimeError(
+                "Recipes.fill_form_and_extract requires a BrowserManager; "
+                "construct Recipes via Agent (which wires it for you)."
+            )
+        if not check_domain_allowed(url, self._config.safety):
+            logger.warning("fill_form_and_extract: domain blocked: {url}", url=url)
+            return ExtractionResult(
+                url=url, extraction_method="none", correlation_id=get_correlation_id()
+            )
+
+        # Late import to avoid a circular dep through agent.py.
+        from playwright.async_api import Page
+        from playwright.async_api import TimeoutError as PlaywrightTimeout
+
+        from .browser_actions import _resolve_locator
+        from .models import FetchResult, FetchStatus
+
+        timeout_ms = spec.wait_timeout_ms
+
+        async def _drive(page: Page) -> ExtractionResult:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except PlaywrightTimeout:
+                logger.warning("fill_form_and_extract: navigation timed out for {url}", url=url)
+                return ExtractionResult(
+                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                )
+
+            # Step 2: fill query box
+            if spec.query_selector is not None and spec.query_value is not None:
+                try:
+                    loc = _resolve_locator(page, spec.query_selector)
+                    await loc.fill(spec.query_value, timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning("query fill failed: {e}", e=exc)
+                    return ExtractionResult(
+                        url=url,
+                        extraction_method="none",
+                        correlation_id=get_correlation_id(),
+                    )
+
+            # Step 3: filters (auto-detect <select> vs input)
+            for selector, value in spec.filters:
+                try:
+                    loc = _resolve_locator(page, selector)
+                    tag = (await loc.evaluate("el => el.tagName")).lower()
+                    if tag == "select":
+                        await loc.select_option(value=value, timeout=timeout_ms)
+                    else:
+                        await loc.fill(value, timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning("filter fill failed for {s}: {e}", s=selector, e=exc)
+                    return ExtractionResult(
+                        url=url,
+                        extraction_method="none",
+                        correlation_id=get_correlation_id(),
+                    )
+
+            # Step 4: submit (click button OR press Enter on query input)
+            try:
+                if spec.submit_selector is not None:
+                    submit_loc = _resolve_locator(page, spec.submit_selector)
+                    await submit_loc.click(timeout=timeout_ms)
+                elif spec.query_selector is not None:
+                    qloc = _resolve_locator(page, spec.query_selector)
+                    await qloc.press("Enter", timeout=timeout_ms)
+                # else: caller already submitted via filters or expects auto-search
+            except Exception as exc:
+                logger.warning("submit failed: {e}", e=exc)
+                return ExtractionResult(
+                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                )
+
+            # Step 5: wait for results
+            try:
+                if spec.wait_for is not None:
+                    wait_loc = _resolve_locator(page, spec.wait_for)
+                    await wait_loc.wait_for(state="visible", timeout=timeout_ms)
+                else:
+                    await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            except PlaywrightTimeout:
+                logger.warning("fill_form_and_extract: wait_for timed out")
+                return ExtractionResult(
+                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                )
+
+            # Step 6: extract
+            html = await page.content()
+            final_url = page.url
+            fr = FetchResult(
+                url=url,
+                final_url=final_url,
+                status=FetchStatus.SUCCESS,
+                html=html,
+                correlation_id=get_correlation_id(),
+            )
+            extracted = self._extractor.extract(fr)
+            extracted.correlation_id = get_correlation_id()
+            return extracted
+
+        if session_id and self._sessions is not None:
+            ctx = self._sessions.get(session_id)
+            self._sessions.touch(session_id)
+            page = await ctx.new_page()
+            try:
+                return await _drive(page)
+            finally:
+                await page.close()
+        else:
+            async with self._bm.new_page(block_resources=False) as page:
+                return await _drive(page)

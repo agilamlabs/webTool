@@ -42,6 +42,15 @@ dev = [
     "mypy>=1.10.0",
     "types-PyYAML>=6.0.0",
 ]
+# Binary extractors (PDF + XLSX). Install with: pip install "web-agent-toolkit[binary]"
+# Required when calling Agent.search_and_extract(extract_files=True) or when
+# routing PDF/XLSX URLs through the extraction pipeline. Without this extra,
+# the extractors return ExtractionResult(extraction_method="none") + a clear
+# install hint instead of crashing.
+binary = [
+    "pypdf>=4.0.0",
+    "openpyxl>=3.1.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["web_agent*"]

@@ -1,5 +1,141 @@
 # Changelog
 
+## [1.6.1] - 2026-05-07
+
+### Failure-surface hardening (7 client-suggested improvements)
+
+This release sharpens what callers see when fetches partially fail,
+expands the extraction pipeline to cover PDF/XLSX, and adds a
+declarative form-fill recipe for dynamic calendar / filings pages.
+All changes are backward-compatible: existing callers continue to
+work; new behavior is opt-in via flags or new fields that default
+to empty.
+
+#### 1. Warnings split from fatal errors
+
+`AgentResult` and `ResearchResult` previously mixed informational
+issues (blocked domains, skipped file URLs) and fatal ones
+(everything failed) in a single `errors: list[str]`. Now:
+
+- `errors`: only fatal issues. If non-empty, treat the call as failed.
+- `warnings`: non-fatal informational issues; the call still produced
+  usable output.
+
+Callers checking `if not result.errors:` for "did this succeed" will
+now correctly succeed in cases where one URL of five was blocked.
+
+#### 2. Structured download candidates
+
+When `search_and_extract` encounters PDF/XLSX/etc. URLs it used to
+emit a string error per URL ("File URL skipped..."). Now those URLs
+land in `AgentResult.download_candidates: list[SearchResultItem]` —
+fully structured (title, snippet, position, provider) so callers can
+programmatically retry via `agent.download(url)`.
+
+#### 3. Built-in PDF / XLSX extraction
+
+New optional dependency group `[binary]` (pypdf + openpyxl).
+
+- `Agent.search_and_extract(query, extract_files=True)` now routes
+  PDF/XLSX results through a binary fetch path (httpx) and extracts
+  text inline into `pages` instead of skipping them.
+- `ContentExtractor.extract` dispatches on `FetchResult.binary` and
+  `content_type` to the right branch:
+  - PDF → `pypdf.PdfReader`, with encrypted-PDF detection.
+  - XLSX → `openpyxl`, dumped TSV-style per sheet.
+- Library-missing path returns
+  `ExtractionResult(extraction_method="none")` with a clear
+  `pip install 'web-agent-toolkit[binary]'` log warning — never
+  crashes the pipeline.
+
+New `WebFetcher.fetch_binary(url, session_id=None)` wraps the binary
+GET with the same domain / robots / rate-limit gates as `fetch`, and
+re-validates `final_url` after redirects.
+
+#### 4. Caller-provided domain hints (`prefer_domains`)
+
+`Recipes._rank` and the public `Agent.search_and_open_best_result` /
+`Agent.web_research` now accept `prefer_domains: list[str]`. Any
+result whose host matches a hint (exact or as a parent suffix) gets a
++0.40 ranking bonus — large enough to dominate the well-known-domain
+heuristic. Use it when you know the regulator / vendor / source you
+expect (e.g. `["ec.europa.eu", "esma.europa.eu"]`).
+
+#### 5. Search-engine SERP URLs unwrap to queries
+
+Calling `search_and_extract("https://www.google.com/search?q=tesla+10k")`
+used to fetch the SERP HTML and try to extract content from it
+(useless and triggers anti-bot). Now SERP URLs from Google / Bing /
+DuckDuckGo / Brave / SearX / SearXNG are unwrapped to their `?q=`
+parameter and the toolkit runs its own search instead. Plain URLs
+(`https://example.com/page`) still go through the URL-as-query
+fast-path.
+
+#### 6. Per-URL fetch diagnostics
+
+New `FetchDiagnostic` model with:
+
+- `url`, `final_url`, `status`, `status_code`
+- `provider`: which search backend surfaced the URL (`searxng` /
+  `ddgs` / `playwright` / `direct` / `unknown`)
+- `block_reason`: `domain_blocked` | `robots_disallowed` |
+  `timeout` | `http_error` | `network_error` | `download_skipped` | None
+- `content_length`, `response_time_ms`, `from_cache`
+
+`AgentResult.diagnostics` and `ResearchResult.diagnostics` carry one
+entry per URL the pipeline considered, in order. Lets callers
+programmatically inspect *why* each URL succeeded or failed without
+parsing free-form error strings.
+
+`SearchResultItem.provider` (new field) is populated by every search
+provider and threaded into diagnostics.
+
+#### 7. Form-fill recipe for dynamic calendar / filings pages
+
+New `FormFilterSpec` model — declarative spec for a search/filter
+form (query selector + value, ordered filters, submit, wait_for).
+
+New `Agent.fill_form_and_extract(url, spec, *, session_id=None)`:
+
+1. Open `url`.
+2. Fill `spec.query_selector` with `spec.query_value`.
+3. Apply each `(locator, value)` in `spec.filters` (auto-detecting
+   `<select>` vs input).
+4. Click `spec.submit_selector` (or press Enter on the query input).
+5. Wait for `spec.wait_for` (or `networkidle`).
+6. Run `ContentExtractor.extract` on the post-submit HTML.
+
+Result-based: returns `ExtractionResult(extraction_method="none")`
+on timeout / locator-not-found rather than raising.
+
+### Other
+
+- `FetchResult` gained `binary: bytes | None` and `content_type: str | None`
+  fields for the binary fetch path; `html` and `binary` are mutually
+  exclusive on a given result.
+- `AGENTS.md` (new): project-level guide for AI coding agents
+  (Codex, Claude Code, Cursor, OpenClaw). Documents setup, lay-of-the-
+  land, conventions, and the "how to add a feature" loop.
+
+### Test additions
+
+- `tests/test_v161_models.py`: warnings/download_candidates/diagnostics defaults.
+- `tests/test_search_url_unwrap.py`: SERP URL detection + unwrapping.
+- `tests/test_prefer_domains.py`: ranking bonus.
+- `tests/test_binary_extraction.py`: PDF + XLSX paths, missing-library degrade.
+- `tests/test_form_recipe_spec.py`: `FormFilterSpec` validation.
+
+### Backward compatibility
+
+- `errors` field shape unchanged; only its semantics tightened (now
+  contains *only* fatal issues). Code checking `if not result.errors:`
+  may now succeed where it previously returned True with non-fatal
+  noise — this is the intended improvement.
+- All new model fields default to empty/None; old JSON dumps still
+  parse.
+- `[binary]` extra is genuinely optional. Without it, callers that
+  don't pass `extract_files=True` see no behavior change at all.
+
 ## [1.6.0] - 2026-04-30
 
 ### Production-safety hardening (the last two gaps before "ready for use")

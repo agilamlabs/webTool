@@ -33,7 +33,13 @@ from .models import FetchResult, FetchStatus
 from .rate_limiter import RateLimiter
 from .robots import RobotsChecker
 from .session_manager import SessionManager
-from .utils import NonRetryableHTTPError, Timer, async_retry, check_domain_allowed
+from .utils import (
+    NonRetryableHTTPError,
+    Timer,
+    async_retry,
+    check_domain_allowed,
+    get_random_user_agent,
+)
 
 # File extensions that trigger browser downloads instead of rendering
 _DOWNLOAD_EXTENSIONS = frozenset(
@@ -379,6 +385,115 @@ class WebFetcher:
         """
         tasks = [self.fetch(url, session_id=session_id) for url in urls]
         return list(await asyncio.gather(*tasks))
+
+    async def fetch_binary(
+        self,
+        url: str,
+        session_id: Optional[str] = None,
+    ) -> FetchResult:
+        """Fetch a binary resource (PDF/XLSX/etc.) into memory via httpx.
+
+        Used by :meth:`Agent.search_and_extract` with ``extract_files=True``
+        and by :meth:`Agent.fetch_and_extract` when the URL points to a
+        downloadable file. Skips the browser entirely (httpx is faster and
+        binary files don't need rendering). Honors the same domain /
+        robots / rate-limit gates as :meth:`fetch`.
+
+        Args:
+            url: Binary resource URL.
+            session_id: Reserved for parity with :meth:`fetch`; binary
+                fetches use httpx so the session is currently ignored.
+
+        Returns:
+            FetchResult with ``binary`` populated on success and
+            ``content_type`` set from the response header. ``html`` is
+            always None for binary fetches.
+        """
+        import httpx
+
+        cid = get_correlation_id()
+
+        if not check_domain_allowed(url, self._config.safety):
+            host = urlparse(url).hostname or ""
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status=FetchStatus.BLOCKED,
+                error_message=f"Domain not allowed by SafetyConfig: {host}",
+                correlation_id=cid,
+            )
+
+        if self._robots is not None and not await self._robots.is_allowed(url):
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status=FetchStatus.BLOCKED,
+                error_message="robots.txt disallows this URL for binary fetch",
+                correlation_id=cid,
+            )
+
+        if self._rate_limiter is not None:
+            await self._rate_limiter.acquire(urlparse(url).hostname or "")
+
+        timer = Timer()
+        try:
+            with timer:
+                async with httpx.AsyncClient(
+                    follow_redirects=True,
+                    timeout=self._config.browser.navigation_timeout / 1000,
+                    headers={"User-Agent": get_random_user_agent()},
+                ) as client:
+                    resp = await client.get(url)
+                    final_url = str(resp.url)
+                    if final_url != url and not check_domain_allowed(
+                        final_url, self._config.safety
+                    ):
+                        return FetchResult(
+                            url=url,
+                            final_url=final_url,
+                            status=FetchStatus.BLOCKED,
+                            error_message=f"Redirected to disallowed URL: {final_url}",
+                            response_time_ms=timer.elapsed_ms,
+                            correlation_id=cid,
+                        )
+                    if resp.status_code >= 400:
+                        return FetchResult(
+                            url=url,
+                            final_url=final_url,
+                            status_code=resp.status_code,
+                            status=FetchStatus.HTTP_ERROR,
+                            error_message=f"HTTP {resp.status_code}",
+                            response_time_ms=timer.elapsed_ms,
+                            correlation_id=cid,
+                        )
+                    return FetchResult(
+                        url=url,
+                        final_url=final_url,
+                        status_code=resp.status_code,
+                        status=FetchStatus.SUCCESS,
+                        binary=resp.content,
+                        content_type=resp.headers.get("content-type"),
+                        response_time_ms=timer.elapsed_ms,
+                        correlation_id=cid,
+                    )
+        except httpx.TimeoutException:
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status=FetchStatus.TIMEOUT,
+                error_message="Binary fetch timed out",
+                response_time_ms=timer.elapsed_ms,
+                correlation_id=cid,
+            )
+        except Exception as exc:
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status=FetchStatus.NETWORK_ERROR,
+                error_message=str(exc),
+                response_time_ms=timer.elapsed_ms,
+                correlation_id=cid,
+            )
 
 
 class _DownloadStartedError(Exception):

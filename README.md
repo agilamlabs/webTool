@@ -6,6 +6,15 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
+> **What's new in 1.6.1** — failure-surface hardening for agent callers:
+> warnings split from fatal errors, structured `download_candidates` for
+> skipped file URLs, per-URL `FetchDiagnostic` (status / provider / block_reason),
+> built-in PDF + XLSX extraction (`pip install web-agent-toolkit[binary]`),
+> caller-supplied `prefer_domains` ranking hints, auto-unwrap of search-engine
+> SERP URLs, and a new `fill_form_and_extract` recipe for dynamic calendar /
+> regulator-filings pages. See [CHANGELOG.md](CHANGELOG.md) and the
+> [Failure-Surface Diagnostics](#failure-surface-diagnostics) section.
+
 ## Features
 
 - **Web Search** -- Free-first provider chain: SearXNG -> DDGS -> Playwright fallback. URL-as-query short-circuits to direct fetch.
@@ -193,11 +202,14 @@ class Agent:
 **AgentResult** (from `search_and_extract`):
 
 ```python
-result.query           # str - original search query
-result.search          # SearchResponse - search results with titles, URLs, snippets
-result.pages           # list[ExtractionResult] - extracted page content
-result.errors          # list[str] - any errors encountered
-result.total_time_ms   # float - pipeline execution time
+result.query                # str - original search query
+result.search               # SearchResponse - search results with titles, URLs, snippets
+result.pages                # list[ExtractionResult] - extracted page content
+result.errors               # list[str] - FATAL issues (e.g. "all fetches failed")
+result.warnings             # list[str] - NON-FATAL (blocked domains, partial fetches)
+result.download_candidates  # list[SearchResultItem] - skipped PDF/XLSX URLs
+result.diagnostics          # list[FetchDiagnostic] - per-URL outcomes
+result.total_time_ms        # float - pipeline execution time
 ```
 
 **ExtractionResult** (from `fetch_and_extract`):
@@ -547,11 +559,14 @@ async with Agent() as agent:
 
 ## High-Level Recipes
 
-Three composite workflows AI agents can call directly without orchestrating primitives:
+Four composite workflows AI agents can call directly without orchestrating primitives:
 
 ```python
 # Recipe 1: search + rank + fetch top hit
-result = await agent.search_and_open_best_result("FastAPI tutorial 2024")
+result = await agent.search_and_open_best_result(
+    "FastAPI tutorial 2024",
+    prefer_domains=["fastapi.tiangolo.com"],   # NEW in 1.6.1
+)
 print(result.title, result.content[:500])
 
 # Recipe 2: search + locate file + download
@@ -561,15 +576,84 @@ dl = await agent.find_and_download_file(
 print(f"Saved: {dl.filepath} ({dl.size_bytes} bytes)")
 
 # Recipe 3: multi-page research with citations
-research = await agent.web_research("vector databases comparison", max_pages=5)
+research = await agent.web_research(
+    "vector databases comparison",
+    max_pages=5,
+    prefer_domains=["arxiv.org", "github.com"],   # NEW in 1.6.1
+)
 for c in research.citations:
     print(f"[{c.relevance_score:.2f}] {c.title} -- {c.url}")
+
+# Recipe 4 (NEW in 1.6.1): fill a search/filter form, then extract
+from web_agent import FormFilterSpec, LocatorSpec
+
+result = await agent.fill_form_and_extract(
+    "https://www.esma.europa.eu/document-search",
+    FormFilterSpec(
+        query_selector="input[name=keywords]",
+        query_value="MiFID II",
+        filters=[
+            ("select#year", "2024"),
+            (LocatorSpec(role="combobox", role_name="Document Type"), "Q&A"),
+        ],
+        submit_selector=LocatorSpec(role="button", role_name="Search"),
+        wait_for=".search-results",
+    ),
+)
+print(result.content[:500])
 ```
 
 `search_and_open_best_result` ranking schemes:
-- `default` -- query overlap + HTTPS bonus + well-known domain bonus + position tiebreaker
+- `default` -- query overlap + HTTPS bonus + well-known domain bonus + `prefer_domains` bonus + position tiebreaker
 - `overlap` -- pure token overlap
 - `position` -- inverse search engine rank
+
+## Failure-Surface Diagnostics
+
+When `search_and_extract` or `web_research` runs against the open
+web, individual URLs can fail for many reasons (domain blocked,
+robots disallow, timeout, HTTP 4xx, file URL skipped). v1.6.1 makes
+these failures programmatically inspectable.
+
+```python
+result = await agent.search_and_extract("Tesla 10-K 2024")
+
+# Fatal vs non-fatal split
+if result.errors:
+    raise RuntimeError(f"Search call failed: {result.errors}")
+for w in result.warnings:
+    log.info("Non-fatal: %s", w)
+
+# Structured download candidates (PDFs, XLSX, etc. that were skipped)
+for cand in result.download_candidates:
+    log.info("File URL skipped: %s (%s)", cand.url, cand.title)
+    # Programmatically retry via download:
+    # dl = await agent.download(cand.url)
+
+# Per-URL diagnostics
+for d in result.diagnostics:
+    log.info(
+        "%s -> %s [%s] block=%s len=%d cache=%s",
+        d.url, d.status, d.provider, d.block_reason,
+        d.content_length, d.from_cache,
+    )
+```
+
+Want PDF/XLSX text inline in `pages` instead of just in
+`download_candidates`?
+
+```bash
+pip install "web-agent-toolkit[binary]"   # adds pypdf + openpyxl
+```
+
+```python
+result = await agent.search_and_extract("Tesla 10-K 2024", extract_files=True)
+# PDFs now appear in result.pages with extraction_method="pdf"
+```
+
+If the `[binary]` extra is missing, the call still succeeds but PDFs
+land as `extraction_method="none"` with a clear log warning telling
+you which package to install.
 
 ## Semantic Locators
 

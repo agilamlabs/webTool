@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -84,8 +84,10 @@ from .models import (
     Citation,
     DownloadResult,
     ExtractionResult,
+    FetchDiagnostic,
     FetchResult,
     FetchStatus,
+    FormFilterSpec,
     LocatorSpec,
     ResearchResult,
     ScreenshotResult,
@@ -167,8 +169,10 @@ __all__ = [
     "Citation",
     "DownloadResult",
     "ExtractionResult",
+    "FetchDiagnostic",
     "FetchResult",
     "FetchStatus",
+    "FormFilterSpec",
     "LocatorSpec",
     "ResearchResult",
     "ScreenshotResult",
