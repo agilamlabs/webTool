@@ -61,6 +61,7 @@ from .models import (
     AgentResult,
     DownloadResult,
     ExtractionResult,
+    FormFilterSpec,
     ResearchResult,
     ScreenshotResult,
 )
@@ -114,6 +115,7 @@ async def web_search(
     query: str,
     max_results: int = 10,
     session_id: Optional[str] = None,
+    extract_files: bool = False,
 ) -> AgentResult:
     """Search the web and extract content from the top results.
 
@@ -123,15 +125,25 @@ async def web_search(
     (title, description, text, markdown).
 
     Args:
-        query: The search query string.
+        query: The search query string. May also be a search-engine SERP
+            URL (Google/Bing/DDG/Brave/SearX) -- it will be unwrapped.
         max_results: Maximum number of results to process (default 10, max ~20).
         session_id: Optional persistent browser session for the page fetches.
+        extract_files: If True, route PDF/XLSX/DOCX/CSV results through the
+            binary extractor inline instead of surfacing them in
+            ``download_candidates``. Requires the ``[binary]`` extra.
 
     Returns:
-        AgentResult with search metadata, extracted page contents, and any errors.
+        AgentResult with search metadata, extracted page contents, structured
+        warnings/errors, download_candidates, and per-URL diagnostics.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.search_and_extract(query, max_results=max_results, session_id=session_id)
+    return await agent.search_and_extract(
+        query,
+        max_results=max_results,
+        session_id=session_id,
+        extract_files=extract_files,
+    )
 
 
 @mcp.tool()
@@ -139,22 +151,30 @@ async def web_fetch(
     ctx: Context,
     url: str,
     session_id: Optional[str] = None,
+    binary_probe: bool = True,
 ) -> ExtractionResult:
     """Fetch a single URL and extract its main content.
 
-    Renders JavaScript-heavy pages in a real browser. Extracts title,
-    description, author, date, and main text using a three-tier fallback
-    (trafilatura -> BeautifulSoup4 -> raw text).
+    Smart routing (NEW in 1.6.2): URLs with known download extensions
+    (.pdf, .xlsx, .docx, .csv, ...) go through the binary extractor.
+    With ``binary_probe=True``, extensionless URLs are HEAD-probed for
+    Content-Type / Content-Disposition to detect document downloads.
+    Otherwise renders JavaScript-heavy pages in a real browser and
+    extracts via the three-tier HTML chain.
 
     Args:
         url: The URL to fetch.
         session_id: Optional persistent browser session.
+        binary_probe: When True, send a HEAD request for extensionless
+            URLs to detect binary documents served via headers.
 
     Returns:
-        ExtractionResult with title, content, metadata, and extraction method used.
+        ExtractionResult with title, content, metadata, and extraction
+        method used (``trafilatura`` | ``bs4`` | ``raw`` | ``pdf`` |
+        ``xlsx`` | ``docx`` | ``csv`` | ``none``).
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.fetch_and_extract(url, session_id=session_id)
+    return await agent.fetch_and_extract(url, session_id=session_id, binary_probe=binary_probe)
 
 
 @mcp.tool()
@@ -268,23 +288,35 @@ async def web_search_best(
     query: str,
     ranking: str = "default",
     session_id: Optional[str] = None,
+    prefer_domains: Optional[list[str]] = None,
+    domain_profile: Optional[str] = None,
 ) -> ExtractionResult:
     """Search the web, rank results, and return the extracted content of the top hit.
 
     Skips the manual "search -> pick result -> fetch" dance: ranks results by
-    query overlap + HTTPS bonus + well-known domain bonus + position tiebreaker,
-    then fetches and extracts the top URL.
+    query overlap + HTTPS bonus + well-known domain bonus + caller-supplied
+    domain hints + position tiebreaker, then fetches and extracts the top URL.
 
     Args:
         query: The search query.
         ranking: Ranking scheme (``default`` | ``overlap`` | ``position``).
         session_id: Optional persistent browser session.
+        prefer_domains: Optional caller-supplied host hints (e.g.
+            ``["ec.europa.eu"]``); matching results get a strong bonus.
+        domain_profile: Optional named ranking profile -- one of
+            ``"official_sources" | "docs" | "research" | "news" | "files"``.
 
     Returns:
         ExtractionResult of the top-ranked URL.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.search_and_open_best_result(query, ranking=ranking, session_id=session_id)
+    return await agent.search_and_open_best_result(
+        query,
+        ranking=ranking,
+        session_id=session_id,
+        prefer_domains=prefer_domains,
+        domain_profile=domain_profile,
+    )
 
 
 @mcp.tool()
@@ -318,6 +350,8 @@ async def web_research(
     max_pages: int = 5,
     depth: int = 1,
     session_id: Optional[str] = None,
+    prefer_domains: Optional[list[str]] = None,
+    domain_profile: Optional[str] = None,
 ) -> ResearchResult:
     """Multi-page research recipe: search + parallel fetch+extract top N pages, build citations.
 
@@ -330,12 +364,52 @@ async def web_research(
         max_pages: Maximum number of pages to fetch and extract.
         depth: Reserved for future expansion (only depth=1 supported in v1).
         session_id: Optional persistent browser session.
+        prefer_domains: Optional caller-supplied host hints; matching results
+            get a strong ranking bonus.
+        domain_profile: Optional named ranking profile -- one of
+            ``"official_sources" | "docs" | "research" | "news" | "files"``.
 
     Returns:
-        ResearchResult with citations, summary_pages, budget telemetry, errors.
+        ResearchResult with citations, summary_pages, budget telemetry,
+        warnings/errors (string + structured), download_candidates, and
+        per-URL diagnostics.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.web_research(query, depth=depth, max_pages=max_pages, session_id=session_id)
+    return await agent.web_research(
+        query,
+        depth=depth,
+        max_pages=max_pages,
+        session_id=session_id,
+        prefer_domains=prefer_domains,
+        domain_profile=domain_profile,
+    )
+
+
+@mcp.tool()
+async def web_fill_form_and_extract(
+    ctx: Context,
+    url: str,
+    spec: FormFilterSpec,
+    session_id: Optional[str] = None,
+) -> ExtractionResult:
+    """Open a URL, fill a search/filter form, then extract post-submit content.
+
+    Targets dynamic calendar / regulator-filings / event-listing pages where
+    content is gated behind a search box and/or filter controls. The caller
+    supplies semantic locators in ``spec`` (query input, filters, submit button,
+    wait_for); the recipe runs the actions and returns the extracted content.
+
+    Args:
+        url: The page URL hosting the form.
+        spec: Declarative FormFilterSpec describing the form interaction.
+        session_id: Optional persistent session (e.g. for authenticated dashboards).
+
+    Returns:
+        ExtractionResult of the post-submit page. ``extraction_method="none"``
+        when locators don't resolve or the form times out.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    return await agent.fill_form_and_extract(url, spec, session_id=session_id)
 
 
 # ---------------------------------------------------------------------------

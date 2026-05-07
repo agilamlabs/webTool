@@ -33,6 +33,20 @@ def _is_xlsx(fr: FetchResult) -> bool:
     return urlparse(fr.final_url or fr.url).path.lower().endswith(".xlsx")
 
 
+def _is_docx(fr: FetchResult) -> bool:
+    ct = (fr.content_type or "").lower()
+    if "wordprocessingml" in ct or "officedocument.wordprocessing" in ct:
+        return True
+    return urlparse(fr.final_url or fr.url).path.lower().endswith(".docx")
+
+
+def _is_csv(fr: FetchResult) -> bool:
+    ct = (fr.content_type or "").lower()
+    if ct.startswith(("text/csv", "text/tab-separated-values")):
+        return True
+    return urlparse(fr.final_url or fr.url).path.lower().endswith((".csv", ".tsv"))
+
+
 class ContentExtractor:
     """Extracts structured content from raw HTML using a layered fallback strategy."""
 
@@ -73,12 +87,17 @@ class ContentExtractor:
 
         url = fetch_result.final_url
 
-        # Binary branch: PDF / XLSX. Dispatched on content_type or URL extension.
+        # Binary branch: PDF / XLSX / DOCX / CSV. Dispatched on
+        # content_type or URL extension.
         if fetch_result.binary is not None:
             if _is_pdf(fetch_result):
                 return self._extract_pdf(fetch_result.binary, url)
             if _is_xlsx(fetch_result):
                 return self._extract_xlsx(fetch_result.binary, url)
+            if _is_docx(fetch_result):
+                return self._extract_docx(fetch_result.binary, url)
+            if _is_csv(fetch_result):
+                return self._extract_csv(fetch_result.binary, url)
             # Unrecognized binary -- not extractable
             return ExtractionResult(
                 url=url,
@@ -90,9 +109,7 @@ class ContentExtractor:
             if strict:
                 from .exceptions import ExtractionError
 
-                raise ExtractionError(
-                    f"FetchResult has neither html nor binary: url={url}"
-                )
+                raise ExtractionError(f"FetchResult has neither html nor binary: url={url}")
             return ExtractionResult(url=url, extraction_method="none")
 
         html = fetch_result.html
@@ -212,10 +229,7 @@ class ContentExtractor:
             for sheet in wb.worksheets:
                 rows: list[str] = [f"# Sheet: {sheet.title}"]
                 for row in sheet.iter_rows(values_only=True):
-                    cells = [
-                        "" if cell is None else str(cell)
-                        for cell in row
-                    ]
+                    cells = ["" if cell is None else str(cell) for cell in row]
                     if any(cells):
                         rows.append("\t".join(cells))
                 if len(rows) > 1:
@@ -236,6 +250,99 @@ class ContentExtractor:
             )
         except Exception as exc:
             logger.warning("XLSX extraction failed for {url}: {e}", url=url, e=exc)
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+
+    @staticmethod
+    def _extract_docx(blob: bytes, url: str) -> ExtractionResult:
+        """Extract text from DOCX bytes using python-docx (paragraph-by-paragraph)."""
+        try:
+            import docx as python_docx  # python-docx package
+        except ImportError:
+            logger.warning(
+                "python-docx not installed; DOCX extraction skipped. "
+                "Install with: pip install 'web-agent-toolkit[binary]'"
+            )
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+
+        try:
+            from io import BytesIO
+
+            doc = python_docx.Document(BytesIO(blob))
+            parts: list[str] = []
+            for para in doc.paragraphs:
+                if para.text:
+                    parts.append(para.text)
+            # Tables: dump cells row-by-row, tab-separated, with a marker.
+            for table in doc.tables:
+                parts.append("# Table")
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    if any(cells):
+                        parts.append("\t".join(cells))
+            text = "\n".join(parts).strip()
+            if not text:
+                return ExtractionResult(url=url, extraction_method="none", content=None)
+            # /Title from core properties when available
+            title: Optional[str] = None
+            try:
+                cp = doc.core_properties
+                if cp is not None and cp.title:
+                    title = str(cp.title)
+            except Exception:
+                pass
+            return ExtractionResult(
+                url=url,
+                title=title,
+                content=text,
+                extraction_method="docx",
+                content_length=len(text),
+            )
+        except Exception as exc:
+            logger.warning("DOCX extraction failed for {url}: {e}", url=url, e=exc)
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+
+    @staticmethod
+    def _extract_csv(blob: bytes, url: str) -> ExtractionResult:
+        """Extract text from CSV/TSV bytes using stdlib csv (no dep required).
+
+        Auto-detects delimiter via :class:`csv.Sniffer`. Falls back to comma
+        on detection failure. Returns the raw content as TSV-style text so
+        downstream LLM consumers see one row per line with tab separators.
+        """
+        try:
+            import csv as csv_mod
+            from io import StringIO
+
+            # Decode bytes -> text. Try utf-8 first, then latin-1 as a
+            # last-resort fallback. We never crash on encoding issues.
+            text_in: str
+            for enc in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    text_in = blob.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                return ExtractionResult(url=url, extraction_method="none", content=None)
+
+            sample = text_in[:4096]
+            try:
+                dialect = csv_mod.Sniffer().sniff(sample, delimiters=",;\t|")
+            except Exception:
+                dialect = csv_mod.excel  # default: comma-separated
+            reader = csv_mod.reader(StringIO(text_in), dialect)
+            rows = ["\t".join(row) for row in reader if any(c.strip() for c in row)]
+            text = "\n".join(rows).strip()
+            if not text:
+                return ExtractionResult(url=url, extraction_method="none", content=None)
+            return ExtractionResult(
+                url=url,
+                content=text,
+                extraction_method="csv",
+                content_length=len(text),
+            )
+        except Exception as exc:
+            logger.warning("CSV extraction failed for {url}: {e}", url=url, e=exc)
             return ExtractionResult(url=url, extraction_method="none", content=None)
 
     def _extract_trafilatura(self, html: str, url: str) -> Optional[ExtractionResult]:

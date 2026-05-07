@@ -73,6 +73,8 @@ from .models import (
     ScreenshotResult,
     SearchResultItem,
     SessionInfo,
+    ToolMessage,
+    ToolSeverity,
 )
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
@@ -100,11 +102,11 @@ def _query_is_url(query: str) -> bool:
 # our own search instead of fetching the SERP HTML (which is rarely
 # useful and triggers anti-bot measures on the SERP host).
 _SEARCH_ENGINE_HOST_PATTERNS = (
-    "google.",       # google.com, google.co.uk, etc.
+    "google.",  # google.com, google.co.uk, etc.
     "bing.com",
     "duckduckgo.com",
     "search.brave.com",
-    "searx.",        # searx.* (searx.tiekoetter.com, searx.be, etc.)
+    "searx.",  # searx.* (searx.tiekoetter.com, searx.be, etc.)
     "searxng.",
 )
 
@@ -145,6 +147,57 @@ def _block_reason_for(fr: FetchResult) -> Optional[str]:
     if fr.status == FetchStatus.SUCCESS:
         return None
     return _BLOCK_REASON_BY_STATUS.get(fr.status)
+
+
+# Mapping from message-prefix substring to (code, prefix-strip-length).
+# Used by _classify_message below to lift human-readable warnings/errors
+# into structured form without touching every append site. Order matters:
+# the first matching prefix wins.
+_MESSAGE_PREFIX_CODES: tuple[tuple[str, str], ...] = (
+    ("Domain blocked:", "domain_blocked"),
+    ("Domain denied:", "domain_blocked"),
+    ("Failed to fetch", "fetch_failed"),
+    ("Fetch raised for", "fetch_exception"),
+    ("downloadable file URL", "download_skipped"),
+    ("downloadable file URLs", "download_skipped"),
+    ("Binary extraction failed", "binary_extraction_failed"),
+    ("All page fetches failed", "all_fetches_failed"),
+    ("No search results found", "no_search_results"),
+    ("No allowed pages", "no_allowed_pages"),
+    ("Budget", "budget_exceeded"),
+)
+
+
+def _classify_message(msg: str) -> tuple[str, Optional[str]]:
+    """Best-effort lift of a free-form message into a (code, url) pair.
+
+    Returns a stable code based on prefix matching plus the first URL
+    found in the message (or None). Used to derive
+    ``structured_warnings`` / ``structured_errors`` from the existing
+    ``warnings`` / ``errors`` lists without duplicating every append.
+    """
+    code = "unknown"
+    for prefix, c in _MESSAGE_PREFIX_CODES:
+        if prefix in msg:
+            code = c
+            break
+    # Pull the first http(s) URL out of the message, if present.
+    url: Optional[str] = None
+    for token in msg.split():
+        token = token.rstrip(".,;:")
+        if token.startswith(("http://", "https://")):
+            url = token
+            break
+    return code, url
+
+
+def _to_structured(messages: list[str], severity: ToolSeverity) -> list[ToolMessage]:
+    """Lift each free-form message into a ToolMessage at the given severity."""
+    out: list[ToolMessage] = []
+    for m in messages:
+        code, url = _classify_message(m)
+        out.append(ToolMessage(code=code, message=m, url=url, severity=severity))
+    return out
 
 
 class Agent:
@@ -373,6 +426,8 @@ class Agent:
                         warnings=warnings,
                         download_candidates=download_candidates,
                         diagnostics=diagnostics,
+                        structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
+                        structured_errors=_to_structured(errors, ToolSeverity.ERROR),
                         total_time_ms=(time.perf_counter() - start) * 1000,
                         correlation_id=cid,
                     )
@@ -382,13 +437,16 @@ class Agent:
             logger.info("Search returned {n} results", n=search_response.total_results)
 
             if not search_response.results:
+                errs = ["No search results found"]
                 return AgentResult(
                     query=query,
                     search=search_response,
-                    errors=["No search results found"],
+                    errors=errs,
                     warnings=warnings,
                     download_candidates=download_candidates,
                     diagnostics=diagnostics,
+                    structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
+                    structured_errors=_to_structured(errs, ToolSeverity.ERROR),
                     total_time_ms=(time.perf_counter() - start) * 1000,
                     correlation_id=cid,
                 )
@@ -468,9 +526,7 @@ class Agent:
                 else:
                     download_candidates.extend(file_items)
                     if len(file_items) == 1:
-                        warnings.append(
-                            "1 downloadable file URL skipped; see download_candidates"
-                        )
+                        warnings.append("1 downloadable file URL skipped; see download_candidates")
                     else:
                         warnings.append(
                             f"{len(file_items)} downloadable file URLs skipped; "
@@ -577,6 +633,8 @@ class Agent:
                 warnings=warnings,
                 download_candidates=download_candidates,
                 diagnostics=diagnostics,
+                structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
+                structured_errors=_to_structured(errors, ToolSeverity.ERROR),
                 total_time_ms=elapsed,
                 correlation_id=cid,
             )
@@ -591,8 +649,17 @@ class Agent:
         *,
         session_id: Optional[str] = None,
         strict: bool = False,
+        binary_probe: bool = True,
     ) -> ExtractionResult:
         """Fetch a single URL and extract its content.
+
+        Smart routing (NEW in 1.6.2):
+          1. Known download extension (``.pdf``, ``.xlsx``, ``.docx``,
+             ``.csv``, ...) -> :meth:`WebFetcher.fetch_binary`.
+          2. ``binary_probe=True`` AND HEAD response indicates binary
+             (Content-Type or Content-Disposition: attachment) ->
+             :meth:`WebFetcher.fetch_binary`.
+          3. Otherwise -> :meth:`WebFetcher.fetch` (HTML path).
 
         Args:
             url: The URL to fetch.
@@ -600,6 +667,11 @@ class Agent:
             strict: If True, raise :class:`NavigationError` when the fetch
                 fails (HTTP error, timeout, blocked, etc.). Default False
                 (return ExtractionResult with extraction_method="none").
+            binary_probe: If True and the URL has no known download
+                extension, send a HEAD request to detect extensionless
+                PDF/XLSX/DOCX/CSV documents via Content-Type. Adds one
+                round-trip but recovers many real-world document URLs.
+                Disable to rely solely on URL extension.
 
         Raises:
             NavigationError: Only when ``strict=True`` and fetch fails.
@@ -609,7 +681,18 @@ class Agent:
         async with self._call_scope("fetch_and_extract", {"url": url}) as cid:
             self._debug.reset()
             logger.info("Fetching and extracting: {url}", url=url)
-            fr = await self._fetcher.fetch(url, session_id=session_id)
+
+            classification = "html"
+            if _is_download_url(url):
+                classification = "binary"
+            elif binary_probe and self._config.safety.probe_binary_urls:
+                classification = await self._fetcher.classify_url(url)
+
+            if classification == "binary":
+                fr = await self._fetcher.fetch_binary(url, session_id=session_id)
+            else:
+                fr = await self._fetcher.fetch(url, session_id=session_id)
+
             if strict and fr.status != FetchStatus.SUCCESS:
                 raise NavigationError(
                     f"Fetch failed: {fr.error_message}",
@@ -725,6 +808,7 @@ class Agent:
         *,
         session_id: Optional[str] = None,
         prefer_domains: Optional[list[str]] = None,
+        domain_profile: Optional[str] = None,
     ) -> ExtractionResult:
         """Recipe: search, rank results, fetch + extract the top hit.
 
@@ -732,13 +816,20 @@ class Agent:
             prefer_domains: Optional caller-supplied host hints (e.g.
                 ``["ec.europa.eu", "esma.europa.eu"]``); matching results
                 receive a strong ranking bonus.
+            domain_profile: Optional named ranking profile -- one of
+                ``"official_sources" | "docs" | "research" | "news" | "files"``.
+                Combined with ``prefer_domains`` to form the hint set.
         """
         async with self._call_scope(
             "search_and_open_best_result", {"query": query, "ranking": ranking}
         ) as cid:
             self._debug.reset()
             result = await self._recipes.search_and_open_best_result(
-                query, ranking, session_id, prefer_domains=prefer_domains
+                query,
+                ranking,
+                session_id,
+                prefer_domains=prefer_domains,
+                domain_profile=domain_profile,
             )
             result.correlation_id = cid
             return result
@@ -772,9 +863,7 @@ class Agent:
         where content is gated behind a search box and/or filter controls.
         See :class:`FormFilterSpec` for the locator/value contract.
         """
-        async with self._call_scope(
-            "fill_form_and_extract", {"url": url}
-        ) as cid:
+        async with self._call_scope("fill_form_and_extract", {"url": url}) as cid:
             self._debug.reset()
             result = await self._recipes.fill_form_and_extract(url, spec, session_id=session_id)
             result.correlation_id = cid
@@ -788,12 +877,15 @@ class Agent:
         *,
         session_id: Optional[str] = None,
         prefer_domains: Optional[list[str]] = None,
+        domain_profile: Optional[str] = None,
     ) -> ResearchResult:
         """Recipe: search + parallel fetch + extract top N pages, return citations.
 
         Args:
             prefer_domains: Optional caller-supplied host hints; matching
                 results receive a strong ranking bonus.
+            domain_profile: Optional named ranking profile -- one of
+                ``"official_sources" | "docs" | "research" | "news" | "files"``.
         """
         async with self._call_scope(
             "web_research",
@@ -801,7 +893,12 @@ class Agent:
         ) as cid:
             self._debug.reset()
             result = await self._recipes.web_research(
-                query, depth, max_pages, session_id, prefer_domains=prefer_domains
+                query,
+                depth,
+                max_pages,
+                session_id,
+                prefer_domains=prefer_domains,
+                domain_profile=domain_profile,
             )
             result.correlation_id = cid
             return result

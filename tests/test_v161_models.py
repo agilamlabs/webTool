@@ -17,7 +17,8 @@ from web_agent import (
 
 
 def test_version_bump():
-    assert __version__ == "1.6.1"
+    # v1.6.x family; bumped to 1.6.2 in the follow-up release.
+    assert __version__.startswith("1.6.")
 
 
 def test_agent_result_new_fields_default_empty():

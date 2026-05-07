@@ -50,8 +50,6 @@ def test_prefer_domain_empty_tuple_no_op():
 
 def test_prefer_domain_strip_leading_dot():
     """Hint '.example.com' should match 'example.com'."""
-    prefd = Recipes._rank(
-        "foo", _item("https://example.com/x"), prefer_domains=(".example.com",)
-    )
+    prefd = Recipes._rank("foo", _item("https://example.com/x"), prefer_domains=(".example.com",))
     base = Recipes._rank("foo", _item("https://example.com/x"))
     assert prefd > base

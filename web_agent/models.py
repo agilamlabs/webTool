@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 
 class SearchResultItem(BaseModel):
-    """A single Google search result."""
+    """A single search result from any configured provider (SearXNG / DDGS / Playwright)."""
 
     position: int = Field(description="1-based rank position in results")
     title: str = Field(description="Result title text")
@@ -128,6 +128,44 @@ class DownloadResult(BaseModel):
     debug_artifacts: list[str] = Field(default_factory=list)
 
 
+class ToolSeverity(str, Enum):
+    """Severity level for ToolWarning / ToolError."""
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    FATAL = "fatal"
+
+
+class ToolMessage(BaseModel):
+    """Structured non-fatal message from any Agent operation.
+
+    Lets agentic callers branch on a stable error code instead of
+    parsing English-language strings. Fields:
+
+    - ``code``: stable, lowercase, snake_case identifier (e.g.
+      ``"domain_blocked"``, ``"download_skipped"``, ``"binary_size_cap"``).
+    - ``message``: human-readable description.
+    - ``url``: optional URL the message is about.
+    - ``severity``: enum from :class:`ToolSeverity`.
+
+    Used as the row type for both ``structured_warnings`` (severity
+    INFO/WARNING) and ``structured_errors`` (severity ERROR/FATAL).
+    The legacy ``errors``/``warnings`` string lists are populated from
+    these via ``.message`` for backward compatibility.
+    """
+
+    code: str = Field(description="Stable, snake_case identifier")
+    message: str = Field(description="Human-readable description")
+    url: Optional[str] = Field(default=None, description="URL the message is about, if any")
+    severity: ToolSeverity = Field(default=ToolSeverity.WARNING)
+
+
+# Aliases preserved for clarity at call sites; both point to ToolMessage.
+ToolWarning = ToolMessage
+ToolError = ToolMessage
+
+
 class FetchDiagnostic(BaseModel):
     """Per-URL fetch outcome surfaced by AgentResult / ResearchResult.
 
@@ -198,6 +236,19 @@ class AgentResult(BaseModel):
     diagnostics: list[FetchDiagnostic] = Field(
         default_factory=list,
         description="Per-URL fetch outcomes (status, provider, block_reason, length).",
+    )
+    structured_warnings: list[ToolMessage] = Field(
+        default_factory=list,
+        description=(
+            "Structured form of ``warnings`` -- each entry has a stable "
+            "``code``, human ``message``, optional ``url``, and ``severity``. "
+            "Lets agentic callers branch on the code instead of parsing "
+            "the legacy string list."
+        ),
+    )
+    structured_errors: list[ToolMessage] = Field(
+        default_factory=list,
+        description="Structured form of ``errors`` -- same shape as ``structured_warnings``.",
     )
     total_time_ms: float = Field(default=0.0)
     correlation_id: Optional[str] = Field(default=None)
@@ -611,6 +662,14 @@ class ResearchResult(BaseModel):
     diagnostics: list[FetchDiagnostic] = Field(
         default_factory=list,
         description="Per-URL fetch outcomes for the URLs the recipe attempted.",
+    )
+    structured_warnings: list[ToolMessage] = Field(
+        default_factory=list,
+        description="Structured form of ``warnings`` (code/message/url/severity).",
+    )
+    structured_errors: list[ToolMessage] = Field(
+        default_factory=list,
+        description="Structured form of ``errors`` (code/message/url/severity).",
     )
     correlation_id: Optional[str] = None
     total_time_ms: float = Field(default=0.0)

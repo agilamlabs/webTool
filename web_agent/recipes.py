@@ -36,6 +36,7 @@ from .models import (
     FormFilterSpec,
     ResearchResult,
     SearchResultItem,
+    ToolSeverity,
 )
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
@@ -55,6 +56,106 @@ _WELL_KNOWN_DOMAINS = (
     "edu",
     "gov",
 )
+
+
+# Reusable named ranking profiles. Each profile is a tuple of host hints
+# that get merged with caller-supplied ``prefer_domains`` and applied as
+# a +0.40 ranking bonus. Designed so callers don't have to hard-code
+# host lists for common research scenarios.
+RANKING_PROFILES: dict[str, tuple[str, ...]] = {
+    "official_sources": (
+        "ec.europa.eu",
+        "esma.europa.eu",
+        "eba.europa.eu",
+        "sec.gov",
+        "treasury.gov",
+        "federalreserve.gov",
+        "bis.org",
+        "imf.org",
+        "worldbank.org",
+        "oecd.org",
+        "un.org",
+        "europa.eu",
+        "gov",
+        "gov.uk",
+        "gov.in",
+    ),
+    "docs": (
+        "docs.python.org",
+        "developer.mozilla.org",
+        "tldp.org",
+        "readthedocs.io",
+        "readthedocs.org",
+        "pkg.go.dev",
+        "rust-lang.org",
+        "kubernetes.io",
+        "docs.aws.amazon.com",
+        "cloud.google.com",
+        "learn.microsoft.com",
+    ),
+    "research": (
+        "arxiv.org",
+        "ssrn.com",
+        "ncbi.nlm.nih.gov",
+        "pubmed.ncbi.nlm.nih.gov",
+        "nature.com",
+        "science.org",
+        "acm.org",
+        "ieee.org",
+        "researchgate.net",
+        "papers.ssrn.com",
+        "openreview.net",
+    ),
+    "news": (
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "ft.com",
+        "wsj.com",
+        "bloomberg.com",
+        "nytimes.com",
+        "economist.com",
+        "axios.com",
+        "theguardian.com",
+    ),
+    "files": (  # commonly hosts canonical PDFs / datasets
+        "sec.gov",
+        "ec.europa.eu",
+        "esma.europa.eu",
+        "data.gov",
+        "data.gov.uk",
+        "github.com",
+        "githubusercontent.com",
+        "huggingface.co",
+        "kaggle.com",
+        "zenodo.org",
+        "figshare.com",
+    ),
+}
+
+
+def _resolve_domain_hints(
+    prefer_domains: Optional[list[str]],
+    domain_profile: Optional[str],
+) -> tuple[str, ...]:
+    """Combine an optional named profile with caller-supplied domain hints.
+
+    Profile domains come first (so the caller's explicit domains can also
+    benefit from rare-domain weighting if any). Unknown profile names are
+    silently ignored after a debug log.
+    """
+    profile_hints: tuple[str, ...] = ()
+    if domain_profile:
+        if domain_profile in RANKING_PROFILES:
+            profile_hints = RANKING_PROFILES[domain_profile]
+        else:
+            logger.debug(
+                "Unknown ranking profile {p!r}; ignoring",
+                p=domain_profile,
+            )
+    user_hints = tuple(prefer_domains or ())
+    return profile_hints + user_hints
 
 
 class Recipes:
@@ -169,6 +270,7 @@ class Recipes:
         ranking: str = "default",
         session_id: Optional[str] = None,
         prefer_domains: Optional[list[str]] = None,
+        domain_profile: Optional[str] = None,
     ) -> ExtractionResult:
         """Search for ``query``, rank results, fetch+extract the top hit.
 
@@ -179,6 +281,9 @@ class Recipes:
             prefer_domains: Optional caller-supplied host hints (e.g.
                 ``["ec.europa.eu", "esma.europa.eu"]``). Results from
                 these hosts get a strong ranking bonus.
+            domain_profile: Optional named ranking profile that contributes
+                a curated host list on top of ``prefer_domains``. Available:
+                ``"official_sources" | "docs" | "research" | "news" | "files"``.
 
         Returns:
             ExtractionResult for the top-ranked URL. If all URLs are blocked
@@ -199,7 +304,7 @@ class Recipes:
                 correlation_id=get_correlation_id(),
             )
 
-        prefs = tuple(prefer_domains or ())
+        prefs = _resolve_domain_hints(prefer_domains, domain_profile)
         ranked = sorted(
             allowed,
             key=lambda r: self._rank(query, r, ranking, prefer_domains=prefs),
@@ -308,6 +413,7 @@ class Recipes:
         max_pages: int = 5,
         session_id: Optional[str] = None,
         prefer_domains: Optional[list[str]] = None,
+        domain_profile: Optional[str] = None,
     ) -> ResearchResult:
         """Search and extract content from the top N pages, returning structured citations.
 
@@ -318,6 +424,8 @@ class Recipes:
             session_id: Optional persistent browser session.
             prefer_domains: Optional caller-supplied host hints; matching
                 results get a strong ranking bonus.
+            domain_profile: Optional named ranking profile -- one of
+                ``"official_sources" | "docs" | "research" | "news" | "files"``.
 
         Returns:
             ResearchResult with citations, summary pages, budget telemetry,
@@ -369,17 +477,22 @@ class Recipes:
             allowed.append(r)
 
         if not allowed:
+            from .agent import _to_structured
+
+            errs = ["No allowed pages in search results"]
             return ResearchResult(
                 query=query,
-                errors=["No allowed pages in search results"],
+                errors=errs,
                 warnings=warnings,
                 download_candidates=download_candidates,
                 diagnostics=diagnostics,
+                structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
+                structured_errors=_to_structured(errs, ToolSeverity.ERROR),
                 correlation_id=get_correlation_id(),
                 total_time_ms=(time.perf_counter() - start) * 1000,
             )
 
-        prefs = tuple(prefer_domains or ())
+        prefs = _resolve_domain_hints(prefer_domains, domain_profile)
         # Cache scores so we don't re-tokenize per item during sort + citation build
         scores: dict[str, float] = {
             r.url: self._rank(query, r, prefer_domains=prefs) for r in allowed
@@ -490,6 +603,8 @@ class Recipes:
         if not summary_pages and not errors:
             errors.append("All page fetches failed; see warnings/diagnostics for detail")
 
+        from .agent import _to_structured
+
         elapsed = (time.perf_counter() - start) * 1000
         return ResearchResult(
             query=query,
@@ -501,6 +616,8 @@ class Recipes:
             warnings=warnings,
             download_candidates=download_candidates,
             diagnostics=diagnostics,
+            structured_warnings=_to_structured(warnings, ToolSeverity.WARNING),
+            structured_errors=_to_structured(errors, ToolSeverity.ERROR),
             correlation_id=get_correlation_id(),
             total_time_ms=elapsed,
         )

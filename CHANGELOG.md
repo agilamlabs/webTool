@@ -1,5 +1,128 @@
 # Changelog
 
+## [1.6.2] - 2026-05-07
+
+### Follow-up to v1.6.1: 12-issue review pass
+
+This release lands the full client review of v1.6.1 (12 issues across
+routing, extraction, MCP surface, ranking, and observability).
+Backward-compatible -- existing callers keep working unchanged.
+
+#### Smart binary routing in `fetch_and_extract` (#1, #2, #10)
+
+`Agent.fetch_and_extract(url)` now routes PDF/XLSX/DOCX/CSV URLs
+through the binary extractor automatically:
+
+1. URL extension matches a known download type → ``fetch_binary``.
+2. Otherwise, with the new ``binary_probe`` flag (default True), send
+   a HEAD request and inspect ``Content-Type`` / ``Content-Disposition``
+   to detect *extensionless* document URLs (regulator dashboards
+   often serve `/download?id=42` with `Content-Type: application/pdf`).
+3. Otherwise → normal HTML fetch through the browser.
+
+New `WebFetcher.classify_url(url) -> 'binary' | 'html' | 'unknown'`
+exposed as the underlying primitive. Toggle the probe globally via
+`SafetyConfig.probe_binary_urls = False`.
+
+#### Streaming binary fetches with size cap (#3)
+
+`fetch_binary` now uses `httpx.Client.stream("GET", ...)` and accumulates
+chunks while enforcing `DownloadConfig.max_file_size_mb`. Aborts and
+returns `HTTP_ERROR` with a clear message when the cap is hit, instead
+of letting a rogue large response exhaust memory.
+
+#### Browser session cookies reused for `fetch_binary` (#4)
+
+When the caller threads `session_id=...` into `fetch_binary`,
+authentication cookies set in the Playwright `BrowserContext`
+(typically by an earlier `agent.interact(login_url, ...)` call) are
+copied into the httpx request. Authenticated regulator dashboards now
+work end-to-end without manual cookie handling.
+
+#### MCP tool surface (#5)
+
+- `web_search` exposes `extract_files`.
+- `web_search_best` and `web_research` expose `prefer_domains` and
+  `domain_profile`.
+- `web_fetch` exposes `binary_probe`.
+- New tool: `web_fill_form_and_extract` -- the v1.6.1 form-fill recipe
+  is now reachable from MCP clients.
+
+#### Ranking profiles (#8)
+
+New `RANKING_PROFILES` dict (publicly importable) with five curated
+profiles:
+
+- `official_sources` -- regulators, central banks, multilaterals
+- `docs` -- canonical software documentation hosts
+- `research` -- arxiv, PubMed, ACM, IEEE, etc.
+- `news` -- wire services + leading mastheads
+- `files` -- common canonical-PDF / dataset hosts
+
+New parameter `domain_profile: str | None` on
+`Agent.search_and_open_best_result` and `Agent.web_research`. Combines
+with caller-supplied `prefer_domains`; unknown profiles are silently
+ignored.
+
+#### Structured `ToolError` / `ToolWarning` (#12)
+
+New `ToolMessage` model with `code` (snake_case identifier),
+`message`, optional `url`, and `severity` (enum: INFO/WARNING/ERROR/FATAL).
+`ToolWarning` and `ToolError` are aliases for `ToolMessage`.
+
+Two new fields on `AgentResult` and `ResearchResult`:
+
+- `structured_warnings: list[ToolMessage]` -- machine-readable
+  counterpart to `warnings: list[str]`.
+- `structured_errors: list[ToolMessage]` -- counterpart to `errors`.
+
+The legacy string lists are still populated -- callers can adopt
+structured forms incrementally. v1.7.0 will deprecate the strings.
+
+#### CSV + DOCX extraction (#11)
+
+`ContentExtractor` now dispatches to two more binary branches:
+
+- CSV/TSV -> stdlib `csv` (no extra dependency). Auto-detects
+  delimiter, falls back to UTF-8 BOM / latin-1.
+- DOCX -> `python-docx` (added to the `[binary]` extra). Walks
+  paragraphs and tables.
+
+XLS (legacy) and PPTX deferred -- xlrd has CVEs, PPTX is a niche use.
+
+#### Defaults + housekeeping (#6, #7, #9)
+
+- CI matrix: added Python 3.13 alongside 3.10 and 3.12.
+- `FetchConfig.wait_until` default flipped from `"networkidle"` to
+  `"domcontentloaded"` -- robust against pages with analytics /
+  long-polling that prevent networkidle from ever firing. The
+  existing per-URL fallback to `"load"` remains for callers who
+  override the default.
+- `SearchResultItem` docstring updated: "A single Google search result"
+  → "A single search result from any configured provider."
+
+### Test additions
+
+- `tests/test_v162_routing.py`: 13 tests for header-based binary
+  detection, smart routing, streaming size cap, cookie sharing.
+- `tests/test_v162_extraction.py`: ~10 tests for CSV (multiple
+  delimiters, BOM, latin-1, empty) and DOCX (synthesized fixture +
+  missing-library degrade).
+- `tests/test_v162_models_and_profiles.py`: 14 tests for ranking
+  profiles, structured ToolMessage round-trip, message classification.
+
+Total: ~37 new tests, full unit suite 295/295 passing.
+
+### Backward compatibility
+
+- `errors`/`warnings` stay as `list[str]`. New `structured_errors`/
+  `structured_warnings` are additive.
+- Old JSON dumps still parse against the v1.6.2 model.
+- `[binary]` stays optional -- without it, CSV still works (stdlib);
+  DOCX/PDF/XLSX degrade with a clear install hint.
+- `wait_until` default change is documented; callers that depended on
+  `networkidle` can pin it via `AppConfig(fetch={"wait_until": "networkidle"})`.
+
 ## [1.6.1] - 2026-05-07
 
 ### Failure-surface hardening (7 client-suggested improvements)

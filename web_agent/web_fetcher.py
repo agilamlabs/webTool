@@ -80,6 +80,43 @@ def _is_download_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DOWNLOAD_EXTENSIONS)
 
 
+# Content-Type prefixes / fragments that mean "this is a binary document".
+# trafilatura/bs4 cannot do anything useful with these — they belong to
+# the binary extraction branch (PDF/XLSX/DOCX/CSV).
+_BINARY_CONTENT_TYPE_HINTS = (
+    "application/pdf",
+    "application/vnd.ms-excel",  # legacy XLS (detected, not extracted yet)
+    "application/vnd.openxmlformats-officedocument.spreadsheetml",  # XLSX
+    "application/vnd.openxmlformats-officedocument.wordprocessingml",  # DOCX
+    "application/vnd.openxmlformats-officedocument.presentationml",  # PPTX
+    "application/msword",
+    "application/vnd.ms-powerpoint",
+    "application/zip",
+    "application/x-zip",
+    "application/octet-stream",
+    "application/x-bzip",
+    "application/x-rar",
+    "application/x-7z-compressed",
+    "text/csv",
+    "text/tab-separated-values",
+)
+
+
+def _content_type_is_binary(content_type: str | None) -> bool:
+    """True if a Content-Type header value indicates a binary document."""
+    if not content_type:
+        return False
+    ct = content_type.lower().split(";", 1)[0].strip()
+    return any(ct.startswith(hint) for hint in _BINARY_CONTENT_TYPE_HINTS)
+
+
+def _disposition_is_attachment(disposition: str | None) -> bool:
+    """True if a Content-Disposition header is an attachment."""
+    if not disposition:
+        return False
+    return "attachment" in disposition.lower()
+
+
 class WebFetcher:
     """Fetches web pages using Playwright with retry, safety, and debug support.
 
@@ -386,28 +423,105 @@ class WebFetcher:
         tasks = [self.fetch(url, session_id=session_id) for url in urls]
         return list(await asyncio.gather(*tasks))
 
+    async def classify_url(self, url: str) -> str:
+        """Return ``'binary' | 'html' | 'unknown'`` for a URL.
+
+        Cheap classification used by :meth:`Agent.fetch_and_extract` to
+        decide whether to route to :meth:`fetch_binary` or :meth:`fetch`.
+
+        Resolution order:
+          1. URL extension matches a known download extension -> ``'binary'``
+          2. Content-Type/Content-Disposition probe via HEAD (skipped when
+             :attr:`SafetyConfig.probe_binary_urls` is False)
+          3. ``'unknown'`` otherwise (caller should default to HTML).
+        """
+        if _is_download_url(url):
+            return "binary"
+        if not self._config.safety.probe_binary_urls:
+            return "unknown"
+
+        # HEAD probe with redirects + UA + cookies (when session present).
+        # We deliberately swallow all errors -- a failing HEAD must NEVER
+        # block the subsequent fetch, only inform routing.
+        try:
+            import httpx
+
+            cookie_jar = await self._cookies_for_session(None)
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=10.0,
+                headers={"User-Agent": get_random_user_agent()},
+                cookies=cookie_jar,
+            ) as client:
+                resp = await client.head(url)
+                ct = resp.headers.get("content-type")
+                disp = resp.headers.get("content-disposition")
+                if _content_type_is_binary(ct) or _disposition_is_attachment(disp):
+                    return "binary"
+                if ct and ct.lower().startswith(("text/html", "application/xhtml")):
+                    return "html"
+                return "unknown"
+        except Exception as exc:
+            logger.debug("HEAD probe failed for {url}: {e}", url=url, e=exc)
+            return "unknown"
+
+    async def _cookies_for_session(self, session_id: Optional[str]) -> dict[str, str]:
+        """Extract Playwright BrowserContext cookies as an httpx-friendly dict.
+
+        When the caller threads a session_id through, we want authenticated
+        downloads (regulator dashboards, intranet docs) to inherit the
+        login state established earlier via ``Agent.interact``. This pulls
+        all cookies from the persistent context and returns them in a form
+        ``httpx.AsyncClient(cookies=...)`` accepts.
+
+        Returns an empty dict when the session is None / unknown / cookie
+        retrieval fails -- never raises.
+        """
+        if not session_id or self._sessions is None:
+            return {}
+        try:
+            ctx = self._sessions.get(session_id)
+        except Exception:
+            return {}
+        try:
+            cookies = await ctx.cookies()
+        except Exception as exc:
+            logger.debug("Failed to read session cookies: {e}", e=exc)
+            return {}
+        return {c["name"]: c["value"] for c in cookies if "name" in c and "value" in c}
+
     async def fetch_binary(
         self,
         url: str,
         session_id: Optional[str] = None,
     ) -> FetchResult:
-        """Fetch a binary resource (PDF/XLSX/etc.) into memory via httpx.
+        """Fetch a binary resource (PDF/XLSX/CSV/DOCX/etc.) into memory via httpx.
 
         Used by :meth:`Agent.search_and_extract` with ``extract_files=True``
         and by :meth:`Agent.fetch_and_extract` when the URL points to a
         downloadable file. Skips the browser entirely (httpx is faster and
         binary files don't need rendering). Honors the same domain /
-        robots / rate-limit gates as :meth:`fetch`.
+        robots / rate-limit / size-cap / cookie gates as
+        :meth:`fetch`.
+
+        Streams the response in chunks and aborts when the accumulated
+        size exceeds ``DownloadConfig.max_file_size_mb`` -- prevents a
+        rogue large file from exhausting memory.
+
+        When ``session_id`` is supplied and the SessionManager has that
+        session, cookies are copied from the Playwright context into the
+        httpx request so authenticated downloads succeed.
 
         Args:
             url: Binary resource URL.
-            session_id: Reserved for parity with :meth:`fetch`; binary
-                fetches use httpx so the session is currently ignored.
+            session_id: Optional persistent session whose cookies should
+                be applied to the httpx request.
 
         Returns:
             FetchResult with ``binary`` populated on success and
             ``content_type`` set from the response header. ``html`` is
-            always None for binary fetches.
+            always None for binary fetches. Returns HTTP_ERROR with a
+            clear message when the size cap is exceeded.
         """
         import httpx
 
@@ -435,6 +549,9 @@ class WebFetcher:
         if self._rate_limiter is not None:
             await self._rate_limiter.acquire(urlparse(url).hostname or "")
 
+        max_bytes = max(1, self._config.download.max_file_size_mb) * 1024 * 1024
+        cookie_jar = await self._cookies_for_session(session_id)
+
         timer = Timer()
         try:
             with timer:
@@ -442,40 +559,63 @@ class WebFetcher:
                     follow_redirects=True,
                     timeout=self._config.browser.navigation_timeout / 1000,
                     headers={"User-Agent": get_random_user_agent()},
+                    cookies=cookie_jar,
                 ) as client:
-                    resp = await client.get(url)
-                    final_url = str(resp.url)
-                    if final_url != url and not check_domain_allowed(
-                        final_url, self._config.safety
-                    ):
-                        return FetchResult(
-                            url=url,
-                            final_url=final_url,
-                            status=FetchStatus.BLOCKED,
-                            error_message=f"Redirected to disallowed URL: {final_url}",
-                            response_time_ms=timer.elapsed_ms,
-                            correlation_id=cid,
-                        )
-                    if resp.status_code >= 400:
+                    async with client.stream("GET", url) as resp:
+                        final_url = str(resp.url)
+                        if final_url != url and not check_domain_allowed(
+                            final_url, self._config.safety
+                        ):
+                            return FetchResult(
+                                url=url,
+                                final_url=final_url,
+                                status=FetchStatus.BLOCKED,
+                                error_message=f"Redirected to disallowed URL: {final_url}",
+                                response_time_ms=timer.elapsed_ms,
+                                correlation_id=cid,
+                            )
+                        if resp.status_code >= 400:
+                            return FetchResult(
+                                url=url,
+                                final_url=final_url,
+                                status_code=resp.status_code,
+                                status=FetchStatus.HTTP_ERROR,
+                                error_message=f"HTTP {resp.status_code}",
+                                response_time_ms=timer.elapsed_ms,
+                                correlation_id=cid,
+                            )
+                        # Stream chunks with running cap. We can't trust
+                        # Content-Length (some servers omit / lie); enforce
+                        # the cap by accumulator instead.
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in resp.aiter_bytes(chunk_size=8192):
+                            total += len(chunk)
+                            if total > max_bytes:
+                                return FetchResult(
+                                    url=url,
+                                    final_url=final_url,
+                                    status_code=resp.status_code,
+                                    status=FetchStatus.HTTP_ERROR,
+                                    error_message=(
+                                        f"Binary exceeded "
+                                        f"{self._config.download.max_file_size_mb} MB cap "
+                                        f"(stopped at {total} bytes)"
+                                    ),
+                                    response_time_ms=timer.elapsed_ms,
+                                    correlation_id=cid,
+                                )
+                            chunks.append(chunk)
                         return FetchResult(
                             url=url,
                             final_url=final_url,
                             status_code=resp.status_code,
-                            status=FetchStatus.HTTP_ERROR,
-                            error_message=f"HTTP {resp.status_code}",
+                            status=FetchStatus.SUCCESS,
+                            binary=b"".join(chunks),
+                            content_type=resp.headers.get("content-type"),
                             response_time_ms=timer.elapsed_ms,
                             correlation_id=cid,
                         )
-                    return FetchResult(
-                        url=url,
-                        final_url=final_url,
-                        status_code=resp.status_code,
-                        status=FetchStatus.SUCCESS,
-                        binary=resp.content,
-                        content_type=resp.headers.get("content-type"),
-                        response_time_ms=timer.elapsed_ms,
-                        correlation_id=cid,
-                    )
         except httpx.TimeoutException:
             return FetchResult(
                 url=url,
