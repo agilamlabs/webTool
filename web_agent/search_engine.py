@@ -21,7 +21,6 @@ e.g. ``providers=["playwright"]`` to use only browser-based search.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
@@ -116,12 +115,12 @@ class SearchEngine:
             cached = await self._cache.get(cache_key)
             if cached is not None:
                 logger.debug("Cache hit for search: {q}", q=query)
+                # Mark from_cache so callers know the result was reused.
+                # We deliberately preserve the original ``searched_at``
+                # so callers doing time-diff math see an honest
+                # timestamp; ``from_cache=True`` is the source of truth
+                # for staleness, not the timestamp.
                 cached["from_cache"] = True
-                # Reset searched_at to "now" so callers can't be misled
-                # into thinking the data is fresh when it's actually
-                # an hours-old cache hit. Pair this with from_cache=True
-                # for full transparency.
-                cached["searched_at"] = datetime.now(timezone.utc).isoformat()
                 return SearchResponse(**cached)
 
         last_response = SearchResponse(query=query)

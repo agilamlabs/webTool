@@ -83,41 +83,9 @@ async def test_search_and_extract_no_unknown_codes_for_normal_path():
     """When the pipeline runs through normal failure/skip paths, every
     structured message has a real code -- no 'unknown' leakage from the
     deprecated prefix classifier."""
-    agent = Agent(AppConfig())
-    agent._search.search = AsyncMock(
-        return_value=SearchResponse(
-            query="x",
-            total_results=2,
-            results=[
-                SearchResultItem(
-                    position=1,
-                    title="A",
-                    url="https://blocked.example.com/x",
-                    provider="searxng",
-                ),
-                SearchResultItem(
-                    position=2,
-                    title="B",
-                    url="https://x.com/page.html",
-                    provider="searxng",
-                ),
-            ],
-        )
-    )
-    agent._fetcher.classify_url = AsyncMock(return_value="html")
-    agent._fetcher.fetch_many = AsyncMock(
-        return_value=[
-            FetchResult(
-                url="https://x.com/page.html",
-                final_url="https://x.com/page.html",
-                status=FetchStatus.HTTP_ERROR,
-                status_code=404,
-                error_message="HTTP 404",
-            )
-        ]
-    )
-
-    # Block the first URL via SafetyConfig
+    # Block the first URL via SafetyConfig so it surfaces as a
+    # 'domain_blocked' warning; the second URL hits a 404 to surface a
+    # 'fetch_failed' warning. Both must carry real codes (no 'unknown').
     config = AppConfig(safety={"denied_domains": ["blocked.example.com"]})
     agent = Agent(config)
     agent._search.search = AsyncMock(

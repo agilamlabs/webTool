@@ -1,5 +1,150 @@
 # Changelog
 
+## [1.6.5] - 2026-05-11
+
+### Self-review pass (16 findings: SSRF + cookie isolation + polish)
+
+A focused fix-up release driven by an internal full-project review of
+v1.6.4. Three classes of issue:
+
+1. **SSRF / cookie-isolation gaps** that the v1.6.4 review missed --
+   the post-redirect re-check existed in some code paths but not all,
+   and httpx-based session paths leaked cookies across hosts.
+2. **Documented-but-broken behaviors** -- the README's nested env-var
+   pattern silently did not work; the `searched_at` timestamp was
+   rewritten on cache hits.
+3. **Long-tail polish** -- dead code, extension-list drift, fragile
+   attribute-stuffing on Playwright objects, missing MCP config path,
+   missing pattern normalization on deny/allow lists.
+
+All 16 issues land with regression tests; the test count grew from
+~376 to **409**. Backward-compatible -- the public Agent API is
+unchanged; the only "breaking" change is that
+`WebFetcher._cookies_for_session` now takes a `target_url` and returns
+`httpx.Cookies` instead of `dict[str, str]`. That helper is private
+(underscored) and re-exporting was never claimed.
+
+#### Critical (security)
+
+- **Cross-domain cookie leak in `WebFetcher._cookies_for_session`
+  closed.** The helper previously returned a flat `{name: value}` dict
+  that httpx would send to every host. With a session logged into
+  `bank.com`, calling
+  `agent.fetch_binary("https://attacker.com/", session_id=sid)`
+  leaked bank auth cookies to the attacker host. The helper now
+  filters by Playwright cookie domain (exact or subdomain match
+  against the target URL's host) and returns an `httpx.Cookies` jar so
+  httpx applies its own cookie-domain rules as a second layer of
+  defense. Affects `classify_url` and `fetch_binary` (the two
+  httpx-based session paths). The Playwright-driven `fetch` path was
+  never affected -- BrowserContext applies cookie-domain rules
+  natively.
+- **`classify_url` pre-gates the URL.** Adds
+  `check_domain_allowed(url, ...)` at the entry of the HEAD-probe
+  branch. Before: a denied-domain or private-IP URL would still fire
+  a HEAD request even though the policy rejects it. After: returns
+  `"unknown"` immediately, no network I/O. Mirrors the same defense
+  v1.6.4 added on the redirect side.
+- **Playwright download paths re-validate post-redirect URLs.**
+  `_do_save_page` now checks `page.url` after `page.goto(...)`;
+  `_download_with_playwright` checks `download.url` (the actual
+  download origin, post-redirect) before any `save_as` call. Closes
+  the SSRF gap that v1.6.4's `_download_httpx` had already addressed
+  -- now consistent across all three download strategies.
+
+#### High
+
+- **`env_nested_delimiter="__"` added to `AppConfig.model_config`.**
+  Without it, pydantic-settings v2 silently ignored
+  `WEB_AGENT_BROWSER__HEADLESS=false` and similar nested env vars.
+  README's claim that this works is now backed by code.
+- **Cached DNS resolution.** `_resolve_host_addresses` is a 2048-entry
+  LRU cache around `socket.getaddrinfo`. The default-on private-IP
+  gate (introduced in v1.6.x) called `getaddrinfo` synchronously per
+  outbound URL; with `fetch_many(urls=10)` that's 10x event-loop
+  blocking on cold DNS. Now the cache pays once per host per process.
+
+#### Medium
+
+- **Cache hit no longer rewrites `searched_at`.** v1.6.x previously
+  overwrote the cached timestamp with `datetime.now()` on every cache
+  hit, which meant callers doing time-diff math on the field saw
+  stale data labeled fresh. Reverted: the original timestamp is
+  preserved; `from_cache=True` is the only correct staleness signal.
+- **`async_retry` validates `max_retries >= 1`.** Setting
+  `FetchConfig(max_retries=0)` previously caused `async_retry` to
+  raise `TypeError("exceptions must derive from BaseException")` at
+  call time (because the for-loop body never ran and
+  `last_exception` was None). Now raises `ValueError` at decorator
+  construction with a clear message.
+- **`find_and_download_file` recovers extensionless binary URLs.**
+  When no extension-matched candidate exists, the recipe now
+  HEAD-probes extensionless results via `classify_url` and treats
+  any with `"binary"` classification as download candidates. Catches
+  regulator-archive URLs like `sec.gov/Archives/12345` whose path
+  has no extension but whose Content-Type is `application/pdf`.
+  Gated by `SafetyConfig.probe_binary_urls` (default True).
+- **`_unwrap_search_url` caps unwrapped query at 1024 chars.** A
+  hostile SERP URL with a giant `?q=` payload would otherwise
+  propagate through the search + cache + diagnostic pipeline.
+- **Dead `_classify_message` / `_to_structured` /
+  `_MESSAGE_PREFIX_CODES` removed.** v1.6.3 introduced `_MessageBag`
+  to record codes at the source; the prefix-string fallback has had
+  zero internal callers ever since. ~60 lines of dead code gone.
+
+#### Low / polish
+
+- **`take_screenshot` honors `FetchConfig.wait_until`.** Previously
+  hardcoded `networkidle`, which is exactly the wait state most
+  likely to hang on analytics-polling pages -- and v1.6.2 already
+  switched the fetch default away from it. Screenshots now use the
+  same configured wait state, so a user tuning for slow renders
+  gets consistent behavior across `fetch` and `screenshot`.
+- **Shared `_OFFICE_AND_ARCHIVE_EXTENSIONS`.** `web_fetcher` now
+  exports a 14-extension shared set used by both `web_fetcher`'s
+  `_DOWNLOAD_EXTENSIONS` and `downloader`'s `_BINARY_EXTENSIONS`.
+  Each module's set is a documented superset of the shared core.
+  Prevents the kind of drift that left `.iso/.deb/.rpm` in the
+  fetcher set but not the downloader set.
+- **`WeakKeyDictionary` for per-Page dialog state.** Replaces the
+  v1.6.4 hack of attribute-stuffing
+  `page._web_agent_dialog_state` onto Playwright Page objects.
+  Module-level `_PAGE_DIALOG_STATES` keyed weakly so closing a page
+  reclaims the entry automatically; future `__slots__`-using
+  Playwright versions won't break.
+- **`SafetyConfig` auto-normalizes deny/allow patterns.**
+  `field_validator` strips `https://`, lowercases, drops trailing
+  paths/queries/fragments, and removes leading dots. So
+  `denied_domains=["https://Evil.com/"]` now actually blocks
+  `evil.com` (previously: silently never matched anything).
+- **MCP server honors `WEB_AGENT_CONFIG` env var.** New
+  `_load_mcp_config()` helper resolves an optional YAML path before
+  falling back to `AppConfig()` (which now picks up nested
+  `WEB_AGENT_*__*` env vars per the H4 fix). Operators deploying
+  via Claude Desktop / Cursor can now set `safe_mode=True` or a
+  domain allowlist without code changes.
+- **Test dedup.** `test_v163_messagebag_profiles.py` had ~30 lines
+  of duplicated setup; cleaned up.
+
+#### Tests
+
+- New: `tests/test_v165_security.py` (16 cases for cookie isolation,
+  classify_url pre-gate, Playwright redirect re-checks).
+- New: `tests/test_v165_high_severity.py` (10 cases for
+  env_nested_delimiter + DNS caching).
+- New: `tests/test_v165_medium.py` (12 cases for cache freshness,
+  retry validation, find_and_download recovery, unwrap-query cap,
+  dead-code removal regression guard).
+- New: `tests/test_v165_low_polish.py` (14 cases for screenshot
+  wait_until, shared extensions, MCP config, weak dialog state,
+  domain pattern normalization).
+- Updated: `tests/test_v162_routing.py`, `tests/test_v163_routing.py`
+  for the `_cookies_for_session` signature change. Removed obsolete
+  `_classify_message` / `_to_structured` tests from
+  `test_v162_models_and_profiles.py`.
+
+Total test count: ~376 -> **409**.
+
 ## [1.6.4] - 2026-05-07
 
 ### External-review pass (cross-platform path fix, mypy fix, download cap, redirect SSRF)

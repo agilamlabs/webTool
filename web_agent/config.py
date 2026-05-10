@@ -20,11 +20,42 @@ Supports three configuration methods (in priority order):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+
+def _normalize_domain_patterns(value: Any) -> Any:
+    """Normalize a list of domain allow/deny patterns at config-load time.
+
+    Accepts user-supplied strings like ``"https://Evil.com/"`` and
+    coerces them to bare hostnames (``"evil.com"``) before the pattern
+    is consulted by ``check_domain_allowed``. Without this, malformed
+    entries would silently never match anything (the previous v1.6.4
+    behavior). Non-list values pass through unchanged so pydantic's
+    own type validation can fire.
+    """
+    if not isinstance(value, list):
+        return value
+    out: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str):
+            # Let pydantic surface the type error naturally.
+            out.append(raw)
+            continue
+        s = raw.strip().lower()
+        if "://" in s:
+            s = s.split("://", 1)[1]
+        # Strip path / query / fragment
+        for sep in ("/", "?", "#"):
+            if sep in s:
+                s = s.split(sep, 1)[0]
+        s = s.strip().lstrip(".")
+        if s:
+            out.append(s)
+    return out
 
 
 class BrowserConfig(BaseSettings):
@@ -235,6 +266,18 @@ class SafetyConfig(BaseSettings):
     allow_downloads: bool = True
     allow_form_submit: bool = True
     block_private_ips: bool = True
+
+    # Normalize URLs / mixed-case input down to bare hostnames before any
+    # ``check_domain_allowed`` consultation. Catches the common foot-gun
+    # of passing ``"https://evil.com"`` as a deny pattern (which would
+    # otherwise silently never match because the comparator looks at
+    # parsed hostnames).
+    _normalize_allowed = field_validator("allowed_domains", mode="before")(
+        _normalize_domain_patterns
+    )
+    _normalize_denied = field_validator("denied_domains", mode="before")(
+        _normalize_domain_patterns
+    )
     probe_binary_urls: bool = Field(
         default=True,
         description=(
@@ -366,7 +409,15 @@ class AppConfig(BaseSettings):
             ...
     """
 
-    model_config = {"env_prefix": "WEB_AGENT_"}
+    # env_nested_delimiter is required for pydantic-settings v2 to parse
+    # double-underscore nested env vars like WEB_AGENT_BROWSER__HEADLESS.
+    # Without it, only top-level fields like WEB_AGENT_LOG_LEVEL apply --
+    # the README + module docstring would silently lie about sub-config
+    # support.
+    model_config = {
+        "env_prefix": "WEB_AGENT_",
+        "env_nested_delimiter": "__",
+    }
 
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
     search: SearchConfig = Field(default_factory=SearchConfig)

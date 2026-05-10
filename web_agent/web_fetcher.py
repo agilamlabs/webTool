@@ -19,6 +19,7 @@ import asyncio
 from typing import Optional
 from urllib.parse import urlparse
 
+import httpx
 from loguru import logger
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
@@ -41,8 +42,13 @@ from .utils import (
     get_random_user_agent,
 )
 
-# File extensions that trigger browser downloads instead of rendering
-_DOWNLOAD_EXTENSIONS = frozenset(
+# Common office documents and archives -- shared between the fetcher
+# and the downloader so the two modules can't drift on what counts as
+# "binary content we extract specially". Image / audio / video / OS
+# installer extensions are NOT here; they belong only to the fetcher's
+# DOWNLOAD set (we route around them) and are explicitly NOT in the
+# downloader's binary set (we don't extract them as documents).
+_OFFICE_AND_ARCHIVE_EXTENSIONS = frozenset(
     {
         ".pdf",
         ".doc",
@@ -58,6 +64,15 @@ _DOWNLOAD_EXTENSIONS = frozenset(
         ".7z",
         ".csv",
         ".tsv",
+    }
+)
+
+
+# File extensions that trigger browser downloads instead of rendering.
+# Superset of _OFFICE_AND_ARCHIVE_EXTENSIONS plus media + OS installers
+# which we want to route around even though we can't extract them.
+_DOWNLOAD_EXTENSIONS = _OFFICE_AND_ARCHIVE_EXTENSIONS | frozenset(
+    {
         ".mp3",
         ".mp4",
         ".avi",
@@ -482,6 +497,18 @@ class WebFetcher:
                 authenticated extensionless document URLs (regulator
                 dashboards, intranet downloads).
         """
+        # Pre-gate: do not probe denied / private-IP URLs even with HEAD.
+        # The fetch path already gates the URL; the classifier must too --
+        # otherwise a HEAD probe leaks a request to a host the policy
+        # explicitly forbids (SSRF defense-in-depth, mirrors fetch /
+        # fetch_binary).
+        if not check_domain_allowed(url, self._config.safety):
+            logger.debug(
+                "classify_url skipping HEAD probe for disallowed URL: {url}",
+                url=url,
+            )
+            return "unknown"
+
         ext_class = _url_ext_classification(url)
         if ext_class != "unknown":
             return ext_class
@@ -498,9 +525,7 @@ class WebFetcher:
         # treating that as 'unknown' avoids using the probe to leak that
         # the redirect target exists, and keeps SSRF mitigations honest.
         try:
-            import httpx
-
-            cookie_jar = await self._cookies_for_session(session_id)
+            cookie_jar = await self._cookies_for_session(session_id, url)
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=10.0,
@@ -527,30 +552,63 @@ class WebFetcher:
             logger.debug("HEAD probe failed for {url}: {e}", url=url, e=exc)
             return "unknown"
 
-    async def _cookies_for_session(self, session_id: Optional[str]) -> dict[str, str]:
-        """Extract Playwright BrowserContext cookies as an httpx-friendly dict.
+    async def _cookies_for_session(
+        self, session_id: Optional[str], target_url: str
+    ) -> httpx.Cookies:
+        """Extract Playwright BrowserContext cookies into a host-scoped jar.
 
-        When the caller threads a session_id through, we want authenticated
-        downloads (regulator dashboards, intranet docs) to inherit the
-        login state established earlier via ``Agent.interact``. This pulls
-        all cookies from the persistent context and returns them in a form
-        ``httpx.AsyncClient(cookies=...)`` accepts.
+        When a caller threads ``session_id`` through, we want authenticated
+        downloads (regulator dashboards, intranet docs) to inherit login
+        state established earlier via ``Agent.interact``. **Critical**: we
+        only forward cookies whose Playwright domain matches the target
+        URL's host (exact or parent suffix). A flat ``{name: value}`` dict
+        would leak EVERY session cookie to EVERY host the agent fetches --
+        including attacker.com getting bank.com auth cookies.
 
-        Returns an empty dict when the session is None / unknown / cookie
+        Each retained cookie is set on the returned :class:`httpx.Cookies`
+        with its declared domain so httpx applies its own cookie-domain
+        rules during request construction (defense in depth).
+
+        Returns an empty jar when the session is None / unknown / cookie
         retrieval fails -- never raises.
+
+        Args:
+            session_id: Persistent session id, or None for ephemeral.
+            target_url: The URL we're about to request. Cookies whose
+                domain doesn't match this host are dropped.
         """
+        jar = httpx.Cookies()
         if not session_id or self._sessions is None:
-            return {}
+            return jar
         try:
             ctx = self._sessions.get(session_id)
         except Exception:
-            return {}
+            return jar
         try:
             cookies = await ctx.cookies()
         except Exception as exc:
             logger.debug("Failed to read session cookies: {e}", e=exc)
-            return {}
-        return {c["name"]: c["value"] for c in cookies if "name" in c and "value" in c}
+            return jar
+
+        target_host = (urlparse(target_url).hostname or "").lower()
+        if not target_host:
+            return jar
+
+        for c in cookies:
+            if "name" not in c or "value" not in c:
+                continue
+            domain = (c.get("domain") or "").lstrip(".").lower()
+            # Cookies without a declared domain only apply to the target
+            # host they were set on; we treat that as a per-host cookie
+            # and pin it to the target host.
+            if not domain:
+                jar.set(c["name"], c["value"], domain=target_host)
+                continue
+            # Send only when target host equals or is a subdomain of the
+            # cookie's declared domain.
+            if target_host == domain or target_host.endswith("." + domain):
+                jar.set(c["name"], c["value"], domain=domain)
+        return jar
 
     async def fetch_binary(
         self,
@@ -585,8 +643,6 @@ class WebFetcher:
             always None for binary fetches. Returns HTTP_ERROR with a
             clear message when the size cap is exceeded.
         """
-        import httpx
-
         cid = get_correlation_id()
 
         if not check_domain_allowed(url, self._config.safety):
@@ -612,7 +668,7 @@ class WebFetcher:
             await self._rate_limiter.acquire(urlparse(url).hostname or "")
 
         max_bytes = max(1, self._config.download.max_file_size_mb) * 1024 * 1024
-        cookie_jar = await self._cookies_for_session(session_id)
+        cookie_jar = await self._cookies_for_session(session_id, url)
 
         timer = Timer()
         try:

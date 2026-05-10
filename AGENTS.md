@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.4**
+- Latest version: **1.6.5**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -28,7 +28,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~244 tests; full suite must pass
+python -m pytest -v          # ~409 tests; full suite must pass
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -144,6 +144,64 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.5 added
+
+A 16-issue review-pass focused on closing the SSRF / cookie-isolation
+gaps that v1.6.4 left open and on the long-tail polish items the
+external review surfaced.
+
+**Critical (security)**
+- **Per-host cookie isolation in `WebFetcher._cookies_for_session`.**
+  Returns a domain-aware `httpx.Cookies` jar instead of a flat
+  `{name: value}` dict; cookies for `bank.com` no longer leak to
+  attacker.com when both share a `session_id`.
+- **`classify_url` pre-gates the URL against `check_domain_allowed`**
+  before any HEAD probe -- closes the input-side of the SSRF gap that
+  v1.6.4 had only closed on the redirect side.
+- **Playwright download paths re-validate post-redirect URLs.**
+  `_do_save_page` checks `page.url`; `_download_with_playwright`
+  checks `download.url` before any `save_as` call. Mirrors the SSRF
+  hardening already in the httpx and Playwright fetch paths.
+
+**High**
+- **`env_nested_delimiter="__"`** added to `AppConfig.model_config` so
+  `WEB_AGENT_BROWSER__HEADLESS=false` actually configures
+  `browser.headless` (the README claim was previously silently broken).
+- **Cached DNS resolution** in `is_private_address` via a 2048-entry
+  LRU cache. The default-on private-IP gate no longer pays a fresh
+  `getaddrinfo` per outbound request.
+
+**Medium**
+- **Cache-hit honesty.** `SearchEngine` no longer rewrites
+  `searched_at` on cache hits; `from_cache=True` is the only
+  staleness signal.
+- **`async_retry` validates `max_retries >= 1`** at decorator-construction
+  time instead of raising a bogus `TypeError` later.
+- **`find_and_download_file` recovers extensionless binary URLs** via
+  `classify_url`, so regulator-archive URLs without an extension are
+  no longer silently dropped.
+- **`_unwrap_search_url` caps the unwrapped query** at 1024 chars so a
+  hostile SERP URL with a giant `?q=` payload cannot poison the
+  pipeline.
+- **Dead `_classify_message` / `_to_structured` /
+  `_MESSAGE_PREFIX_CODES` removed** -- replaced by `_MessageBag` in
+  v1.6.3; the back-compat shim is gone.
+
+**Low / polish**
+- **`take_screenshot` uses `FetchConfig.wait_until`** instead of
+  hardcoded `networkidle`.
+- **Shared `_OFFICE_AND_ARCHIVE_EXTENSIONS`** in `web_fetcher` consumed
+  by both fetcher and downloader -- prevents drift between the two
+  modules' extension lists.
+- **`_PAGE_DIALOG_STATES: WeakKeyDictionary[Page, _DialogState]`**
+  replaces the v1.6.4 hack of attribute-stuffing on Page objects.
+- **`SafetyConfig` auto-normalizes URL-shaped patterns**
+  (`"https://Evil.com/"` -> `"evil.com"`) so deny/allow lists from
+  external config files actually match.
+- **MCP server honors `WEB_AGENT_CONFIG`** env var pointing at a YAML
+  file -- operator can deploy with `safe_mode=True` / domain
+  allowlists without code changes.
 
 ## What v1.6.4 added
 

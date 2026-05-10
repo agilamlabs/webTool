@@ -30,6 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 from urllib.parse import urlparse
+from weakref import WeakKeyDictionary
 
 from loguru import logger
 from playwright.async_api import Dialog, Locator, Page
@@ -183,6 +184,13 @@ class _DialogState:
             await dialog.dismiss()
 
 
+# Per-Page dialog state, weakly keyed so closing the Page (Playwright
+# lifecycle) drops the entry automatically. Replaces v1.6.4's hack of
+# stuffing the state onto the Page via ``page._web_agent_dialog_state``,
+# which would break if Playwright ever introduced ``__slots__``.
+_PAGE_DIALOG_STATES: WeakKeyDictionary[Page, _DialogState] = WeakKeyDictionary()
+
+
 class BrowserActions:
     """Executes browser automation actions on Playwright pages.
 
@@ -327,7 +335,7 @@ class BrowserActions:
                 return _block_all(f"Initial navigation redirected to disallowed domain: {host}")
 
             page.on("dialog", dialog_state.handle)
-            page._web_agent_dialog_state = dialog_state  # type: ignore[attr-defined]
+            _PAGE_DIALOG_STATES[page] = dialog_state
 
             for action_input in actions:
                 if self._config.automation.slow_mo_actions > 0:
@@ -519,8 +527,16 @@ class BrowserActions:
         async def _capture(page: Page) -> Optional[str]:
             """Capture a screenshot. Returns None on success, or an
             error message string if the post-redirect URL violates the
-            safety policy (in which case no file is written)."""
-            await page.goto(url, wait_until="networkidle")
+            safety policy (in which case no file is written).
+
+            Uses ``FetchConfig.wait_until`` (default 'domcontentloaded')
+            instead of hardcoding 'networkidle': screenshots are exactly
+            the case where networkidle hangs indefinitely on pages with
+            analytics polling, and we already chose 'domcontentloaded'
+            as the default for the fetch path in v1.6.2.
+            """
+            wait_until = self._config.fetch.wait_until
+            await page.goto(url, wait_until=wait_until)  # type: ignore[arg-type]
             # Post-redirect re-check: a whitelisted host can redirect
             # to a private IP / denied host. Block before screenshotting.
             if not check_domain_allowed(page.url, self._config.safety):
@@ -777,7 +793,10 @@ class BrowserActions:
         )
 
     async def _do_dialog(self, page: Page, action: DialogInput) -> ActionResult:
-        dialog_state: _DialogState = getattr(page, "_web_agent_dialog_state", _DialogState())
+        dialog_state = _PAGE_DIALOG_STATES.get(page)
+        if dialog_state is None:
+            dialog_state = _DialogState()
+            _PAGE_DIALOG_STATES[page] = dialog_state
         dialog_state.response = action.dialog_action
         dialog_state.prompt_text = action.prompt_text
         logger.debug(

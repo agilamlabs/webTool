@@ -39,29 +39,22 @@ from .rate_limiter import RateLimiter
 from .robots import RobotsChecker
 from .session_manager import SessionManager
 from .utils import check_domain_allowed, get_random_user_agent, safe_join_path
+from .web_fetcher import _OFFICE_AND_ARCHIVE_EXTENSIONS
 
 # Extensions that are web pages (should be saved via page.content(), not expect_download)
 _WEB_PAGE_EXTENSIONS = frozenset(
     {".html", ".htm", ".xhtml", ".mhtml", ".asp", ".aspx", ".php", ".jsp"}
 )
 
-# Extensions that are binary files (expect_download works for these)
-_BINARY_EXTENSIONS = frozenset(
+# Extensions that ``Page.expect_download`` is suitable for (binary
+# content). Superset of the shared office/archive set plus images and
+# OS installers that browsers also download rather than render. Note
+# that this set deliberately does NOT include ``.iso`` / ``.deb`` /
+# ``.rpm`` -- those are in ``web_fetcher._DOWNLOAD_EXTENSIONS`` because
+# we want to route around them in the fetcher, but we don't expect to
+# save them with this strategy.
+_BINARY_EXTENSIONS = _OFFICE_AND_ARCHIVE_EXTENSIONS | frozenset(
     {
-        ".pdf",
-        ".doc",
-        ".docx",
-        ".xls",
-        ".xlsx",
-        ".ppt",
-        ".pptx",
-        ".zip",
-        ".tar",
-        ".gz",
-        ".rar",
-        ".7z",
-        ".csv",
-        ".tsv",
         ".mp3",
         ".mp4",
         ".avi",
@@ -379,9 +372,28 @@ class Downloader:
              abort if the server-declared size already exceeds the cap.
           2. Pre-check the in-memory ``page.content()`` byte length; abort
              before any write so we never leave a partial file behind.
+
+        Also re-validates the post-redirect URL against the safety policy:
+        a whitelisted host that 302s to a denied host or private IP must
+        not have its content written to disk (SSRF defense-in-depth,
+        mirrors the httpx download path).
         """
         max_bytes = self._config.download.max_file_size_mb * 1024 * 1024
         response = await page.goto(url, wait_until="load")
+
+        # Post-redirect re-check: page.url is the final URL after redirects.
+        # If a whitelisted host bounced us to a denied / private host, do
+        # NOT save its content -- return BLOCKED before any disk write.
+        if not check_domain_allowed(page.url, self._config.safety):
+            host = urlparse(page.url).hostname or ""
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename=filepath.name,
+                status=FetchStatus.BLOCKED,
+                error_message=f"Page redirected to disallowed URL: {host}",
+            )
+
         content_type = None
         if response:
             ct = response.headers.get("content-type", "")
@@ -468,6 +480,24 @@ class Downloader:
             )
         return None
 
+    def _blocked_by_redirect(self, url: str, filepath: Path) -> Optional[DownloadResult]:
+        """Return a BLOCKED DownloadResult if ``url`` violates the safety policy.
+
+        Used by the Playwright download strategy to re-validate
+        ``download.url`` (the post-redirect download origin) before
+        ``save_as`` writes anything to disk.
+        """
+        if check_domain_allowed(url, self._config.safety):
+            return None
+        host = urlparse(url).hostname or ""
+        return DownloadResult(
+            url=url,
+            filepath="",
+            filename=filepath.name,
+            status=FetchStatus.BLOCKED,
+            error_message=f"Download redirected to disallowed URL: {host}",
+        )
+
     async def _download_with_playwright(
         self,
         url: str,
@@ -481,6 +511,11 @@ class Downloader:
         stat the result and unlink if oversize. Less ideal than the httpx
         streaming path (which can abort mid-stream) but at least bounds
         the impact -- the oversize file does not stay on disk.
+
+        Re-validates the actual download origin (``download.url``, set
+        after Playwright follows redirects) against the safety policy
+        before any disk write -- closes the SSRF gap where a whitelisted
+        host could 302 to a denied host's payload.
         """
         try:
             if session_id and self._sessions is not None:
@@ -491,6 +526,9 @@ class Downloader:
                     async with page.expect_download(timeout=60000) as download_info:
                         await page.goto(url)
                     download = await download_info.value
+                    blocked = self._blocked_by_redirect(download.url, filepath)
+                    if blocked is not None:
+                        return blocked
                     await download.save_as(str(filepath))
                     over = self._enforce_size_cap(filepath, url)
                     if over is not None:
@@ -511,6 +549,9 @@ class Downloader:
                     async with page.expect_download(timeout=60000) as download_info:
                         await page.goto(url)
                     download = await download_info.value
+                    blocked = self._blocked_by_redirect(download.url, filepath)
+                    if blocked is not None:
+                        return blocked
                     await download.save_as(str(filepath))
                     over = self._enforce_size_cap(filepath, url)
                     if over is not None:
