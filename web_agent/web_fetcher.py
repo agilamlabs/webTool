@@ -491,6 +491,12 @@ class WebFetcher:
         # HEAD probe with redirects + UA + cookies (when session present).
         # We deliberately swallow all errors -- a failing HEAD must NEVER
         # block the subsequent fetch, only inform routing.
+        #
+        # Defense-in-depth: re-validate the FINAL redirected URL against
+        # the safety policy. follow_redirects=True can land us on a
+        # disallowed host that would never have passed the entry gate;
+        # treating that as 'unknown' avoids using the probe to leak that
+        # the redirect target exists, and keeps SSRF mitigations honest.
         try:
             import httpx
 
@@ -502,6 +508,14 @@ class WebFetcher:
                 cookies=cookie_jar,
             ) as client:
                 resp = await client.head(url)
+                final_url = str(resp.url)
+                if final_url != url and not check_domain_allowed(final_url, self._config.safety):
+                    logger.debug(
+                        "HEAD probe followed redirect to disallowed URL {final}; "
+                        "treating as 'unknown'",
+                        final=final_url,
+                    )
+                    return "unknown"
                 ct = resp.headers.get("content-type")
                 disp = resp.headers.get("content-disposition")
                 if _content_type_is_binary(ct) or _disposition_is_attachment(disp):

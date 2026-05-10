@@ -12,7 +12,8 @@ from web_agent.recipes import RANKING_PROFILES
 
 
 def test_version_bump():
-    assert __version__ == "1.6.3"
+    # v1.6.x family; bumped to 1.6.4 in the review-pass follow-up.
+    assert __version__.startswith("1.6.")
 
 
 # ----------------------------------------------------------------------

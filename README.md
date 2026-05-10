@@ -1,19 +1,28 @@
 # webTool
 
+[![CI](https://github.com/agilamlabs/webTool/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/agilamlabs/webTool/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 Professional agentic web search, fetch, download, extraction, and browser automation toolkit built on Playwright's headless Chromium.
 
 Designed as a tool for AI agents that need to search the web, fetch JavaScript-heavy pages, extract structured content, download files, and automate browser interactions -- all through a clean async Python API.
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.3** — follow-up review pass on v1.6.2: direct-URL
-> branch in `search_and_extract` now uses smart binary routing; search
-> results parallel-HEAD-probed for extensionless PDFs/XLSX/DOCX (regulator
-> `/download?id=42` URLs); `classify_url` accepts `session_id` for
-> authenticated probes; structured warnings/errors recorded with stable
-> codes at the source (no more brittle prefix matching);
-> `AppConfig.ranking_profiles` makes ranking profiles user-extensible and
-> overridable. See [CHANGELOG.md](CHANGELOG.md).
+> **What's new in 1.6.4** — external-review pass: fixes the long-running
+> Linux-only CI failure (Windows drive paths slipped through `safe_join_path`
+> on POSIX); mypy clean on bs4 meta-content reads; Playwright download
+> paths now enforce `max_file_size_mb` (the httpx path already did);
+> HEAD probe re-validates the final URL after redirects (last remaining
+> SSRF gap closed); `SECURITY.md` published with full threat model;
+> README CI badge + clarified install. See [CHANGELOG.md](CHANGELOG.md).
+>
+> **v1.6.3** added: smart routing for direct-URL search path; parallel
+> HEAD-probe of search results for extensionless PDFs/XLSX/DOCX;
+> `classify_url(session_id=...)`; structured warnings/errors at the
+> source via `_MessageBag`; `AppConfig.ranking_profiles` makes profiles
+> user-extensible and overridable.
 >
 > **v1.6.2** added: smart binary routing in `fetch_and_extract` (HEAD-based
 > detection of extensionless PDF/XLSX URLs), streaming binary fetches with
@@ -51,8 +60,17 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 
 ## Installation
 
+> **Source-install only.** `web-agent-toolkit` is not on PyPI yet. Install from source:
+
 ```bash
+# From a local clone (recommended for development):
+git clone https://github.com/agilamlabs/webTool.git
+cd webTool
 pip install -e ".[dev]"
+playwright install chromium
+
+# Or directly from the GitHub URL:
+pip install "web-agent-toolkit @ git+https://github.com/agilamlabs/webTool.git"
 playwright install chromium
 ```
 
@@ -62,7 +80,13 @@ On Linux, use `--with-deps` to auto-install Chromium's system dependencies:
 playwright install --with-deps chromium
 ```
 
-**Requirements:** Python 3.10+
+**Optional binary-document extractors** (PDF / XLSX / DOCX; CSV is stdlib):
+
+```bash
+pip install -e ".[dev,binary]"
+```
+
+**Requirements:** Python 3.10+ (3.10, 3.11, 3.12, 3.13 tested in CI)
 
 ## Quick Start
 

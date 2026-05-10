@@ -1,5 +1,94 @@
 # Changelog
 
+## [1.6.4] - 2026-05-07
+
+### External-review pass (cross-platform path fix, mypy fix, download cap, redirect SSRF)
+
+Addresses an external code review's seven recommendations. Three were
+real bugs (one of which explains the long-deferred CI failure on
+Linux); the rest are security hardening + documentation polish.
+
+#### P0 -- CI gates: fixed
+
+- **Cross-platform absolute-path detection in `safe_join_path` (security
+  helper).** `pathlib.PurePosixPath("C:\\Windows").is_absolute()` is
+  False on Linux, so a Linux container would silently accept Windows
+  drive-rooted paths from caller-supplied filenames -- defeating the
+  point of the helper. New `_is_cross_platform_absolute(path)` rejects
+  POSIX absolute, Windows drive-rooted (any letter, either slash),
+  Windows root-only, and UNC paths regardless of the OS the check runs
+  on. This explains the test that's been failing on the CI Linux
+  runners since v1.6.1 (`test_rejects_windows_drive_absolute_path`).
+- **bs4 `.get("content")` mypy errors.** `Tag.get()` is typed as
+  `str | AttributeValueList | None` in newer bs4 stubs;
+  `ExtractionResult` requires `str | None`. The two errors at
+  `content_extractor.py:457-458` are gone now -- both meta-tag reads
+  coerce via `str(val) if val is not None else None`.
+
+After these two fixes, CI's lint + test jobs pass on all of
+Python 3.10 / 3.12 / 3.13 (the v1.6.1-era failure mystery is resolved).
+
+#### P1 -- Security hardening
+
+- **Playwright download paths now enforce `max_file_size_mb`.** Before:
+  only the httpx streaming path enforced the cap; the Playwright
+  page-save and expect-download paths wrote the full file before any
+  size check. Now:
+  - Strategy 2 (page-save) pre-checks the navigation response's
+    `Content-Length` header and the in-memory rendered DOM size before
+    writing -- aborts before any disk write if either exceeds the cap.
+  - Strategy 3 (expect-download) post-saves and stat-checks; if
+    oversize, the file is unlinked and an HTTP_ERROR result is
+    returned.
+- **HEAD probe redirect re-validation.** `WebFetcher.classify_url` was
+  the one remaining redirect-following code path that didn't re-validate
+  the final URL against `check_domain_allowed` after redirects. A
+  whitelisted entry host could redirect HEAD to a denied target and
+  the probe would happily report 'binary'/'html' based on the denied
+  target's headers -- weakening SSRF defense and leaking that the
+  redirect target exists. Now probes that follow a redirect to a
+  disallowed host return 'unknown' (so the caller falls back to a
+  real fetch, which has its own gate).
+
+#### P2 -- Polish
+
+- **CI badge** added to README, plus Python-version and license badges.
+- **Install instructions** clarified: source-install only (not on
+  PyPI); both `git clone` + `pip install -e ".[dev]"` and
+  `pip install "web-agent-toolkit @ git+https://..."` documented.
+- **`SECURITY.md`** added: vulnerability reporting process, full
+  threat model (in-scope and out-of-scope), enumeration of all 12
+  defense-in-depth layers, hardening recommendations for production.
+  Documents the DNS rebinding limitation explicitly with mitigation
+  options for callers who need it.
+
+### Deferred to v1.7
+
+The reviewer flagged two further items for a v1.7 pass:
+
+- **DNS rebinding mitigation** (pin DNS at pre-check or use Playwright
+  request interception). Currently documented in SECURITY.md.
+- **`except Exception` audit** (some intentionally swallow result-based
+  errors; a few call sites worth tightening).
+
+### Test additions
+
+- `tests/test_v164_fixes.py`: 18 tests for cross-platform absolute
+  detection (every Windows drive letter A-Z, UNC, lookalikes that
+  must NOT match), Playwright download cap (Content-Length pre-check,
+  rendered DOM pre-check, post-save stat+unlink), HEAD probe redirect
+  re-validation, bs4 None-content handling.
+
+Total: 342/342 unit tests passing (v1.6.3 was 319; +23).
+
+### Backward compatibility
+
+- All changes are additive or internal helpers. No public-API breaks.
+- Behavior change: callers who previously relied on a Windows
+  drive-rooted filename being silently accepted on Linux now get a
+  ValueError. This is the intended security tightening.
+- Old JSON dumps still parse against the v1.6.4 model.
+
 ## [1.6.3] - 2026-05-07
 
 ### Follow-up to v1.6.2: 8-issue review pass
