@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import random
+import re
 import socket
 import time
 from collections.abc import Callable
@@ -331,11 +332,50 @@ def check_domain_allowed(url: str, safety: SafetyConfig, *, strict: bool = False
     return _reject("not in allow-list")
 
 
+# Cross-platform absolute-path detection patterns.
+# - POSIX absolute: starts with "/"
+# - Windows drive-rooted: "C:\foo" or "C:/foo" (any letter)
+# - Windows root-only:    "\foo" or "/foo" (already covered by POSIX rule)
+# - UNC path:             "\\server\share" or "//server/share"
+# We detect ALL of these regardless of the host OS, because:
+#   - pathlib.PurePosixPath("C:\\Windows").is_absolute() returns False on Linux
+#     (Linux treats "C:\\Windows" as a relative file named literally "C:\Windows"),
+#     so a Linux container would silently accept a Windows-rooted path that the
+#     security helper is supposed to reject.
+_WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
+_UNC_PATTERN = re.compile(r"^[\\/]{2}[^\\/]")
+
+
+def _is_cross_platform_absolute(user_path: str) -> bool:
+    """True if ``user_path`` is absolute on ANY major platform.
+
+    Catches POSIX absolute, Windows drive-rooted, Windows root-only, and
+    UNC paths regardless of the host OS the check runs on.
+    """
+    if not user_path:
+        return False
+    if user_path.startswith(("/", "\\")):
+        return True
+    if _WINDOWS_DRIVE_PATTERN.match(user_path):
+        return True
+    if _UNC_PATTERN.match(user_path):
+        return True
+    # Fallback to pathlib (catches any platform-specific case the regexes miss)
+    return Path(user_path).is_absolute()
+
+
 def safe_join_path(base: Path | str, user_path: str) -> Path:
     """Resolve ``base / user_path`` and ensure it does NOT escape ``base``.
 
     Defends against path-traversal attacks where ``user_path`` contains
     ``..`` components, absolute paths, or symlinks pointing outside ``base``.
+
+    Cross-platform absolute-path detection: rejects POSIX absolute paths
+    (``/etc/passwd``), Windows drive-rooted paths (``C:\\Windows\\System32``),
+    and UNC paths (``\\\\server\\share``) regardless of the OS where the
+    check runs. This matters because ``pathlib.PurePosixPath`` does NOT
+    treat ``C:\\Windows`` as absolute on Linux, so a Linux container would
+    otherwise silently accept Windows-rooted user input.
 
     Args:
         base: Base directory (must be a real directory).
@@ -346,14 +386,15 @@ def safe_join_path(base: Path | str, user_path: str) -> Path:
 
     Raises:
         ValueError: If the resolved path escapes ``base``, or if ``user_path``
-            is empty or absolute.
+            is empty or absolute on any major platform.
     """
     if not user_path:
         raise ValueError("Empty filename / path")
 
-    user_p = Path(user_path)
-    if user_p.is_absolute():
+    if _is_cross_platform_absolute(user_path):
         raise ValueError(f"Absolute paths are not allowed: {user_path!r}")
+
+    user_p = Path(user_path)
 
     base_resolved = Path(base).resolve()
     candidate = (base_resolved / user_p).resolve()

@@ -372,14 +372,55 @@ class Downloader:
             )
 
     async def _do_save_page(self, page: Page, url: str, filepath: Path) -> DownloadResult:
-        """Inner page-save: navigate and write page.content() to disk."""
+        """Inner page-save: navigate and write page.content() to disk.
+
+        Enforces ``max_file_size_mb`` BEFORE writing to disk (strategy 2):
+          1. Pre-check ``Content-Length`` header from the navigation response;
+             abort if the server-declared size already exceeds the cap.
+          2. Pre-check the in-memory ``page.content()`` byte length; abort
+             before any write so we never leave a partial file behind.
+        """
+        max_bytes = self._config.download.max_file_size_mb * 1024 * 1024
         response = await page.goto(url, wait_until="load")
         content_type = None
         if response:
             ct = response.headers.get("content-type", "")
             content_type = ct.split(";")[0].strip() if ct else None
+            # Cheap pre-check: trust Content-Length when the server sent one.
+            cl_raw = response.headers.get("content-length")
+            if cl_raw:
+                try:
+                    declared = int(cl_raw)
+                except ValueError:
+                    declared = -1
+                if declared > max_bytes:
+                    return DownloadResult(
+                        url=url,
+                        filepath="",
+                        filename=filepath.name,
+                        status=FetchStatus.HTTP_ERROR,
+                        error_message=(
+                            f"Page Content-Length {declared} bytes exceeds "
+                            f"{self._config.download.max_file_size_mb} MB cap"
+                        ),
+                        content_type=content_type,
+                    )
 
         html = await page.content()
+        # In-memory pre-check: stop before write if the rendered DOM is too large.
+        encoded_size = len(html.encode("utf-8"))
+        if encoded_size > max_bytes:
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename=filepath.name,
+                status=FetchStatus.HTTP_ERROR,
+                error_message=(
+                    f"Rendered page {encoded_size} bytes exceeds "
+                    f"{self._config.download.max_file_size_mb} MB cap"
+                ),
+                content_type=content_type,
+            )
         filepath.write_text(html, encoding="utf-8")
         size = filepath.stat().st_size
 
@@ -398,13 +439,49 @@ class Downloader:
             status=FetchStatus.SUCCESS,
         )
 
+    def _enforce_size_cap(self, filepath: Path, url: str) -> Optional[DownloadResult]:
+        """Enforce ``max_file_size_mb`` after a Playwright download.
+
+        Playwright's ``download.save_as()`` writes the full file before
+        returning, so we stat-check and unlink any oversize result.
+        Returns ``None`` if the file is within budget; an error
+        DownloadResult (and unlinks the file) if oversize.
+        """
+        max_bytes = self._config.download.max_file_size_mb * 1024 * 1024
+        try:
+            size = filepath.stat().st_size
+        except OSError:
+            return None
+        if size > max_bytes:
+            with suppress(OSError):
+                filepath.unlink()
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename=filepath.name,
+                size_bytes=size,
+                status=FetchStatus.HTTP_ERROR,
+                error_message=(
+                    f"Downloaded file {size} bytes exceeds "
+                    f"{self._config.download.max_file_size_mb} MB cap (deleted)"
+                ),
+            )
+        return None
+
     async def _download_with_playwright(
         self,
         url: str,
         filepath: Path,
         session_id: Optional[str] = None,
     ) -> DownloadResult:
-        """Strategy 3: Use Playwright's download event for JS-triggered downloads."""
+        """Strategy 3: Use Playwright's download event for JS-triggered downloads.
+
+        Enforces ``max_file_size_mb`` POST-save: Playwright's
+        ``Download.save_as`` writes the full file before returning, so we
+        stat the result and unlink if oversize. Less ideal than the httpx
+        streaming path (which can abort mid-stream) but at least bounds
+        the impact -- the oversize file does not stay on disk.
+        """
         try:
             if session_id and self._sessions is not None:
                 ctx = self._sessions.get(session_id)
@@ -415,6 +492,9 @@ class Downloader:
                         await page.goto(url)
                     download = await download_info.value
                     await download.save_as(str(filepath))
+                    over = self._enforce_size_cap(filepath, url)
+                    if over is not None:
+                        return over
                     size = filepath.stat().st_size
                     return DownloadResult(
                         url=url,
@@ -432,6 +512,9 @@ class Downloader:
                         await page.goto(url)
                     download = await download_info.value
                     await download.save_as(str(filepath))
+                    over = self._enforce_size_cap(filepath, url)
+                    if over is not None:
+                        return over
                     size = filepath.stat().st_size
 
                     logger.info(

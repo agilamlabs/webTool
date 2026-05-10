@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.3"
+__version__ = "1.6.4"
 
 from .agent import Agent
 from .audit import AuditLogger

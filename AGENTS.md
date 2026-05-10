@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.3**
+- Latest version: **1.6.4**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -144,6 +144,26 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.4 added
+
+- **Cross-platform `safe_join_path`.** New `_is_cross_platform_absolute`
+  helper rejects POSIX, Windows-drive (any letter, either slash),
+  Windows-root, and UNC absolute paths regardless of OS. Closes the
+  Linux-only CI test failure that's been pending since v1.6.1.
+- **bs4 meta content coercion.** `Tag.get("content")` is widened to
+  `str | None` at the call site. Fixes 2 mypy errors on newer bs4
+  stubs.
+- **Playwright download size cap.** Strategy 2 (page-save) pre-checks
+  Content-Length + rendered DOM size before disk write; Strategy 3
+  (expect-download) stat-checks and unlinks oversize results.
+- **HEAD probe redirect re-validation.** `classify_url` now treats a
+  HEAD that redirects to a denied host as `unknown` instead of
+  reporting on the denied target's content-type.
+- **`SECURITY.md`.** Threat model, defense-in-depth layers, hardening
+  recipe for production, DNS rebinding limitation documented.
+- **README polish.** CI badge, Python-version badge, source-install
+  clarity (no PyPI yet).
 
 ## What v1.6.3 added
 

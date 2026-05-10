@@ -417,16 +417,20 @@ class ContentExtractor:
                 title = title_tag.get_text(strip=True)
 
             # Meta description
-            description = None
+            description: Optional[str] = None
             meta_desc = soup.find("meta", attrs={"name": "description"})
             if meta_desc:
-                description = meta_desc.get("content", "")
+                # bs4 >= 4.13 types Tag.get() as str | AttributeValueList | None;
+                # ExtractionResult.description requires str | None, so we coerce.
+                desc_val = meta_desc.get("content")
+                description = str(desc_val) if desc_val is not None else None
 
             # Author
-            author = None
+            author: Optional[str] = None
             meta_author = soup.find("meta", attrs={"name": "author"})
             if meta_author:
-                author = meta_author.get("content", "")
+                author_val = meta_author.get("content")
+                author = str(author_val) if author_val is not None else None
 
             # Main content: try semantic tags first, then common class/id patterns
             content_tag = (
