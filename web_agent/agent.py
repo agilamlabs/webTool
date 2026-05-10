@@ -112,11 +112,21 @@ _SEARCH_ENGINE_HOST_PATTERNS = (
 )
 
 
+# Cap on the unwrapped SERP query length. Real-world search queries are
+# < 500 chars; a 1MB ?q= payload (which urllib.parse.parse_qs WILL parse)
+# would otherwise propagate through the entire pipeline.
+_MAX_UNWRAPPED_QUERY_LEN = 1024
+
+
 def _unwrap_search_url(query: str) -> Optional[str]:
     """If query is a search-engine SERP URL, return the embedded query string.
 
     Returns None when the URL is not a recognized SERP or has no ``q`` param.
     Only invoked when ``_query_is_url(query)`` already returned True.
+
+    The unwrapped query is truncated to ``_MAX_UNWRAPPED_QUERY_LEN`` chars
+    so a hostile SERP URL with a giant ``q=`` payload cannot poison the
+    downstream pipeline.
     """
     try:
         parsed = urlparse(query.strip())
@@ -132,7 +142,16 @@ def _unwrap_search_url(query: str) -> Optional[str]:
     if not raw:
         return None
     inner = raw[0].strip()
-    return inner or None
+    if not inner:
+        return None
+    if len(inner) > _MAX_UNWRAPPED_QUERY_LEN:
+        logger.warning(
+            "Unwrapped SERP query truncated from {n} to {cap} chars",
+            n=len(inner),
+            cap=_MAX_UNWRAPPED_QUERY_LEN,
+        )
+        inner = inner[:_MAX_UNWRAPPED_QUERY_LEN]
+    return inner
 
 
 _BLOCK_REASON_BY_STATUS = {
@@ -148,55 +167,6 @@ def _block_reason_for(fr: FetchResult) -> Optional[str]:
     if fr.status == FetchStatus.SUCCESS:
         return None
     return _BLOCK_REASON_BY_STATUS.get(fr.status)
-
-
-# Mapping from message-prefix substring to a stable code. Retained ONLY
-# for the back-compat _classify_message helper -- the hot path now uses
-# _MessageBag which assigns codes at the source. New callers should not
-# rely on prefix-based code derivation.
-_MESSAGE_PREFIX_CODES: tuple[tuple[str, str], ...] = (
-    ("Domain blocked:", "domain_blocked"),
-    ("Domain denied:", "domain_blocked"),
-    ("Failed to fetch", "fetch_failed"),
-    ("Fetch raised for", "fetch_exception"),
-    ("downloadable file URL", "download_skipped"),
-    ("downloadable file URLs", "download_skipped"),
-    ("Binary extraction failed", "binary_extraction_failed"),
-    ("All page fetches failed", "all_fetches_failed"),
-    ("No search results found", "no_search_results"),
-    ("No allowed pages", "no_allowed_pages"),
-    ("Budget", "budget_exceeded"),
-)
-
-
-def _classify_message(msg: str) -> tuple[str, Optional[str]]:
-    """Best-effort lift of a free-form message into a (code, url) pair.
-
-    Kept for back-compat (a few external callers may have built on top
-    of it); the agent itself no longer relies on this hot-path string
-    classifier. Use :class:`_MessageBag` to record codes at the source.
-    """
-    code = "unknown"
-    for prefix, c in _MESSAGE_PREFIX_CODES:
-        if prefix in msg:
-            code = c
-            break
-    url: Optional[str] = None
-    for token in msg.split():
-        token = token.rstrip(".,;:")
-        if token.startswith(("http://", "https://")):
-            url = token
-            break
-    return code, url
-
-
-def _to_structured(messages: list[str], severity: ToolSeverity) -> list[ToolMessage]:
-    """Back-compat helper: lift each free-form message into a ToolMessage."""
-    out: list[ToolMessage] = []
-    for m in messages:
-        code, url = _classify_message(m)
-        out.append(ToolMessage(code=code, message=m, url=url, severity=severity))
-    return out
 
 
 class _MessageBag:

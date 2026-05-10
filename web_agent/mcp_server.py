@@ -45,6 +45,7 @@ Claude Desktop config (``claude_desktop_config.json``)::
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -72,6 +73,43 @@ from .models import (
 # ---------------------------------------------------------------------------
 
 
+def _load_mcp_config() -> AppConfig:
+    """Load AppConfig for the MCP server.
+
+    Resolution order:
+      1. ``WEB_AGENT_CONFIG`` env var pointing at a YAML file -- enables
+         operator-supplied allow/deny lists, ``safe_mode``, custom
+         ranking profiles, etc., without code changes.
+      2. ``AppConfig()`` defaults, which already pick up
+         ``WEB_AGENT_*`` env vars (incl. nested ``__`` paths since
+         v1.6.5) thanks to pydantic-settings.
+
+    A missing or unreadable YAML file is logged at WARNING and falls
+    back to defaults rather than failing the server start -- matches
+    the CLI's tolerance for missing config.
+    """
+    yaml_path = os.environ.get("WEB_AGENT_CONFIG")
+    if yaml_path:
+        from pathlib import Path
+
+        path = Path(yaml_path)
+        if path.exists():
+            try:
+                logger.info("Loading MCP config from {p}", p=path)
+                return AppConfig.from_yaml(path)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load WEB_AGENT_CONFIG={p}: {e}; using defaults",
+                    p=path,
+                    e=exc,
+                )
+        else:
+            logger.warning(
+                "WEB_AGENT_CONFIG={p} not found; using defaults", p=path
+            )
+    return AppConfig()
+
+
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     """Initialize the web_agent Agent once and share it across all tool calls."""
@@ -79,7 +117,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     logger.add(sys.stderr, level="INFO")
 
     logger.info("Starting web_agent MCP server...")
-    config = AppConfig()
+    config = _load_mcp_config()
     async with Agent(config) as agent:
         logger.info("web_agent MCP server ready")
         yield {"agent": agent}

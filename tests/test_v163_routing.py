@@ -51,19 +51,28 @@ def test_query_string_does_not_affect_classification():
 
 @pytest.mark.asyncio
 async def test_classify_url_uses_session_cookies():
-    """classify_url with session_id should pull cookies from the session."""
+    """classify_url with session_id should pull cookies from the session.
+
+    Updated for v1.6.5: _cookies_for_session now takes a target_url and
+    returns httpx.Cookies (host-scoped) instead of a flat dict.
+    """
+    import httpx
     from web_agent.config import AppConfig
     from web_agent.web_fetcher import WebFetcher
 
     bm = MagicMock()
     sessions = MagicMock()
     fake_ctx = MagicMock()
-    fake_ctx.cookies = AsyncMock(return_value=[{"name": "auth", "value": "secret-token"}])
+    # Cookie with a domain attribute matching the target host
+    fake_ctx.cookies = AsyncMock(
+        return_value=[{"name": "auth", "value": "secret-token", "domain": "x.com"}]
+    )
     sessions.get = MagicMock(return_value=fake_ctx)
 
     fetcher = WebFetcher(bm, AppConfig(), sessions=sessions)
-    cookies = await fetcher._cookies_for_session("session-1")
-    assert cookies == {"auth": "secret-token"}
+    jar = await fetcher._cookies_for_session("session-1", "https://x.com/page")
+    assert isinstance(jar, httpx.Cookies)
+    assert "auth" in {c.name for c in jar.jar}
 
 
 @pytest.mark.asyncio

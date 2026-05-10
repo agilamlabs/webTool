@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import ipaddress
 import random
 import re
@@ -66,7 +67,17 @@ def async_retry(
     max_delay: float = 30.0,
     non_retryable_exceptions: tuple[type[Exception], ...] = (),
 ) -> Callable:
-    """Decorator that retries an async function with exponential backoff + jitter."""
+    """Decorator that retries an async function with exponential backoff + jitter.
+
+    Raises:
+        ValueError: If ``max_retries < 1``. Without at least one attempt
+            the decorator's loop body never runs and the trailing
+            ``raise last_exception`` would raise a bogus
+            ``TypeError("exceptions must derive from BaseException")``
+            because ``last_exception`` would be None.
+    """
+    if max_retries < 1:
+        raise ValueError(f"max_retries must be >= 1, got {max_retries}")
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
@@ -237,6 +248,34 @@ def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified)
 
 
+@functools.lru_cache(maxsize=2048)
+def _resolve_host_addresses(host: str) -> tuple[str, ...]:
+    """Resolve ``host`` to all addresses, cached for the process lifetime.
+
+    Cached because ``check_domain_allowed`` calls :func:`is_private_address`
+    for every URL when ``block_private_ips=True`` (default), and DNS
+    resolution is otherwise the dominant per-request cost. DNS rarely
+    changes within a single agent's lifetime, and even when it does the
+    LRU eviction (2048-entry cap) bounds staleness for long-running
+    processes.
+
+    Returns an empty tuple on resolution failure -- callers treat that as
+    "unknown / cannot prove private" and fall through.
+
+    Note: this is a sync function called from sync code paths
+    (:func:`check_domain_allowed`); a future async refactor would
+    propagate :class:`asyncio` through every URL gate. See the v1.7
+    roadmap for that work.
+    """
+    try:
+        # info[4] is the sockaddr tuple; index 0 is the IP literal
+        # (str for both IPv4 and IPv6). Stubs type it as Any, so we
+        # narrow with str() to keep mypy strict-mode happy.
+        return tuple(str(info[4][0]) for info in socket.getaddrinfo(host, None))
+    except (socket.gaierror, OSError):
+        return ()
+
+
 def is_private_address(host: str) -> bool:
     """Return True if ``host`` resolves to a private/loopback/link-local IP.
 
@@ -244,9 +283,10 @@ def is_private_address(host: str) -> bool:
     link-local (169.254/16 incl. AWS IMDS at 169.254.169.254, fe80::/10),
     and the unspecified address (0.0.0.0, ::).
 
-    If ``host`` is a hostname (not a literal IP), this function attempts
-    DNS resolution and checks the resolved address. On resolution failure
-    it returns False (we don't know -- caller must decide).
+    If ``host`` is a hostname (not a literal IP), this function consults
+    a per-process DNS cache (see :func:`_resolve_host_addresses`) and
+    checks every resolved address. On resolution failure it returns
+    False (we don't know -- caller must decide).
 
     Args:
         host: Hostname or IP literal.
@@ -260,22 +300,15 @@ def is_private_address(host: str) -> bool:
         ip = ipaddress.ip_address(host)
         return _is_private_ip(ip)
     except ValueError:
-        # Not a literal IP -- try DNS resolution
+        # Not a literal IP -- try cached DNS resolution
         pass
 
-    try:
-        infos = socket.getaddrinfo(host, None)
-        for info in infos:
-            sockaddr = info[4]
-            ip_str = sockaddr[0]
-            try:
-                ip = ipaddress.ip_address(ip_str)
-                if _is_private_ip(ip):
-                    return True
-            except ValueError:
-                continue
-    except (socket.gaierror, OSError):
-        return False
+    for addr_str in _resolve_host_addresses(host):
+        try:
+            if _is_private_ip(ipaddress.ip_address(addr_str)):
+                return True
+        except ValueError:
+            continue
     return False
 
 

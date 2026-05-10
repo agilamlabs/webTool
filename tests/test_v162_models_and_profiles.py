@@ -11,7 +11,6 @@ from web_agent import (
     ToolWarning,
     __version__,
 )
-from web_agent.agent import _classify_message, _to_structured
 from web_agent.models import SearchResponse
 from web_agent.recipes import RANKING_PROFILES, Recipes, _resolve_domain_hints
 
@@ -101,38 +100,12 @@ def test_tool_warning_and_error_are_aliases():
     assert ToolError is ToolMessage
 
 
-def test_classify_message_domain_blocked():
-    code, url = _classify_message("Domain blocked: https://bad.example.com/path")
-    assert code == "domain_blocked"
-    assert url == "https://bad.example.com/path"
-
-
-def test_classify_message_fetch_failed():
-    code, url = _classify_message("Failed to fetch https://x.com/y: timeout")
-    assert code == "fetch_failed"
-    assert url == "https://x.com/y"
-
-
-def test_classify_message_download_skipped():
-    code, _ = _classify_message("3 downloadable file URLs skipped; see download_candidates")
-    assert code == "download_skipped"
-
-
-def test_classify_message_no_search_results():
-    code, _ = _classify_message("No search results found")
-    assert code == "no_search_results"
-
-
-def test_classify_message_unknown_falls_through():
-    code, url = _classify_message("Something completely unexpected happened")
-    assert code == "unknown"
-    assert url is None
-
-
-def test_to_structured_preserves_severity():
-    msgs = ["Domain blocked: https://x.com", "Failed to fetch https://y.com/z"]
-    structured = _to_structured(msgs, ToolSeverity.WARNING)
-    assert all(s.severity == ToolSeverity.WARNING for s in structured)
+# NOTE: tests for `_classify_message` and `_to_structured` were removed
+# in v1.6.5 along with the helpers themselves -- the hot path uses
+# `_MessageBag` and records codes at the source. See
+# tests/test_v163_messagebag_profiles.py for the replacement coverage
+# and tests/test_v165_medium.py::test_classify_message_helper_removed
+# for the deletion regression guard.
 
 
 def test_agent_result_structured_default_empty():

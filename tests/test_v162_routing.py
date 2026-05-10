@@ -298,6 +298,8 @@ async def test_fetch_binary_size_cap_enforced(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cookies_for_session_reads_from_context():
+    """Updated for v1.6.5: returns httpx.Cookies (host-scoped) and takes target_url."""
+    import httpx
     from web_agent.config import AppConfig
     from web_agent.web_fetcher import WebFetcher
 
@@ -313,25 +315,36 @@ async def test_cookies_for_session_reads_from_context():
     sessions.get = MagicMock(return_value=fake_ctx)
 
     fetcher = WebFetcher(bm, AppConfig(), sessions=sessions)
-    cookies = await fetcher._cookies_for_session("session-1")
-    assert cookies == {"auth": "abc123", "session": "xyz"}
+    jar = await fetcher._cookies_for_session("session-1", "https://x.com/page")
+    assert isinstance(jar, httpx.Cookies)
+    names = {c.name for c in jar.jar}
+    assert "auth" in names
+    assert "session" in names
 
 
 @pytest.mark.asyncio
 async def test_cookies_for_session_returns_empty_when_no_session_id():
+    """v1.6.5: empty jar (not dict) when no session is supplied."""
+    import httpx
     from web_agent.config import AppConfig
     from web_agent.web_fetcher import WebFetcher
 
     fetcher = WebFetcher(MagicMock(), AppConfig())
-    assert await fetcher._cookies_for_session(None) == {}
+    jar = await fetcher._cookies_for_session(None, "https://x.com")
+    assert isinstance(jar, httpx.Cookies)
+    assert {c.name for c in jar.jar} == set()
 
 
 @pytest.mark.asyncio
 async def test_cookies_for_session_returns_empty_on_get_failure():
+    """v1.6.5: empty jar on session lookup failure (never raises)."""
+    import httpx
     from web_agent.config import AppConfig
     from web_agent.web_fetcher import WebFetcher
 
     sessions = MagicMock()
     sessions.get = MagicMock(side_effect=KeyError("no such session"))
     fetcher = WebFetcher(MagicMock(), AppConfig(), sessions=sessions)
-    assert await fetcher._cookies_for_session("missing") == {}
+    jar = await fetcher._cookies_for_session("missing", "https://x.com")
+    assert isinstance(jar, httpx.Cookies)
+    assert {c.name for c in jar.jar} == set()

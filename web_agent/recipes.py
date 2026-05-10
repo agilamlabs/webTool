@@ -397,12 +397,32 @@ class Recipes:
                 candidates.append(url)
 
         if not candidates:
-            # Fallback: any download-looking URL (any of our known download extensions)
+            # Fallback 1: any download-looking URL (any known download extension)
             candidates = [
                 r.url
                 for r in search_resp.results
                 if _is_download_url(r.url) and check_domain_allowed(r.url, self._config.safety)
             ]
+
+        if not candidates and self._config.safety.probe_binary_urls:
+            # Fallback 2 (NEW in v1.6.5): HEAD-probe extensionless URLs.
+            # Recovers regulator dashboards / asset-portal URLs whose
+            # path lacks an extension but whose Content-Type indicates
+            # a binary document. Only one HEAD per result; we stop on
+            # the first 'binary' classification.
+            for r in search_resp.results:
+                if not check_domain_allowed(r.url, self._config.safety):
+                    continue
+                if self._url_extension(r.url):
+                    continue  # already considered in Tier 1/2
+                classification = await self._fetcher.classify_url(r.url, session_id=session_id)
+                if classification == "binary":
+                    logger.info(
+                        "Extensionless URL routed to download via HEAD probe: {url}",
+                        url=r.url,
+                    )
+                    candidates.append(r.url)
+                    break
 
         if not candidates:
             return DownloadResult(
