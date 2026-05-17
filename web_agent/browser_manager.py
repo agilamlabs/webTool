@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 from playwright.async_api import (
@@ -24,12 +24,19 @@ from playwright_stealth import Stealth
 from .config import AppConfig
 from .utils import get_random_user_agent, safe_join_path
 
+if TYPE_CHECKING:  # pragma: no cover -- avoid runtime import cycle
+    from .network_collector import NetworkCollector
+
 
 class BrowserManager:
     """Manages a single Chromium browser instance with stealth anti-detection
     and a semaphore-bounded pool of browser contexts."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        network_collector: Optional[NetworkCollector] = None,
+    ) -> None:
         self._config = config
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -52,6 +59,14 @@ class BrowserManager:
         self._owned_profile_dir: bool = False
         self._cdp_endpoint: str | None = None
         self._cdp_port_resolved: int | None = None
+        # v1.6.8: shared NetworkCollector attached to every Page opened
+        # via new_page() (the ephemeral path). Sessions get the same
+        # collector via TabManager. None when the Agent didn't pass one
+        # in (older test scaffolding).
+        self._network_collector = network_collector
+        # v1.6.8: True after a successful connect_over_cdp -- changes
+        # stop() to disconnect-without-killing-process.
+        self._is_remote_cdp: bool = False
 
     def _resolve_profile_dir(self) -> Path:
         """Resolve the effective user-data-dir for isolation_mode.
@@ -150,6 +165,37 @@ class BrowserManager:
                 return
 
             bcfg = self._config.browser
+
+            # v1.6.8 remote_cdp short-circuit: skip profile resolution and
+            # launch args entirely -- we're connecting to an already-running
+            # browser, not launching one. The config validator has already
+            # confirmed remote_cdp_url is a loopback ws:// endpoint.
+            if bcfg.backend == "remote_cdp":
+                try:
+                    self._pw_cm = self._stealth.use_async(async_playwright())
+                    self._playwright = await self._pw_cm.__aenter__()
+                    assert bcfg.remote_cdp_url is not None  # validator guarantees
+                    self._browser = await self._playwright.chromium.connect_over_cdp(
+                        bcfg.remote_cdp_url
+                    )
+                    self._is_remote_cdp = True
+                    self._started = True
+                    logger.info(
+                        "Connected to remote CDP browser: {u}",
+                        u=bcfg.remote_cdp_url,
+                    )
+                    return
+                except Exception as exc:
+                    if self._pw_cm is not None:
+                        with suppress(Exception):
+                            await self._pw_cm.__aexit__(None, None, None)
+                    self._pw_cm = None
+                    self._playwright = None
+                    self._browser = None
+                    self._is_remote_cdp = False
+                    raise BrowserError(
+                        f"Failed to connect to remote CDP at {bcfg.remote_cdp_url}: {exc}"
+                    ) from exc
 
             # Resolve profile dir BEFORE launch so a failure to create it
             # surfaces as ConfigError-like behavior, not BrowserError.
@@ -260,13 +306,25 @@ class BrowserManager:
         )
 
     async def stop(self) -> None:
-        """Close the browser and Playwright. Idempotent under concurrent calls."""
+        """Close the browser and Playwright. Idempotent under concurrent calls.
+
+        v1.6.8: when the backend is ``remote_cdp``, ``browser.close()``
+        disconnects the Playwright client without killing the remote
+        Chromium process (per Playwright docs). This is the intended
+        behaviour for cloud-browser / browser-farm callers.
+        """
         async with self._lifecycle_lock:
             if self._browser:
                 try:
+                    # close() on a connect_over_cdp browser is a disconnect.
+                    # On a locally-launched browser it terminates the process.
                     await self._browser.close()
                 except Exception as exc:
-                    logger.warning("Error closing browser: {e}", e=exc)
+                    logger.warning(
+                        "Error {action}: {e}",
+                        action="disconnecting remote CDP" if self._is_remote_cdp else "closing browser",
+                        e=exc,
+                    )
                 self._browser = None
             if self._pw_cm:
                 try:
@@ -277,6 +335,7 @@ class BrowserManager:
                 self._pw_cm = None
             # v1.6.6: clean up the ephemeral profile we created in start()
             # (only when WE created it -- named profiles are user-owned).
+            # remote_cdp never owns a profile so this branch is a no-op for it.
             if (
                 self._owned_profile_dir
                 and self._config.browser.cleanup_on_exit
@@ -287,8 +346,21 @@ class BrowserManager:
             self._owned_profile_dir = False
             self._cdp_endpoint = None
             self._cdp_port_resolved = None
+            self._is_remote_cdp = False
             self._started = False
             logger.info("Browser closed")
+
+    def get_remote_cdp_url(self) -> str | None:
+        """v1.6.8: return the remote_cdp ws:// URL we connected to.
+
+        Returns the configured ``BrowserConfig.remote_cdp_url`` when the
+        backend is ``remote_cdp`` AND ``start()`` succeeded. Returns None
+        for the ``playwright`` and ``cdp_owned`` backends, and before
+        ``start()`` completes.
+        """
+        if self._is_remote_cdp:
+            return self._config.browser.remote_cdp_url
+        return None
 
     async def _build_context(
         self,
@@ -391,6 +463,11 @@ class BrowserManager:
         """Convenience: acquire context -> open page -> yield -> cleanup."""
         async with self.new_context(user_agent=user_agent, block_resources=block_resources) as ctx:
             page = await ctx.new_page()
+            # v1.6.8: attach network capture (no-op when both diagnostic
+            # switches are off). Done here so ephemeral fetches benefit
+            # from network/api/download observability when enabled.
+            if self._network_collector is not None:
+                self._network_collector.attach(page)
             try:
                 yield page
             finally:

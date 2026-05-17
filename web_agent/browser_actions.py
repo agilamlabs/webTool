@@ -219,11 +219,22 @@ class BrowserActions:
         config: AppConfig,
         sessions: Optional[SessionManager] = None,
         debug: Optional[DebugCapture] = None,
+        network_collector: Optional[Any] = None,
+        trace_recorder: Optional[Any] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
         self._sessions = sessions
         self._debug = debug or DebugCapture(config)
+        # v1.6.8: shared NetworkCollector. When set and capture is on,
+        # execute_sequence and take_screenshot copy the per-Page events
+        # onto their results. None when no Agent provided one (older test
+        # scaffolding).
+        self._network_collector = network_collector
+        # v1.6.8: shared SessionTraceRecorder. When set and trace_enabled,
+        # execute_sequence appends a JSONL entry per action under
+        # diagnostics.trace_dir, keyed by session_id.
+        self._trace_recorder = trace_recorder
 
     # ------------------------------------------------------------------
     # Public API
@@ -313,6 +324,8 @@ class BrowserActions:
         succeeded = 0
         failed = 0
         all_artifacts: list[str] = []
+        # v1.6.8: optional per-action verification screenshots.
+        verification_screenshots: list[str] = []
 
         # Per-sequence dialog state (thread-safe - not shared across sequences)
         dialog_state = _DialogState()
@@ -334,6 +347,12 @@ class BrowserActions:
         page = None
         ctx_mgr = None
         owner = "ephemeral"
+        # v1.6.8: bind early so the except path / final return doesn't
+        # see an UnboundLocalError when an exception fires before the
+        # success-snapshot line inside the try.
+        net_events: list = []
+        api_cands: list[str] = []
+        dl_intents: list[str] = []
 
         try:
             if session_id and self._sessions is not None:
@@ -360,9 +379,17 @@ class BrowserActions:
                     # was closed externally. Fall back to opening a new page.
                     page = await ctx.new_page()
                     owner = "session_ephemeral"
+                    # v1.6.8: attach network capture to the fallback page.
+                    # The persistent tab path went through TabManager which
+                    # already attached on register_initial_page; this branch
+                    # bypasses TabManager so we must attach manually.
+                    if self._network_collector is not None:
+                        self._network_collector.attach(page)
             else:
                 ctx_mgr = self._bm.new_page(block_resources=False)
                 page = await ctx_mgr.__aenter__()
+                # BrowserManager.new_page() already attaches the collector
+                # before yielding.
 
             # All branches above set ``page``; mypy can't follow the
             # cross-branch reassignment so we narrow here.
@@ -391,6 +418,38 @@ class BrowserActions:
                     succeeded += 1
                 else:
                     failed += 1
+
+                # v1.6.8: post-action verification screenshot. Best-effort
+                # only -- failures log at DEBUG and never fail the sequence.
+                if (
+                    self._config.diagnostics.screenshot_after_action
+                    and result.status == ActionStatus.SUCCESS
+                ):
+                    vshot = await self._capture_verification_screenshot(
+                        page, action_index=len(results) - 1, cid=cid
+                    )
+                    if vshot:
+                        verification_screenshots.append(vshot)
+
+                # v1.6.8: per-action trace recording. Off by default; only
+                # active when DiagnosticsConfig.trace_enabled and a
+                # session_id is known (replay requires session context).
+                if (
+                    session_id
+                    and self._trace_recorder is not None
+                    and self._trace_recorder.enabled
+                ):
+                    with contextlib.suppress(Exception):
+                        await self._trace_recorder.record(
+                            session_id=session_id,
+                            method=f"action.{action_input.action}",
+                            args=action_input.model_dump(
+                                exclude_none=True, exclude={"tab_id"}
+                            ),
+                            status=result.status.value,
+                            elapsed_ms=result.duration_ms,
+                            url=url,
+                        )
 
                 # Per-action URL-drift check: detect when an innocuous-looking
                 # action (link click, form submit, JS-driven nav) lands on a
@@ -448,6 +507,16 @@ class BrowserActions:
                         selector=_selector_repr(getattr(remaining, "selector", None)),
                     )
                 )
+            # v1.6.8: snapshot network events / api_candidates / download
+            # intents BEFORE the page is closed. The deques live in a
+            # WeakKeyDictionary so once the Page is GC'd the data is gone.
+            # Captured here (inside try) so the closer-than-finally locality
+            # makes the lifecycle obvious. The vars were initialised before
+            # the try block so an early exception still leaves them bound.
+            if self._network_collector is not None and page is not None:
+                net_events = self._network_collector.events_for(page)
+                api_cands = self._network_collector.api_candidates_for(page)
+                dl_intents = self._network_collector.download_intents_for(page)
         finally:
             # v1.6.6: only close pages WE created. Persistent session tabs
             # outlive sequences so subsequent interact() calls share state.
@@ -468,6 +537,10 @@ class BrowserActions:
             total_time_ms=elapsed,
             correlation_id=cid,
             debug_artifacts=all_artifacts,
+            network_events=net_events,
+            api_candidates=api_cands,
+            download_candidates=dl_intents,
+            verification_screenshots=verification_screenshots,
         )
 
     async def execute_action(self, page: Page, action_input: Action) -> ActionResult:
@@ -524,6 +597,39 @@ class BrowserActions:
                 error_message=str(e),
                 debug_artifacts=artifacts,
             )
+
+    async def _capture_verification_screenshot(
+        self,
+        page: Page,
+        action_index: int,
+        cid: Optional[str],
+    ) -> Optional[str]:
+        """v1.6.8: take a best-effort PNG screenshot after a successful action.
+
+        File name: ``verify-<correlation_id>-<index>.png`` under
+        ``automation.screenshot_dir``. Failure logs at DEBUG and returns
+        None -- this method NEVER raises and never fails the sequence.
+
+        Path goes through ``safe_join_path`` so even though we construct
+        the filename ourselves, a malicious correlation_id (shouldn't be
+        possible -- they're UUIDs -- but defensive) cannot escape the
+        screenshot dir.
+        """
+        try:
+            ss_dir = Path(self._config.automation.screenshot_dir)
+            ss_dir.mkdir(parents=True, exist_ok=True)
+            safe_cid = (cid or "no-cid").replace("/", "_").replace("\\", "_")
+            fname = f"verify-{safe_cid}-{action_index:03d}.png"
+            try:
+                resolved = safe_join_path(ss_dir, fname)
+            except ValueError as exc:
+                logger.warning("Rejected verification screenshot path: {e}", e=exc)
+                return None
+            await page.screenshot(path=str(resolved), full_page=False, type="png")
+            return str(resolved)
+        except Exception as exc:
+            logger.debug("Verification screenshot failed: {e}", e=exc)
+            return None
 
     async def take_screenshot(
         self,

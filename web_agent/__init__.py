@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.7"
+__version__ = "1.6.8"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -52,6 +52,7 @@ from .config import (
     BrowserConfig,
     CacheConfig,
     DebugConfig,
+    DiagnosticsConfig,
     DownloadConfig,
     ExtractionConfig,
     FetchConfig,
@@ -98,6 +99,7 @@ from .models import (
     FormFilterSpec,
     IframeClickInput,
     LocatorSpec,
+    NetworkEvent,
     ObserveResult,
     PressKeyInput,
     ResearchResult,
@@ -117,6 +119,7 @@ from .models import (
     TypeTextInput,
     UploadFileInput,
 )
+from .network_collector import NetworkCollector
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
 from .robots import RobotsChecker
@@ -126,6 +129,7 @@ from .search_providers import (
     SearchProvider,
     SearXNGProvider,
 )
+from .trace_recorder import SessionTraceRecorder
 from .utils import BudgetTracker, RetryPolicy, get_retry_policy
 
 __all__ = [
@@ -141,6 +145,7 @@ __all__ = [
     "BrowserConfig",
     "CacheConfig",
     "DebugConfig",
+    "DiagnosticsConfig",
     "DownloadConfig",
     "ExtractionConfig",
     "FetchConfig",
@@ -204,6 +209,8 @@ __all__ = [
     "FormFilterSpec",
     "IframeClickInput",
     "LocatorSpec",
+    "NetworkCollector",
+    "NetworkEvent",
     "ObserveResult",
     "PressKeyInput",
     "ResearchResult",
@@ -212,6 +219,7 @@ __all__ = [
     "SearchResultItem",
     "SelectorLike",
     "SessionInfo",
+    "SessionTraceRecorder",
     "ShadowDomClickInput",
     "SkillApplicationResult",
     "SkillInputSpec",

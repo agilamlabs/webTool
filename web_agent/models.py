@@ -50,6 +50,64 @@ class FetchStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+class NetworkEvent(BaseModel):
+    """v1.6.8: a single Playwright network event captured during a page session.
+
+    Surfaced on ``FetchResult.network_events`` and
+    ``ActionSequenceResult.network_events`` when
+    ``DiagnosticsConfig.capture_network=True``. The collector lives in
+    ``web_agent.network_collector.NetworkCollector`` and writes events
+    via the ``page.on('request' | 'response' | 'requestfailed')`` hooks.
+    """
+
+    event_type: Literal["request", "response", "requestfailed"]
+    url: str
+    method: str = Field(default="GET")
+    resource_type: str = Field(
+        default="",
+        description=(
+            "Playwright ``request.resource_type``: xhr | fetch | document | "
+            "script | image | font | stylesheet | media | websocket | ..."
+        ),
+    )
+    status_code: Optional[int] = Field(
+        default=None,
+        description="HTTP status code (response events only).",
+    )
+    content_type: Optional[str] = Field(
+        default=None,
+        description="Response Content-Type header (response events only).",
+    )
+    request_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Request headers. Populated only when "
+            "``DiagnosticsConfig.include_request_headers=True`` because "
+            "Authorization / Cookie values are commonly sensitive."
+        ),
+    )
+    response_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Response headers. Populated only when "
+            "``DiagnosticsConfig.include_response_headers=True``."
+        ),
+    )
+    timing_ms: float = Field(
+        default=0.0,
+        description="Approximate timing (request->response) when measurable, else 0.",
+    )
+    failure_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Playwright failure message (requestfailed events only) -- "
+            "e.g. ``net::ERR_NAME_NOT_RESOLVED``."
+        ),
+    )
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    correlation_id: Optional[str] = Field(default=None)
+
+
 class FetchResult(BaseModel):
     """Result of fetching a URL, before content extraction."""
 
@@ -82,6 +140,32 @@ class FetchResult(BaseModel):
     from_cache: bool = Field(
         default=False,
         description="True if this fetch was served from the local cache.",
+    )
+    # v1.6.8: network diagnostics (populated only when
+    # DiagnosticsConfig.capture_network=True / capture_download_intents=True)
+    network_events: list[NetworkEvent] = Field(
+        default_factory=list,
+        description=(
+            "Per-Page network events captured during the fetch. Empty unless "
+            "``DiagnosticsConfig.capture_network=True``."
+        ),
+    )
+    api_candidates: list[str] = Field(
+        default_factory=list,
+        description=(
+            "URLs of XHR/fetch responses with JSON content-type, derived from "
+            "``network_events``. De-duplicated, order-preserving."
+        ),
+    )
+    download_candidates_runtime: list[str] = Field(
+        default_factory=list,
+        description=(
+            "URLs the page tried to download during this fetch (via "
+            "``page.on('download')`` notification). Empty unless "
+            "``DiagnosticsConfig.capture_download_intents=True``. Named "
+            "``_runtime`` to disambiguate from ``AgentResult.download_candidates`` "
+            "(search-derived)."
+        ),
     )
 
 
@@ -727,6 +811,37 @@ class ActionSequenceResult(BaseModel):
     total_time_ms: float = Field(default=0.0)
     correlation_id: Optional[str] = Field(default=None)
     debug_artifacts: list[str] = Field(default_factory=list)
+    # v1.6.8: network diagnostics (populated only when
+    # DiagnosticsConfig.capture_network=True / capture_download_intents=True)
+    network_events: list[NetworkEvent] = Field(
+        default_factory=list,
+        description=(
+            "Per-Page network events captured during the sequence. Empty "
+            "unless ``DiagnosticsConfig.capture_network=True``."
+        ),
+    )
+    api_candidates: list[str] = Field(
+        default_factory=list,
+        description=(
+            "XHR/fetch JSON response URLs observed during the sequence. "
+            "Derived from ``network_events``."
+        ),
+    )
+    download_candidates: list[str] = Field(
+        default_factory=list,
+        description=(
+            "URLs the page tried to download via ``page.on('download')``. "
+            "Empty unless ``DiagnosticsConfig.capture_download_intents=True``."
+        ),
+    )
+    verification_screenshots: list[str] = Field(
+        default_factory=list,
+        description=(
+            "v1.6.8: one PNG path per successful action when "
+            "``DiagnosticsConfig.screenshot_after_action=True``. May be "
+            "shorter than ``results`` (failed actions skip the screenshot)."
+        ),
+    )
 
 
 class ScreenshotResult(BaseModel):

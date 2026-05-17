@@ -242,8 +242,26 @@ class Agent:
 
     def __init__(self, config: AppConfig | None = None) -> None:
         self._config = config or AppConfig()
-        self._bm = BrowserManager(self._config)
-        self._sessions = SessionManager(self._bm, self._config)
+        # v1.6.8: NetworkCollector is created first so every subsystem
+        # below can pass it down to its Page handlers. The collector is
+        # a pure data sink -- when both capture switches are False (the
+        # default), attach() is a no-op and no listeners are registered.
+        from .network_collector import NetworkCollector
+
+        self._network_collector = NetworkCollector(self._config.diagnostics)
+        # v1.6.8: SessionTraceRecorder writes per-session JSONL action
+        # traces under diagnostics.trace_dir. Disabled by default.
+        from .trace_recorder import SessionTraceRecorder
+
+        self._trace_recorder = SessionTraceRecorder(
+            self._config.diagnostics, self._config.base_dir
+        )
+        self._bm = BrowserManager(
+            self._config, network_collector=self._network_collector
+        )
+        self._sessions = SessionManager(
+            self._bm, self._config, network_collector=self._network_collector
+        )
         self._debug = DebugCapture(self._config)
 
         # Politeness layer: per-host rate gate + robots.txt checker.
@@ -296,6 +314,7 @@ class Agent:
             rate_limiter=self._rate_limiter,
             robots=self._robots,
             cache=self._cache,
+            network_collector=self._network_collector,
         )
         self._extractor = ContentExtractor(self._config)
         self._downloader = Downloader(
@@ -305,9 +324,15 @@ class Agent:
             debug=self._debug,
             rate_limiter=self._rate_limiter,
             robots=self._robots,
+            network_collector=self._network_collector,
         )
         self._actions = BrowserActions(
-            self._bm, self._config, sessions=self._sessions, debug=self._debug
+            self._bm,
+            self._config,
+            sessions=self._sessions,
+            debug=self._debug,
+            network_collector=self._network_collector,
+            trace_recorder=self._trace_recorder,
         )
         self._recipes = Recipes(
             self._search,
@@ -1507,6 +1532,100 @@ class Agent:
             )
             result.correlation_id = cid
             return result
+
+    # ------------------------------------------------------------------
+    # v1.6.8 Diagnostics + Replay + Remote CDP
+    # ------------------------------------------------------------------
+
+    def get_remote_cdp_url(self) -> str | None:
+        """v1.6.8: return the remote_cdp ws:// URL we connected to, or None.
+
+        Returns the configured ``BrowserConfig.remote_cdp_url`` after a
+        successful ``connect_over_cdp`` start. Returns None for the
+        ``playwright`` and ``cdp_owned`` backends and before the Agent
+        is entered. Mirror of :meth:`get_cdp_endpoint` -- the two are
+        mutually exclusive (config validator rejects both).
+        """
+        return self._bm.get_remote_cdp_url()
+
+    def list_traces(self) -> list[str]:
+        """v1.6.8: session_ids of replay traces under ``diagnostics.trace_dir``.
+
+        Returns an empty list when tracing was never enabled. Use the
+        returned id with :meth:`replay_trace` to re-run a session.
+        """
+        return self._trace_recorder.list_traces()
+
+    async def replay_trace(self, trace_file: str | Path) -> ActionSequenceResult:
+        """v1.6.8: re-execute the action list recorded in *trace_file*.
+
+        Reconstructs ``Action`` discriminated-union entries from the JSONL
+        log written during a previous live sequence, then dispatches them
+        against a fresh ephemeral page. Network events / verification
+        screenshots are NOT replayed (they were observed, not directed).
+
+        The starting URL is taken from the first entry that includes a
+        ``url`` field. If no entry has one (e.g. older traces), the
+        first action's ``url`` attribute is used. If neither is present,
+        raises ValueError.
+
+        Args:
+            trace_file: Path to a ``<session_id>.jsonl`` trace file.
+
+        Returns:
+            ``ActionSequenceResult`` from the replay run. ``correlation_id``
+            is fresh -- the replay has its own audit identity.
+
+        Raises:
+            FileNotFoundError: trace_file does not exist.
+            ValueError: trace has no replayable action entries or no URL.
+        """
+        from pydantic import TypeAdapter
+
+        from .models import Action
+
+        async with self._call_scope(
+            "replay_trace", {"trace_file": str(trace_file)}
+        ) as cid:
+            entries = self._trace_recorder.load_entries(trace_file)
+            # Only entries whose method starts with "action." replay cleanly.
+            # Other (future) entry types like "scope.start" are skipped.
+            action_entries = [
+                e for e in entries if str(e.get("method", "")).startswith("action.")
+            ]
+            if not action_entries:
+                raise ValueError(
+                    f"Trace {trace_file} has no replayable action entries"
+                )
+            start_url: str | None = None
+            for e in entries:
+                if e.get("url"):
+                    start_url = str(e["url"])
+                    break
+            action_dicts: list[dict[str, Any]] = []
+            for e in action_entries:
+                args = dict(e.get("args") or {})
+                # Rebuild the discriminator -- audit args dropped it during
+                # exclude=. The method tail IS the action name.
+                args["action"] = str(e["method"]).removeprefix("action.")
+                action_dicts.append(args)
+            adapter = TypeAdapter(list[Action])
+            actions = adapter.validate_python(action_dicts)
+            if start_url is None:
+                # Fall back to the first action's `url` attribute if any.
+                start_url = getattr(actions[0], "url", None)
+            if not start_url:
+                raise ValueError(
+                    f"Trace {trace_file} lacks a starting URL "
+                    "(no entry with 'url' and first action has no url field)"
+                )
+            logger.info(
+                "Replaying {n} actions from {p} (cid={cid})",
+                n=len(actions),
+                p=trace_file,
+                cid=cid,
+            )
+            return await self._actions.execute_sequence(start_url, actions)
 
     # ------------------------------------------------------------------
     # Output

@@ -16,7 +16,7 @@ Optional features:
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -186,6 +186,7 @@ class WebFetcher:
         rate_limiter: Optional[RateLimiter] = None,
         robots: Optional[RobotsChecker] = None,
         cache: Optional[Cache] = None,
+        network_collector: Optional[Any] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
@@ -194,6 +195,11 @@ class WebFetcher:
         self._rate_limiter = rate_limiter
         self._robots = robots
         self._cache = cache
+        # v1.6.8: shared NetworkCollector -- when set, fetch() copies the
+        # per-Page events into FetchResult.network_events / api_candidates /
+        # download_candidates_runtime on success. None when the Agent
+        # didn't provide one (older test scaffolding).
+        self._network_collector = network_collector
 
     async def fetch(
         self,
@@ -358,6 +364,13 @@ class WebFetcher:
                 ctx = self._sessions.get(session_id)
                 self._sessions.touch(session_id)
                 page = await ctx.new_page()
+                # v1.6.8: attach network capture (no-op when disabled). The
+                # SessionManager wires the collector into TabManager for
+                # session-owned tabs, but this `ctx.new_page()` call creates
+                # a one-off page outside TabManager's awareness, so we must
+                # attach explicitly here.
+                if self._network_collector is not None:
+                    self._network_collector.attach(page)
                 try:
                     return await self._navigate_and_extract(
                         page, url, debug_artifacts, wait_strategy
@@ -365,6 +378,8 @@ class WebFetcher:
                 finally:
                     await page.close()
             else:
+                # BrowserManager.new_page() already attaches the collector
+                # for ephemeral pages.
                 async with self._bm.new_page() as page:
                     return await self._navigate_and_extract(
                         page, url, debug_artifacts, wait_strategy
@@ -441,6 +456,18 @@ class WebFetcher:
 
             html = await page.content()
 
+            # v1.6.8: snapshot network events / api_candidates / download
+            # intents BEFORE the caller closes the Page. The deques live
+            # in a WeakKeyDictionary so a closed Page evicts them; we
+            # capture into lists now and let the result outlive the Page.
+            net_events: list = []
+            api_cands: list[str] = []
+            dl_intents: list[str] = []
+            if self._network_collector is not None:
+                net_events = self._network_collector.events_for(page)
+                api_cands = self._network_collector.api_candidates_for(page)
+                dl_intents = self._network_collector.download_intents_for(page)
+
             return FetchResult(
                 url=url,
                 final_url=final_url,
@@ -448,6 +475,9 @@ class WebFetcher:
                 status=FetchStatus.SUCCESS,
                 html=html,
                 debug_artifacts=debug_artifacts,
+                network_events=net_events,
+                api_candidates=api_cands,
+                download_candidates_runtime=dl_intents,
             )
         except Exception as exc:
             # Capture debug artifacts on any failure path before re-raising

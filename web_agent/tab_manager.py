@@ -21,13 +21,16 @@ from __future__ import annotations
 import asyncio
 import secrets
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from weakref import WeakKeyDictionary
 
 from loguru import logger
 from playwright.async_api import BrowserContext, Page
 
 from .models import TabInfo
+
+if TYPE_CHECKING:  # pragma: no cover -- avoid runtime import cycle
+    from .network_collector import NetworkCollector
 
 # Reserved tab_id for the initial page created at session-create time.
 INITIAL_TAB_ID = "main"
@@ -36,12 +39,20 @@ INITIAL_TAB_ID = "main"
 class TabManager:
     """Manages the tabs (Pages) for a single session's BrowserContext."""
 
-    def __init__(self, ctx: BrowserContext) -> None:
+    def __init__(
+        self,
+        ctx: BrowserContext,
+        network_collector: Optional[NetworkCollector] = None,
+    ) -> None:
         self._ctx = ctx
         self._tabs: dict[str, Page] = {}
         self._reverse: WeakKeyDictionary[Page, str] = WeakKeyDictionary()
         self._opened_at: dict[str, datetime] = {}
         self._current_tab_id: Optional[str] = None
+        # v1.6.8: optional NetworkCollector that auto-attaches to every
+        # Page this manager sees -- the registered popup hook below also
+        # routes through here so popups inherit network capture.
+        self._network_collector = network_collector
         # Serialize ops that mutate _tabs / _current_tab_id so concurrent
         # callers (e.g. parallel switch + close) don't race.
         self._lock = asyncio.Lock()
@@ -87,6 +98,10 @@ class TabManager:
         if already_closed:
             self._evict_on_close(tid)
             return
+        # v1.6.8: attach network capture to popups too. Off-by-default
+        # gating happens inside NetworkCollector.attach().
+        if self._network_collector is not None:
+            self._network_collector.attach(page)
         logger.debug("Tab auto-registered from popup: {tid}", tid=tid)
 
     def _evict_on_close(self, tab_id: str) -> None:
@@ -126,6 +141,9 @@ class TabManager:
             self._opened_at[tab_id] = datetime.now(timezone.utc)
             self._current_tab_id = tab_id
             page.on("close", lambda _p: self._evict_on_close(tab_id))
+        # v1.6.8: attach network capture (no-op when both switches off).
+        if self._network_collector is not None:
+            self._network_collector.attach(page)
         return tab_id
 
     # ------------------------------------------------------------------
@@ -145,6 +163,10 @@ class TabManager:
             self._opened_at[tid] = datetime.now(timezone.utc)
             self._current_tab_id = tid
             page.on("close", lambda _p: self._evict_on_close(tid))
+        # v1.6.8: attach network capture immediately after the page is
+        # created so we don't miss the first navigation's requests.
+        if self._network_collector is not None:
+            self._network_collector.attach(page)
         if url:
             try:
                 await page.goto(url)

@@ -1,5 +1,132 @@
 # Changelog
 
+## [1.6.8] - 2026-05-17
+
+### Diagnostics and Advanced Browser Intelligence (6 features)
+
+Turns webTool from a *successful* browser tool into an **explainable
+and debuggable** one. Per the upgrade doc, this is the slice that
+"makes webTool explainable and debuggable for complex dynamic
+websites." Every diagnostic surface is **off by default** -- existing
+callers see no behavior change.
+
+Test count 510 -> 574 (64 new tests across 6 new files
+`tests/test_v168_*.py`).
+
+#### Feature 1 -- Network Event Capture (Rank 7, P1)
+
+New ``NetworkCollector`` (``web_agent/network_collector.py``) attaches
+``page.on("request" | "response" | "requestfailed")`` to every Page the
+Agent creates. Storage uses ``WeakKeyDictionary[Page, deque]`` so closed
+Pages auto-evict. The deque ``maxlen`` enforces ``max_network_events``
+with O(1) eviction.
+
+* New ``NetworkEvent`` Pydantic model -- ``event_type``, ``url``,
+  ``method``, ``resource_type``, ``status_code``, ``content_type``,
+  ``request_headers``, ``response_headers``, ``timing_ms``,
+  ``failure_text``, ``occurred_at``, ``correlation_id``.
+* New ``FetchResult.network_events`` field + ``ActionSequenceResult.network_events``
+  field. Both default to ``[]``; populated only when capture is on.
+* Attachment sites: ``BrowserManager.new_page``, ``TabManager`` (initial
+  page + ``new_tab`` + popup hook), ``SessionManager``, ``WebFetcher``,
+  ``BrowserActions`` fallback page, ``Downloader``.
+* Foot-gun: request/response headers may contain Authorization / Cookie
+  values. ``include_request_headers`` / ``include_response_headers``
+  default False; opt in only.
+
+#### Feature 2 -- API Endpoint Candidate Discovery
+
+Derived from Feature 1. ``NetworkCollector.api_candidates_for(page)``
+filters captured events for ``resource_type ∈ {xhr,fetch}`` + JSON
+content-type, de-duplicated order-preserving. Surfaced as
+``FetchResult.api_candidates`` and ``ActionSequenceResult.api_candidates``.
+No new config -- piggybacks on ``capture_network``.
+
+#### Feature 3 -- Download Event Diagnostics
+
+Adds ``page.on("download")`` notification listener (separate from
+``downloader.py``'s explicit ``expect_download`` consumer). Captured
+URLs surface as ``FetchResult.download_candidates_runtime`` and
+``ActionSequenceResult.download_candidates``.
+
+* Foot-gun: ``page.on("download")`` triggers Chromium tmpfile creation.
+  When no ``expect_download`` consumer is active, the file would pile up
+  -- the listener calls ``download.delete()`` as a side-effect so long
+  sessions don't leak temp files.
+
+#### Feature 4 -- Post-Action Screenshot Verification
+
+New ``BrowserActions._capture_verification_screenshot`` writes
+``verify-<correlation_id>-<index>.png`` under
+``automation.screenshot_dir`` after each successful action when
+``DiagnosticsConfig.screenshot_after_action=True``. Best-effort: failure
+logs at DEBUG and never fails the sequence. Paths go through
+``safe_join_path`` (v1.6.4).
+
+* New ``ActionSequenceResult.verification_screenshots: list[str]``.
+
+#### Feature 5 -- Session Replay / Audit Traces
+
+New ``SessionTraceRecorder`` (``web_agent/trace_recorder.py``) writes
+one JSONL file per session under ``diagnostics.trace_dir``. Each line
+is ``{ts, ordinal, session_id, correlation_id, method, args, status,
+elapsed_ms, url}``. Distinct from ``AuditLogger`` (which is
+Agent-call-grained); recorders coexist.
+
+* 3 new ``Agent`` methods: ``replay_trace(file)``, ``list_traces()``,
+  ``get_remote_cdp_url()``.
+* New CLI subcommand: ``web-agent replay <trace_file>``.
+* Foot-gun: session_ids are validated against
+  ``^[A-Za-z0-9._-]+$`` before being used as filenames (path-traversal
+  defense in depth).
+
+#### Feature 6 -- Remote CDP Backend Abstraction (Rank 10, P2)
+
+Adds third ``BrowserConfig.backend`` literal ``"remote_cdp"`` +
+``remote_cdp_url`` field. ``BrowserManager.start()`` dispatches to
+``chromium.connect_over_cdp(remote_cdp_url)`` instead of ``launch()``.
+``stop()`` disconnects without killing the remote process (per
+Playwright's documented ``Browser.close()`` semantics under CDP).
+
+* Config validator enforces loopback-only URLs (same posture as v1.6.6
+  ``cdp_host``), ``ws://`` / ``wss://`` scheme, and rejects combinations
+  with ``isolation_mode=True`` / ``cdp_enabled=True``.
+* New ``Agent.get_remote_cdp_url()`` mirror of ``get_cdp_endpoint()``.
+* 3 new MCP tools: ``web_get_remote_cdp_url``, ``web_list_traces``,
+  ``web_replay_trace``.
+
+### New configuration
+
+```python
+class DiagnosticsConfig(BaseSettings):
+    capture_network: bool = False
+    max_network_events: int = 500  # bounded [1, 10000]
+    network_resource_types: list[str] = ["xhr", "fetch", "document"]
+    include_request_headers: bool = False
+    include_response_headers: bool = False
+    capture_download_intents: bool = False
+    screenshot_after_action: bool = False
+    trace_enabled: bool = False
+    trace_dir: str = "./.webtool-audit/traces"
+```
+
+Nested env vars via the existing ``WEB_AGENT_`` prefix +
+``env_nested_delimiter="__"``:
+``WEB_AGENT_DIAGNOSTICS__CAPTURE_NETWORK=true``.
+
+### Backward-compat notes
+
+* All new behavior is **off by default**. Existing configs boot
+  unchanged.
+* ``FetchResult`` / ``ActionSequenceResult`` field additions are purely
+  additive with ``default_factory=list``.
+* ``BrowserConfig.backend`` Literal widens from
+  ``Literal["playwright", "cdp_owned"]`` to
+  ``Literal["playwright", "cdp_owned", "remote_cdp"]``. Old values keep
+  working; the new value is opt-in.
+* No new core dependencies.
+* MCP tool count grows from ~46 to ~49.
+
 ## [1.6.7] - 2026-05-17
 
 ### Skills and Playbooks (5 features, browser-harness-inspired)
