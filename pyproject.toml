@@ -31,6 +31,9 @@ dependencies = [
     "httpx>=0.28.0",
     "mcp[cli]>=1.0.0",
     "ddgs>=9.0.0",
+    # v1.6.7: parses ".webtool-skills/<domain>/<skill>.md" frontmatter for
+    # the domain-skills registry. Pulls in PyYAML which is already a dep.
+    "python-frontmatter>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -57,6 +60,11 @@ binary = [
 
 [tool.setuptools.packages.find]
 include = ["web_agent*"]
+
+# v1.6.7: ship .md skill files alongside their __init__.py runners so
+# the SkillRegistry can read them from the installed package.
+[tool.setuptools.package-data]
+"web_agent.builtin_skills" = ["**/*.md"]
 
 [tool.setuptools.dynamic]
 version = {attr = "web_agent.__version__"}

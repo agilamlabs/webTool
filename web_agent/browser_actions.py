@@ -50,9 +50,11 @@ from .models import (
     ClickXYInput,
     DialogInput,
     DialogResponse,
+    DragAndDropInput,
     EvaluateInput,
     FillInput,
     HoverInput,
+    IframeClickInput,
     KeyboardInput,
     LocatorSpec,
     NavigateDirection,
@@ -66,13 +68,15 @@ from .models import (
     ScrollInput,
     SelectInput,
     SelectorLike,
+    ShadowDomClickInput,
     TypeInput,
     TypeTextInput,
+    UploadFileInput,
     WaitInput,
     WaitTarget,
 )
 from .session_manager import SessionManager
-from .utils import check_domain_allowed, safe_join_path
+from .utils import _is_cross_platform_absolute, check_domain_allowed, safe_join_path
 
 # Heuristic CSS patterns that look like submit buttons (used by safe_mode)
 _SUBMIT_BUTTON_HINTS = (
@@ -1027,6 +1031,322 @@ class BrowserActions:
         )
 
     # ------------------------------------------------------------------
+    # v1.6.7 Interaction Library handlers (Feature 5)
+    # ------------------------------------------------------------------
+
+    def _validate_upload_path(self, raw_path: str) -> str:
+        """Resolve and validate an upload path against SafetyConfig.
+
+        By default upload_file accepts only paths under
+        ``download.download_dir`` to prevent prompt-injection
+        exfiltration of arbitrary local files (e.g. ``~/.ssh/id_rsa``).
+        Set ``safety.allow_upload_outside_download_dir=True`` to widen.
+
+        Uses ``_is_cross_platform_absolute`` (v1.6.4 helper) so behavior
+        is consistent on Windows and POSIX -- ``Path.is_absolute()`` is
+        OS-dependent and rejects ``/foo`` on Windows.
+
+        Returns the resolved absolute path string. Raises
+        SafeModeBlockedError on any safety violation; the caller
+        surfaces this as ActionResult FAILED rather than crashing.
+        """
+        from .exceptions import SafeModeBlockedError
+
+        if _is_cross_platform_absolute(raw_path):
+            resolved = Path(raw_path).resolve()
+        else:
+            base = Path(self._config.download.download_dir).resolve()
+            try:
+                resolved = safe_join_path(base, raw_path)
+            except ValueError as exc:
+                raise SafeModeBlockedError(
+                    f"upload_file: invalid relative path {raw_path!r}: {exc}",
+                    operation="upload_file",
+                ) from exc
+
+        # Existence check first -- surfaces the most actionable error to
+        # the caller. A path that doesn't exist can't be exfiltrated, so
+        # we don't lose any safety guarantee by checking it before the
+        # download-dir containment check.
+        if not resolved.exists():
+            raise SafeModeBlockedError(
+                f"upload_file: path does not exist: {resolved}",
+                operation="upload_file",
+            )
+
+        if not self._config.safety.allow_upload_outside_download_dir:
+            base = Path(self._config.download.download_dir).resolve()
+            try:
+                resolved.relative_to(base)
+            except ValueError as exc:
+                raise SafeModeBlockedError(
+                    f"upload_file: path {resolved} is outside download_dir "
+                    f"{base}. Set safety.allow_upload_outside_download_dir=True "
+                    f"to permit arbitrary local files.",
+                    operation="upload_file",
+                ) from exc
+
+        return str(resolved)
+
+    async def _do_upload_file(self, page: Page, action: UploadFileInput) -> ActionResult:
+        """Upload one or more files to a file input element.
+
+        Path safety: each path is validated against
+        ``download.download_dir`` unless the upload-outside-download-dir
+        flag is enabled (see :meth:`_validate_upload_path`).
+        """
+        from .exceptions import SafeModeBlockedError
+
+        try:
+            resolved_paths = [self._validate_upload_path(p) for p in action.paths]
+        except SafeModeBlockedError as exc:
+            return ActionResult(
+                action=ActionType.UPLOAD_FILE,
+                status=ActionStatus.FAILED,
+                selector=_selector_repr(action.selector),
+                error_message=str(exc),
+            )
+
+        loc = _resolve_locator(page, action.selector)
+        await loc.set_input_files(resolved_paths)
+        logger.debug("Uploaded {n} file(s) to {sel}", n=len(resolved_paths), sel=action.selector)
+        return ActionResult(
+            action=ActionType.UPLOAD_FILE,
+            status=ActionStatus.SUCCESS,
+            selector=_selector_repr(action.selector),
+            data={"paths": resolved_paths},
+        )
+
+    async def _do_iframe_click(self, page: Page, action: IframeClickInput) -> ActionResult:
+        """Click a target inside an iframe via Playwright's frame_locator.
+
+        ``frame_locator`` returns a chainable scoped to the iframe;
+        subsequent ``locator(...).click()`` calls operate inside it.
+        Works for same-origin iframes. Cross-origin iframes raise --
+        coord-click is the fallback for those.
+        """
+        frame = page.frame_locator(action.iframe_selector)
+        target = frame.locator(action.inner_selector)
+        if action.timeout is not None:
+            await target.click(timeout=action.timeout)
+        else:
+            await target.click()
+        logger.debug(
+            "Clicked {inner} inside iframe {ifr}",
+            inner=action.inner_selector,
+            ifr=action.iframe_selector,
+        )
+        return ActionResult(
+            action=ActionType.IFRAME_CLICK,
+            status=ActionStatus.SUCCESS,
+            selector=f"{action.iframe_selector} >> {action.inner_selector}",
+            data={
+                "iframe_selector": action.iframe_selector,
+                "inner_selector": action.inner_selector,
+            },
+        )
+
+    async def _do_shadow_dom_click(
+        self, page: Page, action: ShadowDomClickInput
+    ) -> ActionResult:
+        """Click an element inside a shadow DOM tree.
+
+        Playwright auto-pierces shadow DOM for CSS selectors. The ``>>``
+        combinator chains a parent and a descendant locator -- we use
+        it here with ``host_selector >> inner_selector`` so callers can
+        compose pierce queries explicitly.
+        """
+        combined = f"{action.host_selector} >> {action.inner_selector}"
+        loc = page.locator(combined)
+        if action.timeout is not None:
+            await loc.click(timeout=action.timeout)
+        else:
+            await loc.click()
+        logger.debug("Shadow-DOM click via {sel}", sel=combined)
+        return ActionResult(
+            action=ActionType.SHADOW_DOM_CLICK,
+            status=ActionStatus.SUCCESS,
+            selector=combined,
+            data={
+                "host_selector": action.host_selector,
+                "inner_selector": action.inner_selector,
+            },
+        )
+
+    async def _do_drag_and_drop(self, page: Page, action: DragAndDropInput) -> ActionResult:
+        """Drag from one selector and drop on another.
+
+        Resolves both via _resolve_locator to honor semantic LocatorSpec
+        AND CSS-string selectors uniformly. Playwright's
+        ``page.drag_and_drop`` accepts only string selectors, so we use
+        the lower-level ``source.drag_to(target)`` API for LocatorSpec
+        compatibility.
+        """
+        source_loc = _resolve_locator(page, action.source)
+        target_loc = _resolve_locator(page, action.target)
+        if action.timeout is not None:
+            await source_loc.drag_to(target_loc, timeout=action.timeout)
+        else:
+            await source_loc.drag_to(target_loc)
+        logger.debug(
+            "Dragged {src} -> {tgt}", src=action.source, tgt=action.target
+        )
+        return ActionResult(
+            action=ActionType.DRAG_AND_DROP,
+            status=ActionStatus.SUCCESS,
+            data={
+                "source": _selector_repr(action.source),
+                "target": _selector_repr(action.target),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # v1.6.7 Top-level scroll_until_text / print_page_as_pdf
+    # ------------------------------------------------------------------
+
+    async def scroll_until_text(
+        self,
+        text: str,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+        max_scrolls: int = 10,
+        scroll_step: int = 800,
+    ) -> ActionResult:
+        """Scroll the page in `scroll_step`-px increments until ``text``
+        is present in document.body.innerText, or ``max_scrolls`` is
+        exhausted.
+
+        Useful for infinite-scroll feeds where the target row only
+        materializes after enough scrolling.
+        """
+        if self._sessions is None:
+            raise RuntimeError("scroll_until_text requires a SessionManager")
+        tab_mgr = self._sessions.get_tab_manager(session_id)
+        page = tab_mgr.get_or_current(tab_id)
+        if page is None:
+            raise ValueError(
+                f"Session {session_id!r} has no current tab. Open one first."
+            )
+        self._sessions.touch(session_id)
+
+        # Already on the page? Quick win.
+        try:
+            body = await page.evaluate("() => document.body ? document.body.innerText : ''")
+            if isinstance(body, str) and text in body:
+                return ActionResult(
+                    action=ActionType.SCROLL,
+                    status=ActionStatus.SUCCESS,
+                    data={"text": text, "scrolls_used": 0, "found": True},
+                )
+        except Exception:
+            pass
+
+        for i in range(max_scrolls):
+            try:
+                await page.mouse.wheel(0, scroll_step)
+                await page.wait_for_load_state("domcontentloaded", timeout=2000)
+            except Exception:
+                pass
+            try:
+                body = await page.evaluate("() => document.body ? document.body.innerText : ''")
+            except Exception:
+                continue
+            if isinstance(body, str) and text in body:
+                return ActionResult(
+                    action=ActionType.SCROLL,
+                    status=ActionStatus.SUCCESS,
+                    data={"text": text, "scrolls_used": i + 1, "found": True},
+                )
+
+        return ActionResult(
+            action=ActionType.SCROLL,
+            status=ActionStatus.FAILED,
+            data={"text": text, "scrolls_used": max_scrolls, "found": False},
+            error_message=f"Text {text!r} not found after {max_scrolls} scrolls",
+        )
+
+    async def print_page_as_pdf(
+        self,
+        url: Optional[str] = None,
+        output_path: Optional[str] = None,
+        *,
+        session_id: Optional[str] = None,
+        tab_id: Optional[str] = None,
+    ) -> ScreenshotResult:
+        """Render a page to PDF using Chromium's headless ``page.pdf()``.
+
+        Output path goes through ``safe_join_path`` against
+        ``automation.screenshot_dir`` -- PDFs land alongside screenshots.
+        Returns the same ``ScreenshotResult`` shape (path, dimensions
+        carry zero for PDF) for consistency.
+        """
+        cid = get_correlation_id()
+        safety = self._config.safety
+
+        # Resolve target page (session or ephemeral with url)
+        page: Optional[Page] = None
+        ctx_mgr_local = None
+        owner_mode = "ephemeral"
+        if session_id and self._sessions is not None:
+            tab_mgr = self._sessions.get_tab_manager(session_id)
+            page = tab_mgr.get_or_current(tab_id)
+            if page is None:
+                raise ValueError(
+                    f"Session {session_id!r} has no current tab. "
+                    f"Open one with agent.new_tab(url, session_id=...)."
+                )
+            owner_mode = "session_persistent"
+            self._sessions.touch(session_id)
+
+        try:
+            if page is None:
+                if not url:
+                    raise ValueError(
+                        "print_page_as_pdf() requires either session_id or url."
+                    )
+                if not check_domain_allowed(url, safety):
+                    host = urlparse(url).hostname or ""
+                    raise ValueError(f"Domain not allowed: {host}")
+                ctx_mgr_local = self._bm.new_page(block_resources=False)
+                page = await ctx_mgr_local.__aenter__()
+
+            assert page is not None
+            if url:
+                await page.goto(url, wait_until=self._config.fetch.wait_until)  # type: ignore[arg-type]
+                if not check_domain_allowed(page.url, safety):
+                    host = urlparse(page.url).hostname or ""
+                    raise ValueError(f"Page redirected to disallowed domain: {host}")
+
+            # Output path
+            shot_dir = Path(self._config.automation.screenshot_dir)
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            if output_path is None:
+                filename = f"page_{cid or 'anon'}_{int(time.time() * 1000)}.pdf"
+                resolved = safe_join_path(shot_dir, filename)
+            else:
+                p = Path(output_path)
+                resolved = p.resolve() if p.is_absolute() else safe_join_path(shot_dir, output_path)
+
+            await page.pdf(path=str(resolved))
+            # PDFs reuse ScreenshotResult; format is PNG (the closest enum
+            # we have today) -- callers identify PDFs via the .pdf suffix
+            # on ``path``. status=SUCCESS; size_bytes left at 0 to avoid an
+            # extra stat call.
+            return ScreenshotResult(
+                url=page.url,
+                path=str(resolved),
+                format=ScreenshotFormat.PNG,
+                size_bytes=0,
+                status=ActionStatus.SUCCESS,
+                correlation_id=cid,
+            )
+        finally:
+            if owner_mode == "ephemeral" and ctx_mgr_local is not None:
+                with contextlib.suppress(Exception):
+                    await ctx_mgr_local.__aexit__(None, None, None)
+
+    # ------------------------------------------------------------------
     # v1.6.6 Feature 5: observe mode
     # ------------------------------------------------------------------
 
@@ -1232,4 +1552,9 @@ class BrowserActions:
         ActionType.CLICK_XY: _do_click_xy,
         ActionType.TYPE_TEXT: _do_type_text,
         ActionType.PRESS_KEY: _do_press_key,
+        # v1.6.7 interaction-skill library (Feature 5)
+        ActionType.UPLOAD_FILE: _do_upload_file,
+        ActionType.IFRAME_CLICK: _do_iframe_click,
+        ActionType.SHADOW_DOM_CLICK: _do_shadow_dom_click,
+        ActionType.DRAG_AND_DROP: _do_drag_and_drop,
     }
