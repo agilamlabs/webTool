@@ -430,6 +430,12 @@ class SafetyConfig(BaseSettings):
     allow_downloads: bool = True
     allow_form_submit: bool = True
     block_private_ips: bool = True
+    # v1.6.7: upload-file safety. By default, ``UploadFileInput`` / the
+    # top-level ``Agent.upload_file`` accepts only paths under
+    # ``download.download_dir``. Without this fence, a prompt-injection
+    # could call ``upload_file(selector=..., paths=["~/.ssh/id_rsa"])``
+    # and exfiltrate arbitrary local files. Opt in to widen scope.
+    allow_upload_outside_download_dir: bool = False
 
     # Normalize URLs / mixed-case input down to bare hostnames before any
     # ``check_domain_allowed`` consultation. Catches the common foot-gun
@@ -538,6 +544,118 @@ class CacheConfig(BaseSettings):
     max_cache_mb: int = 100
 
 
+class SkillsConfig(BaseSettings):
+    """v1.6.7: Domain Skills registry.
+
+    A "skill" is a markdown file at
+    ``<skill_dir>/<domain>/<name>.md`` with YAML frontmatter
+    (name, domain, description, inputs, output_schema, runnable) plus
+    structured sections (Use case / Recommended flow / Known selectors
+    / Known traps). Skills make webTool accumulate reusable knowledge
+    about specific websites instead of rediscovering quirks every run.
+
+    Three skill directories with priority order:
+      ``builtin`` (lowest) < ``workspace`` < ``project`` (highest)
+
+    Bundled skills (under ``web_agent/builtin_skills/``) ship with a
+    Python runner and are dispatchable via
+    ``Agent.apply_domain_skill``. User markdown skills are
+    informational only unless the workspace mode allows adjacent
+    Python helpers.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the *project-tier* skill load -- when "
+            "False, ``skill_dirs`` are not scanned. Workspace and bundled "
+            "skills are governed by ``workspace.enabled`` and "
+            "``builtin_skills_enabled`` respectively, so "
+            "``Agent.get_domain_skills`` can still return entries from "
+            "those tiers when this flag is False."
+        ),
+    )
+    skill_dirs: list[str] = Field(
+        default_factory=lambda: ["./.webtool-skills"],
+        description=(
+            "Project skill directories (highest priority). Each entry is "
+            "resolved against ``AppConfig.base_dir`` when relative. The "
+            "first matching ``(domain, name)`` wins; later entries are "
+            "overrides."
+        ),
+    )
+    builtin_skills_enabled: bool = Field(
+        default=True,
+        description=(
+            "Include bundled skills shipped under "
+            "``web_agent/builtin_skills/``. Default True -- the bundled "
+            "skills are the only runnable skills in v1.6.7. Disable to "
+            "audit-only mode where only user-authored skills appear."
+        ),
+    )
+
+
+class WorkspaceConfig(BaseSettings):
+    """v1.6.7: Agent-editable workspace with safety modes.
+
+    A workspace is a directory the agent reads from and (in some
+    modes) writes to. Default layout::
+
+        .webtool-workspace/
+            domain-skills/    # user-authored markdown skills (auto-loaded)
+            notes/            # agent-authored free-text notes
+            helpers.py        # Python helpers (gated by mode)
+
+    Default ``enabled=False`` for safety: the agent must explicitly opt
+    in. When enabled, the default mode is ``markdown_skills_only`` --
+    the agent can read and write ``.md`` files but cannot execute
+    Python.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Master switch. When False, workspace is invisible to Agent.",
+    )
+    # NB: cannot be named ``path`` -- pydantic-settings on this BaseSettings
+    # subclass would pull from the ``PATH`` environment variable (a real,
+    # always-set foot-gun on every OS) before applying the field default.
+    workspace_dir: str = Field(
+        default="./.webtool-workspace",
+        description=(
+            "Workspace root. Resolved against ``AppConfig.base_dir`` when "
+            "relative. Created on first write if missing."
+        ),
+    )
+    mode: Literal[
+        "read_only",
+        "markdown_skills_only",
+        "reviewed_python_helpers",
+        "unsafe_python_helpers",
+    ] = Field(
+        default="markdown_skills_only",
+        description=(
+            "Safety mode for workspace writes. ``read_only`` blocks all "
+            "writes. ``markdown_skills_only`` (default) allows .md files "
+            "under domain-skills/ only. ``reviewed_python_helpers`` adds "
+            "helpers.py writes but execution requires explicit opt-in. "
+            "``unsafe_python_helpers`` removes all restrictions."
+        ),
+    )
+    audit_helper_usage: bool = Field(
+        default=True,
+        description="Log every workspace write to the audit log when audit is enabled.",
+    )
+    execute_helpers: bool = Field(
+        default=False,
+        description=(
+            "When mode is ``reviewed_python_helpers`` or "
+            "``unsafe_python_helpers``, controls whether ``helpers.py`` is "
+            "imported and made available to skills. Default False -- "
+            "writing helpers is allowed, executing them is a second opt-in."
+        ),
+    )
+
+
 class AppConfig(BaseSettings):
     """Top-level configuration for the web_agent toolkit.
 
@@ -593,6 +711,9 @@ class AppConfig(BaseSettings):
     debug: DebugConfig = Field(default_factory=DebugConfig)
     audit: AuditConfig = Field(default_factory=AuditConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    # v1.6.7: domain skills + agent-editable workspace
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     log_level: str = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")

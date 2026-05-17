@@ -141,6 +141,51 @@ async def run_observe(args: argparse.Namespace) -> None:
         print(obs.model_dump_json(indent=2))
 
 
+async def run_skills(args: argparse.Namespace) -> None:
+    """``skills list / show / apply`` -- inspect and run the SkillRegistry."""
+    config = _load_config(args)
+    setup_logging(config.log_level)
+
+    async with Agent(config) as agent:
+        if args.skills_subcommand == "list":
+            skills = agent.list_domain_skills()
+            if args.json:
+                import json as _json
+
+                print(
+                    _json.dumps(
+                        [s.model_dump(mode="json") for s in skills], indent=2
+                    )
+                )
+                return
+            for s in skills:
+                runner = "runnable" if s.runnable else "info-only"
+                print(f"  [{s.source:9}] {s.domain}/{s.name}  ({runner})")
+                print(f"      {s.description}")
+            print(f"\nTotal: {len(skills)} skill(s)")
+
+        elif args.skills_subcommand == "show":
+            matches = [s for s in agent.list_domain_skills() if s.domain == args.domain and s.name == args.name]
+            if not matches:
+                print(f"No skill found: {args.domain}/{args.name}")
+                raise SystemExit(1)
+            print(matches[0].model_dump_json(indent=2))
+
+        elif args.skills_subcommand == "apply":
+            inputs_raw = args.inputs or "{}"
+            try:
+                import json as _json
+
+                inputs = _json.loads(inputs_raw)
+            except Exception as exc:
+                print(f"--inputs is not valid JSON: {exc}")
+                raise SystemExit(1) from exc
+            result = await agent.apply_domain_skill(args.url, args.name, inputs)
+            print(result.model_dump_json(indent=2))
+            if not result.succeeded:
+                raise SystemExit(2)
+
+
 async def run_doctor(args: argparse.Namespace) -> None:
     """Run web_agent self-diagnostic and print the report."""
     # Doctor doesn't need a running Agent or Browser, but it does need
@@ -233,6 +278,31 @@ def main() -> None:
         "--aria", action="store_true", help="Include accessibility snapshot (may be large)"
     )
 
+    # v1.6.7: skills (Features 1-3)
+    sp_skills = subparsers.add_parser(
+        "skills", help="Inspect / run domain skills from the SkillRegistry"
+    )
+    sk_sub = sp_skills.add_subparsers(dest="skills_subcommand", required=True)
+    sp_skills_list = sk_sub.add_parser("list", help="List every registered skill")
+    sp_skills_list.add_argument("--json", action="store_true", help="Emit JSON")
+    sp_skills_show = sk_sub.add_parser(
+        "show", help="Print one skill's full metadata as JSON"
+    )
+    sp_skills_show.add_argument("domain", help="Skill domain, e.g. sec.gov")
+    sp_skills_show.add_argument("name", help="Skill name, e.g. filing_search")
+    sp_skills_apply = sk_sub.add_parser(
+        "apply", help="Run a bundled domain skill against a live URL"
+    )
+    sp_skills_apply.add_argument("name", help="Skill name")
+    sp_skills_apply.add_argument(
+        "--url", required=True, help="Target URL (domain must match the skill)"
+    )
+    sp_skills_apply.add_argument(
+        "--inputs",
+        default="{}",
+        help='Skill inputs as JSON, e.g. \'{"company":"Apple"}\'',
+    )
+
     # v1.6.6: doctor (Feature 6)
     sp_doctor = subparsers.add_parser(
         "doctor",
@@ -260,6 +330,7 @@ def main() -> None:
         "screenshot": run_screenshot,
         "observe": run_observe,
         "doctor": run_doctor,
+        "skills": run_skills,
     }
     asyncio.run(handler_map[args.command](args))
 

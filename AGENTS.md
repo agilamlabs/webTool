@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.6**
+- Latest version: **1.6.7**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -28,7 +28,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~450 tests; full suite must pass
+python -m pytest -v          # ~505 tests; full suite must pass
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -55,12 +55,15 @@ web_agent/             # The package. One module = one responsibility.
   web_fetcher.py       # WebFetcher.fetch / fetch_many / fetch_binary
   content_extractor.py # trafilatura -> bs4 -> raw, plus PDF / XLSX
   downloader.py        # 3-strategy file download with safety gates
-  browser_actions.py   # 15 action types incl. coord-click/type/press (v1.6.6)
+  browser_actions.py   # 19 action types incl. coord-click + iframe + shadow-DOM + upload + drag (v1.6.6 + v1.6.7)
   recipes.py           # search_and_open_best_result, find_and_download_file,
                        # web_research, fill_form_and_extract
   session_manager.py   # Persistent browser sessions (cookies, storage)
   tab_manager.py       # Per-session tab lifecycle (v1.6.6)
   doctor.py            # Self-diagnostic capability probes (v1.6.6)
+  domain_skills.py     # Domain skill registry + dispatcher (v1.6.7)
+  workspace.py         # Agent-editable workspace with mode gates (v1.6.7)
+  builtin_skills/      # Bundled domain skills (sec.gov / github.com / ec.europa.eu)
   cache.py             # DiskCache with TTL + LRU eviction (opt-in)
   audit.py             # JSONL audit log of every public Agent call (opt-in)
   rate_limiter.py      # Per-host token-bucket gate
@@ -146,6 +149,41 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.7 added
+
+Skills and Playbooks: webTool now accumulates reusable per-site
+knowledge instead of rediscovering quirks each run. Five features:
+
+**Domain skills (Ranks 1+2+3, P0)**
+- New `web_agent/domain_skills.py`: `SkillRegistry` loads markdown
+  files with YAML frontmatter from three tiers
+  (project > workspace > builtin). `agent.list_domain_skills() /
+  get_domain_skills(url) / apply_domain_skill(url, name, inputs)`.
+- New core dep: `python-frontmatter>=1.0.0`.
+- 3 bundled skills: `sec.gov/filing_search`,
+  `github.com/release_download`, `ec.europa.eu/document_search`. Each
+  ships with a Python runner; user markdown skills are info-only.
+
+**Workspace (Rank 9, P2)**
+- New `web_agent/workspace.py`: mode-gated read/write to
+  `.webtool-workspace/`. Modes: `read_only` /
+  `markdown_skills_only` (default) / `reviewed_python_helpers` /
+  `unsafe_python_helpers`. Workspace skills under
+  `domain-skills/` auto-load into the SkillRegistry.
+- Default: `workspace.enabled=False`. Opt-in for safety.
+
+**Interaction skill library (Rank 12, P2)**
+- 8 new top-level Agent methods: `handle_dialog`, `select_dropdown`,
+  `upload_file`, `drag_and_drop`, `scroll_until_text`,
+  `click_inside_iframe`, `click_shadow_dom`, `print_page_as_pdf`.
+- 4 new Action types: `UPLOAD_FILE`, `IFRAME_CLICK`,
+  `SHADOW_DOM_CLICK`, `DRAG_AND_DROP`.
+- Safety: `safety.allow_upload_outside_download_dir` (default
+  False) gates `upload_file` paths to the download dir.
+
+**Tests:** 51 new across 3 files (`tests/test_v167_*.py`). Total
+suite ~505, all green.
 
 ## What v1.6.6 added
 

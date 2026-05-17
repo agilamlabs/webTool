@@ -749,6 +749,231 @@ async def web_get_cdp_endpoint(ctx: Context) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# v1.6.7: Domain Skills (Features 1+2+3)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def list_domain_skills(ctx: Context) -> dict:
+    """List every domain skill registered with the Agent's SkillRegistry.
+
+    Skills come from three tiers (priority: project > workspace >
+    builtin). Returns both runnable bundled skills (those with a
+    Python runner) and informational-only user markdown skills.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    skills = agent.list_domain_skills()
+    return {
+        "count": len(skills),
+        "skills": [s.model_dump(mode="json") for s in skills],
+    }
+
+
+@mcp.tool()
+async def get_domain_skill(ctx: Context, url: str, name: str) -> dict:
+    """Get the parsed skill for a given (URL host, name) tuple.
+
+    Skills are looked up by host suffix match against ``url``. When
+    multiple skills match (e.g. nested domains), the most-specific
+    one (longest registered domain) is returned. Returns
+    ``{"skill": null}`` when no match.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    matches = agent.get_domain_skills(url)
+    # Filter by name
+    chosen = None
+    for s in matches:
+        if s.name == name and (chosen is None or len(s.domain) > len(chosen.domain)):
+            chosen = s
+    return {"skill": chosen.model_dump(mode="json") if chosen else None}
+
+
+@mcp.tool()
+async def apply_domain_skill(
+    ctx: Context,
+    url: str,
+    name: str,
+    inputs: Optional[dict] = None,
+) -> dict:
+    """Run a bundled domain skill against ``url`` with ``inputs``.
+
+    Only bundled (Python-backed) skills are dispatchable. User markdown
+    skills are informational; this tool raises ``SkillNotRunnableError``
+    for them -- callers should use ``get_domain_skill`` to read the
+    instructions and act on them with the standard Agent primitives.
+
+    Inputs are validated against the skill's frontmatter schema before
+    the runner is invoked.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    result = await agent.apply_domain_skill(url, name, inputs or {})
+    return result.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# v1.6.7: Interaction Library (Feature 5)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_handle_dialog(
+    ctx: Context,
+    session_id: str,
+    action: str = "accept",
+    prompt_text: Optional[str] = None,
+    tab_id: Optional[str] = None,
+) -> dict:
+    """Pre-arm the next browser dialog (alert/confirm/prompt) handler.
+
+    Subsequent dialogs on the session's tab will receive ``action``
+    (``accept`` or ``dismiss``) automatically. For prompt dialogs,
+    ``prompt_text`` is the response.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.handle_dialog(
+        action, prompt_text=prompt_text, session_id=session_id, tab_id=tab_id
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_select_dropdown(
+    ctx: Context,
+    session_id: str,
+    selector: str,
+    value: Optional[str] = None,
+    label: Optional[str] = None,
+    index: Optional[int] = None,
+    tab_id: Optional[str] = None,
+) -> dict:
+    """Select an option from a ``<select>`` element. Pass exactly one of
+    value / label / index."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.select_dropdown(
+        selector,
+        session_id=session_id,
+        tab_id=tab_id,
+        value=value,
+        label=label,
+        index=index,
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_upload_file(
+    ctx: Context,
+    session_id: str,
+    selector: str,
+    paths: list[str],
+    tab_id: Optional[str] = None,
+) -> dict:
+    """Upload one or more files to a file input element.
+
+    Paths default to those under ``download.download_dir``; set
+    ``safety.allow_upload_outside_download_dir=True`` to widen.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.upload_file(
+        selector, paths, session_id=session_id, tab_id=tab_id
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_drag_and_drop(
+    ctx: Context,
+    session_id: str,
+    source: str,
+    target: str,
+    tab_id: Optional[str] = None,
+) -> dict:
+    """Drag an element from ``source`` and drop on ``target``."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.drag_and_drop(
+        source, target, session_id=session_id, tab_id=tab_id
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_scroll_until_text(
+    ctx: Context,
+    session_id: str,
+    text: str,
+    tab_id: Optional[str] = None,
+    max_scrolls: int = 10,
+    scroll_step: int = 800,
+) -> dict:
+    """Scroll the session's tab until ``text`` is visible (or
+    ``max_scrolls`` is reached). Useful for infinite-scroll feeds."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.scroll_until_text(
+        text,
+        session_id=session_id,
+        tab_id=tab_id,
+        max_scrolls=max_scrolls,
+        scroll_step=scroll_step,
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_click_inside_iframe(
+    ctx: Context,
+    session_id: str,
+    iframe_selector: str,
+    inner_selector: str,
+    tab_id: Optional[str] = None,
+) -> dict:
+    """Click a button inside a same-origin iframe via Playwright's
+    frame_locator."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.click_inside_iframe(
+        iframe_selector, inner_selector, session_id=session_id, tab_id=tab_id
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_click_shadow_dom(
+    ctx: Context,
+    session_id: str,
+    host_selector: str,
+    inner_selector: str,
+    tab_id: Optional[str] = None,
+) -> dict:
+    """Click an element inside a shadow DOM tree via the pierce
+    combinator (``host >> inner``)."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.click_shadow_dom(
+        host_selector, inner_selector, session_id=session_id, tab_id=tab_id
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_print_page_as_pdf(
+    ctx: Context,
+    url: Optional[str] = None,
+    output_path: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tab_id: Optional[str] = None,
+) -> dict:
+    """Render the current page (or ``url``) as PDF via Chromium's
+    ``page.pdf()``. Output path defaults to ``automation.screenshot_dir``.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.print_page_as_pdf(
+        url=url,
+        output_path=output_path,
+        session_id=session_id,
+        tab_id=tab_id,
+    )
+    return r.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

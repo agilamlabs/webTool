@@ -279,6 +279,11 @@ class ActionType(str, Enum):
     CLICK_XY = "click_xy"
     TYPE_TEXT = "type_text"
     PRESS_KEY = "press_key"
+    # v1.6.7: interaction-skill library actions
+    UPLOAD_FILE = "upload_file"
+    IFRAME_CLICK = "iframe_click"
+    SHADOW_DOM_CLICK = "shadow_dom_click"
+    DRAG_AND_DROP = "drag_and_drop"
 
 
 class ActionStatus(str, Enum):
@@ -606,6 +611,66 @@ class PressKeyInput(BaseAction):
     )
 
 
+# v1.6.7: Interaction-skill library Action types (Feature 5)
+# Convenience surfaces for common patterns: file upload, iframe / shadow-DOM
+# click, drag-and-drop. All inherit BaseAction so ``tab_id`` routing works.
+
+
+class UploadFileInput(BaseAction):
+    """Upload one or more files via an ``<input type="file">`` element.
+
+    Calls Playwright's ``Locator.set_input_files``. Paths are validated
+    against ``SafetyConfig`` -- by default callers may only upload files
+    that live under ``download.download_dir`` to prevent prompt-injection
+    from exfiltrating arbitrary files like ``~/.ssh/id_rsa``. Flip
+    ``safety.allow_upload_outside_download_dir=True`` to opt in.
+    """
+
+    action: Literal["upload_file"] = "upload_file"
+    selector: SelectorLike = Field(description="CSS selector or LocatorSpec for the file input")
+    paths: list[str] = Field(description="Files to upload")
+    timeout: Optional[int] = Field(default=None)
+
+
+class IframeClickInput(BaseAction):
+    """Click a button inside an iframe via Playwright's frame_locator.
+
+    Required when the target lives in a same-origin iframe (Google
+    consent dialog, payment provider widgets, embedded calendars).
+    """
+
+    action: Literal["iframe_click"] = "iframe_click"
+    iframe_selector: str = Field(description="CSS selector for the <iframe> element")
+    inner_selector: str = Field(description="CSS selector inside the iframe document")
+    timeout: Optional[int] = Field(default=None)
+
+
+class ShadowDomClickInput(BaseAction):
+    """Click an element inside a shadow DOM tree.
+
+    Playwright pierces shadow DOM automatically for CSS selectors when
+    composed with the ``>>`` combinator. Pass the shadow-host selector
+    and the inner-tree selector separately for clarity.
+    """
+
+    action: Literal["shadow_dom_click"] = "shadow_dom_click"
+    host_selector: str = Field(description="CSS selector for the shadow host")
+    inner_selector: str = Field(description="CSS selector for the target inside the shadow root")
+    timeout: Optional[int] = Field(default=None)
+
+
+class DragAndDropInput(BaseAction):
+    """Drag an element from one selector and drop it on another.
+
+    Calls Playwright's ``Page.drag_and_drop``.
+    """
+
+    action: Literal["drag_and_drop"] = "drag_and_drop"
+    source: SelectorLike = Field(description="CSS selector or LocatorSpec for the source element")
+    target: SelectorLike = Field(description="CSS selector or LocatorSpec for the drop target")
+    timeout: Optional[int] = Field(default=None)
+
+
 # Discriminated union of all action types
 Action = Annotated[
     Union[
@@ -624,6 +689,11 @@ Action = Annotated[
         ClickXYInput,
         TypeTextInput,
         PressKeyInput,
+        # v1.6.7 interaction-skill library
+        UploadFileInput,
+        IframeClickInput,
+        ShadowDomClickInput,
+        DragAndDropInput,
     ],
     Field(discriminator="action"),
 ]
@@ -910,3 +980,94 @@ class DoctorReport(BaseModel):
     checks: list[DoctorCheck] = Field(default_factory=list)
     total_duration_ms: float = Field(default=0.0)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# v1.6.7: Domain Skills + Workspace (Features 1+2+3+4)
+# ---------------------------------------------------------------------------
+
+
+class SkillInputSpec(BaseModel):
+    """One input field declared by a domain skill's YAML frontmatter.
+
+    The skill author lists the inputs the skill expects under ``inputs:``
+    in the frontmatter; each maps to one ``SkillInputSpec``.
+    """
+
+    type: Literal["str", "int", "float", "bool"] = Field(
+        default="str", description="Pydantic-friendly scalar type"
+    )
+    required: bool = Field(default=False)
+    default: Any = Field(default=None, description="Default value when not provided")
+    description: Optional[str] = Field(default=None)
+
+
+class DomainSkill(BaseModel):
+    """A parsed markdown skill file describing how to handle a specific domain.
+
+    Loaded by :class:`SkillRegistry` from one of three directories
+    (priority: project > workspace > builtin). The frontmatter section
+    populates the structured fields; the markdown body populates the
+    free-text sections (use_case, recommended_flow, etc.).
+
+    Bundled skills (``source="builtin"``) are runnable via
+    :meth:`Agent.apply_domain_skill` -- they ship with a Python
+    implementation alongside the markdown. User markdown skills are
+    informational only unless the workspace mode permits adjacent Python.
+    """
+
+    name: str = Field(description="Skill name, unique within a domain")
+    domain: str = Field(description="Host suffix this skill targets (e.g. 'sec.gov')")
+    description: str = Field(description="One-line summary")
+    runnable: bool = Field(
+        default=False,
+        description=(
+            "True only for bundled skills with a Python runner. User "
+            "markdown-only skills are informational; apply_domain_skill "
+            "raises SkillNotRunnableError for them."
+        ),
+    )
+    inputs: dict[str, SkillInputSpec] = Field(default_factory=dict)
+    output_schema: dict[str, str] = Field(
+        default_factory=dict,
+        description="Type names per output field (e.g. {'filing_url': 'str'})",
+    )
+    # Free-text sections parsed from the markdown body
+    use_case: Optional[str] = Field(default=None)
+    recommended_flow: list[str] = Field(
+        default_factory=list, description="Numbered steps from the '## Recommended flow' section"
+    )
+    known_selectors: dict[str, str] = Field(
+        default_factory=dict,
+        description="Selector hints parsed from '## Known selectors' bullets (label: selector)",
+    )
+    known_traps: list[str] = Field(
+        default_factory=list,
+        description="Bullet items from '## Known traps' (warnings to surface to the consumer)",
+    )
+    output_expectation: Optional[str] = Field(default=None)
+    # Provenance
+    source: Literal["builtin", "workspace", "project"] = Field(
+        description="Which directory the skill came from"
+    )
+    source_path: str = Field(description="Absolute path to the .md file")
+
+
+class SkillApplicationResult(BaseModel):
+    """Result of running a bundled domain skill against a live URL."""
+
+    skill_name: str
+    domain: str
+    url: str
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    succeeded: bool = Field(default=False)
+    errors: list[ToolError] = Field(default_factory=list)
+    warnings: list[ToolWarning] = Field(default_factory=list)
+    correlation_id: Optional[str] = Field(default=None)
+    duration_ms: float = Field(default=0.0)
+
+
+# (interaction-library Action types are defined above, before the Action
+# discriminated union -- see UploadFileInput / IframeClickInput /
+# ShadowDomClickInput / DragAndDropInput around the BaseAction block.)

@@ -67,6 +67,7 @@ from .models import (
     AgentResult,
     ClickXYInput,
     DoctorReport,
+    DomainSkill,
     DownloadResult,
     ExtractionResult,
     FetchDiagnostic,
@@ -79,7 +80,9 @@ from .models import (
     ResearchResult,
     ScreenshotResult,
     SearchResultItem,
+    SelectorLike,
     SessionInfo,
+    SkillApplicationResult,
     TabInfo,
     ToolMessage,
     ToolSeverity,
@@ -315,6 +318,18 @@ class Agent:
             browser_manager=self._bm,
             sessions=self._sessions,
         )
+        # v1.6.7: domain-skills registry. Loaded lazily so an Agent
+        # configured with both skills disabled does no filesystem walk.
+        # Always instantiated (cheap when both flags are False -- the
+        # constructor short-circuits).
+        from .domain_skills import SkillRegistry
+        from .workspace import Workspace
+
+        self._skills = SkillRegistry(self._config)
+        # v1.6.7: agent-editable workspace. Always instantiated; gates
+        # are enforced on read/write, not on construction. Audit-logged
+        # when both audit.enabled and workspace.audit_helper_usage are True.
+        self._workspace = Workspace(self._config, audit=self._audit)
 
     @asynccontextmanager
     async def _call_scope(
@@ -1115,6 +1130,277 @@ class Agent:
         from .doctor import run_doctor
 
         return await run_doctor(self._config, quick=quick)
+
+    # ------------------------------------------------------------------
+    # v1.6.7 Domain Skills (Features 1+2+3)
+    # ------------------------------------------------------------------
+
+    def list_domain_skills(self) -> list[DomainSkill]:
+        """Return every domain skill registered in this Agent's registry.
+
+        Skills come from three tiers (priority: project > workspace >
+        builtin). Returns both runnable bundled skills and informational
+        user markdown skills. Sort order is unspecified.
+        """
+        return self._skills.list_all()
+
+    def get_domain_skills(self, url: str) -> list[DomainSkill]:
+        """Return skills matching the host of ``url`` (suffix match).
+
+        Example: ``sec.gov`` matches ``www.sec.gov``,
+        ``cgi-bin.sec.gov``. The host suffix must align on a label
+        boundary, so ``ec.europa.eu`` won't accidentally match
+        ``not-ec.europa.eu``.
+        """
+        return self._skills.get_for_url(url)
+
+    async def apply_domain_skill(
+        self,
+        url: str,
+        name: str,
+        inputs: dict[str, Any] | None = None,
+    ) -> SkillApplicationResult:
+        """Dispatch a runnable skill against ``url`` with ``inputs``.
+
+        Resolves the most-specific matching skill for the URL's domain
+        (longest domain wins on ambiguity). Validates ``inputs`` against
+        the skill's declared schema, then invokes the bundled Python
+        runner.
+
+        Raises:
+            SkillNotFoundError: no matching skill for this URL + name.
+            SkillNotRunnableError: skill is markdown-only (informational).
+            SkillInputError: caller-supplied inputs failed validation.
+        """
+        async with self._call_scope(
+            "apply_domain_skill", {"url": url, "name": name, "inputs": inputs}
+        ):
+            return await self._skills.apply(self, url, name, inputs or {})
+
+    # ------------------------------------------------------------------
+    # v1.6.7 Interaction Skill Library (Feature 5)
+    # ------------------------------------------------------------------
+
+    async def handle_dialog(
+        self,
+        action: str = "accept",
+        prompt_text: str | None = None,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Pre-arm the next browser dialog (alert/confirm/prompt) handler.
+
+        Wraps ``DialogInput`` to keep a single source of truth for the
+        per-page WeakKeyDictionary state. ``action`` is ``'accept'`` or
+        ``'dismiss'``; ``prompt_text`` populates a prompt() box.
+        """
+        from .models import DialogInput, DialogResponse
+
+        async with self._call_scope(
+            "handle_dialog",
+            {"action": action, "session_id": session_id, "tab_id": tab_id},
+        ):
+            di = DialogInput(
+                dialog_action=DialogResponse(action),
+                prompt_text=prompt_text,
+                tab_id=tab_id,
+            )
+            return await self._actions.execute_single_on_session(
+                di, session_id=session_id, tab_id=tab_id
+            )
+
+    async def select_dropdown(
+        self,
+        selector: SelectorLike,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+        value: str | None = None,
+        label: str | None = None,
+        index: int | None = None,
+    ) -> ActionResult:
+        """Select an option from a ``<select>`` element.
+
+        Pass exactly one of ``value`` / ``label`` / ``index``. Wraps the
+        existing ``SelectInput`` action so the SELECT handler's dispatch
+        path is reused.
+        """
+        from .models import SelectInput
+
+        async with self._call_scope(
+            "select_dropdown",
+            {"session_id": session_id, "tab_id": tab_id, "value": value, "label": label, "index": index},
+        ):
+            si = SelectInput(
+                selector=selector,
+                value=value,
+                label=label,
+                index=index,
+                tab_id=tab_id,
+            )
+            return await self._actions.execute_single_on_session(
+                si, session_id=session_id, tab_id=tab_id
+            )
+
+    async def upload_file(
+        self,
+        selector: SelectorLike,
+        paths: str | list[str],
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Upload one or more files to an ``<input type="file">``.
+
+        Path safety: each path is validated against
+        ``download.download_dir`` unless
+        ``safety.allow_upload_outside_download_dir=True``. Blocks
+        prompt-injection from uploading arbitrary local files.
+        """
+        from .models import UploadFileInput
+
+        path_list = [paths] if isinstance(paths, str) else list(paths)
+        async with self._call_scope(
+            "upload_file",
+            {"session_id": session_id, "tab_id": tab_id, "n_paths": len(path_list)},
+        ):
+            uf = UploadFileInput(selector=selector, paths=path_list, tab_id=tab_id)
+            return await self._actions.execute_single_on_session(
+                uf, session_id=session_id, tab_id=tab_id
+            )
+
+    async def drag_and_drop(
+        self,
+        source: SelectorLike,
+        target: SelectorLike,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Drag from one element and drop on another."""
+        from .models import DragAndDropInput
+
+        async with self._call_scope(
+            "drag_and_drop", {"session_id": session_id, "tab_id": tab_id}
+        ):
+            dd = DragAndDropInput(source=source, target=target, tab_id=tab_id)
+            return await self._actions.execute_single_on_session(
+                dd, session_id=session_id, tab_id=tab_id
+            )
+
+    async def scroll_until_text(
+        self,
+        text: str,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+        max_scrolls: int = 10,
+        scroll_step: int = 800,
+    ) -> ActionResult:
+        """Scroll a session's tab in fixed increments until ``text``
+        appears in the visible page, or ``max_scrolls`` is exhausted.
+
+        Useful for infinite-scroll feeds.
+        """
+        async with self._call_scope(
+            "scroll_until_text",
+            {"text": text[:80], "session_id": session_id, "tab_id": tab_id},
+        ):
+            return await self._actions.scroll_until_text(
+                text,
+                session_id=session_id,
+                tab_id=tab_id,
+                max_scrolls=max_scrolls,
+                scroll_step=scroll_step,
+            )
+
+    async def click_inside_iframe(
+        self,
+        iframe_selector: str,
+        inner_selector: str,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Click a target inside a same-origin iframe.
+
+        Uses Playwright's ``frame_locator`` to scope the click into the
+        iframe document. Cross-origin iframes raise -- use coord-click
+        as the fallback.
+        """
+        from .models import IframeClickInput
+
+        async with self._call_scope(
+            "click_inside_iframe",
+            {
+                "iframe_selector": iframe_selector,
+                "inner_selector": inner_selector,
+                "session_id": session_id,
+                "tab_id": tab_id,
+            },
+        ):
+            ic = IframeClickInput(
+                iframe_selector=iframe_selector,
+                inner_selector=inner_selector,
+                tab_id=tab_id,
+            )
+            return await self._actions.execute_single_on_session(
+                ic, session_id=session_id, tab_id=tab_id
+            )
+
+    async def click_shadow_dom(
+        self,
+        host_selector: str,
+        inner_selector: str,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Click an element inside a shadow DOM tree using Playwright's
+        pierce-selector chain (``host >> inner``)."""
+        from .models import ShadowDomClickInput
+
+        async with self._call_scope(
+            "click_shadow_dom",
+            {
+                "host_selector": host_selector,
+                "inner_selector": inner_selector,
+                "session_id": session_id,
+                "tab_id": tab_id,
+            },
+        ):
+            sd = ShadowDomClickInput(
+                host_selector=host_selector,
+                inner_selector=inner_selector,
+                tab_id=tab_id,
+            )
+            return await self._actions.execute_single_on_session(
+                sd, session_id=session_id, tab_id=tab_id
+            )
+
+    async def print_page_as_pdf(
+        self,
+        url: str | None = None,
+        output_path: str | None = None,
+        *,
+        session_id: str | None = None,
+        tab_id: Optional[str] = None,
+    ) -> ScreenshotResult:
+        """Render the current page (or ``url``) as PDF via Chromium's
+        ``page.pdf()``. Output goes under ``automation.screenshot_dir``
+        unless ``output_path`` is absolute. Returns the same
+        ``ScreenshotResult`` shape used by ``Agent.screenshot``."""
+        async with self._call_scope(
+            "print_page_as_pdf",
+            {"url": url, "session_id": session_id, "tab_id": tab_id},
+        ):
+            return await self._actions.print_page_as_pdf(
+                url=url,
+                output_path=output_path,
+                session_id=session_id,
+                tab_id=tab_id,
+            )
 
     # ------------------------------------------------------------------
     # High-Level Recipes

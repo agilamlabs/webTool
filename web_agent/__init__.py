@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.6"
+__version__ = "1.6.7"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -57,6 +57,8 @@ from .config import (
     FetchConfig,
     SafetyConfig,
     SearchConfig,
+    SkillsConfig,
+    WorkspaceConfig,
 )
 from .correlation import correlation_scope, get_correlation_id, new_correlation_id
 from .exceptions import (
@@ -86,12 +88,15 @@ from .models import (
     ClickXYInput,
     DoctorCheck,
     DoctorReport,
+    DomainSkill,
     DownloadResult,
+    DragAndDropInput,
     ExtractionResult,
     FetchDiagnostic,
     FetchResult,
     FetchStatus,
     FormFilterSpec,
+    IframeClickInput,
     LocatorSpec,
     ObserveResult,
     PressKeyInput,
@@ -101,12 +106,16 @@ from .models import (
     SearchResultItem,
     SelectorLike,
     SessionInfo,
+    ShadowDomClickInput,
+    SkillApplicationResult,
+    SkillInputSpec,
     TabInfo,
     ToolError,
     ToolMessage,
     ToolSeverity,
     ToolWarning,
     TypeTextInput,
+    UploadFileInput,
 )
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
@@ -137,6 +146,8 @@ __all__ = [
     "FetchConfig",
     "SafetyConfig",
     "SearchConfig",
+    "SkillsConfig",
+    "WorkspaceConfig",
     # Correlation
     "correlation_scope",
     "get_correlation_id",
@@ -183,12 +194,15 @@ __all__ = [
     "ClickXYInput",
     "DoctorCheck",
     "DoctorReport",
+    "DomainSkill",
     "DownloadResult",
+    "DragAndDropInput",
     "ExtractionResult",
     "FetchDiagnostic",
     "FetchResult",
     "FetchStatus",
     "FormFilterSpec",
+    "IframeClickInput",
     "LocatorSpec",
     "ObserveResult",
     "PressKeyInput",
@@ -198,10 +212,14 @@ __all__ = [
     "SearchResultItem",
     "SelectorLike",
     "SessionInfo",
+    "ShadowDomClickInput",
+    "SkillApplicationResult",
+    "SkillInputSpec",
     "TabInfo",
     "ToolError",
     "ToolMessage",
     "ToolSeverity",
     "ToolWarning",
     "TypeTextInput",
+    "UploadFileInput",
 ]

@@ -1,5 +1,141 @@
 # Changelog
 
+## [1.6.7] - 2026-05-17
+
+### Skills and Playbooks (5 features, browser-harness-inspired)
+
+Turns webTool from a stateless browser backend into one that
+*accumulates reusable knowledge about websites*. Per the upgrade doc,
+this is the strongest idea borrowed from `browser-harness`: an agent
+should reuse known instructions for a site instead of rediscovering
+quirks every run.
+
+Test count 454 -> ~506 (51 new tests across 3 new files
+`tests/test_v167_*.py`). All five features are opt-in or read-only by
+default; the only behavior change is that v1.6.6 callers will now see
+the bundled SEC / GitHub / EC skills in ``Agent.list_domain_skills()``
+unless they explicitly disable ``skills.builtin_skills_enabled``.
+
+#### Feature 1+2+3 -- Domain Skills Registry + Discovery + Markdown Format (Rank 3, P0)
+
+A "skill" is a markdown file with YAML frontmatter at
+``<skill_dir>/<name>.md`` describing how to handle a domain: inputs,
+output schema, recommended flow, known selectors, known traps. Three
+discovery tiers with priority order:
+
+```
+project (highest, default ./.webtool-skills) > workspace > builtin (lowest)
+```
+
+* New module: ``web_agent/domain_skills.py`` -- ``SkillRegistry`` +
+  parser + dispatcher.
+* New module: ``web_agent/builtin_skills/`` -- bundled-skill registry.
+* New core dep: ``python-frontmatter>=1.0.0``.
+* New ``SkillsConfig`` (master switch ``enabled=False`` for project
+  skills; ``builtin_skills_enabled=True`` so the 3 bundled examples
+  are visible out-of-box).
+* 3 new ``Agent`` methods: ``list_domain_skills``, ``get_domain_skills``,
+  ``apply_domain_skill``.
+* 3 new MCP tools: ``list_domain_skills``, ``get_domain_skill``,
+  ``apply_domain_skill``.
+* New CLI subcommand: ``web-agent skills list|show|apply``.
+* New exceptions: ``SkillError``, ``SkillNotFoundError``,
+  ``SkillNotRunnableError``, ``SkillInputError``.
+* New models: ``DomainSkill``, ``SkillInputSpec``,
+  ``SkillApplicationResult``.
+
+Bundled skills (always loaded unless ``builtin_skills_enabled=False``):
+
+* ``sec.gov/filing_search`` -- find a company's most recent SEC filing
+  of a given form type. Composes the existing
+  ``search_and_extract`` recipe with EDGAR-scoped queries.
+* ``github.com/release_download`` -- download a release asset via
+  ``find_and_download_file``.
+* ``ec.europa.eu/document_search`` -- search the EU document
+  register across ``ec.europa.eu``, ``eur-lex.europa.eu``,
+  ``finance.ec.europa.eu``.
+
+User markdown skills (under ``.webtool-skills/<domain>/<name>.md``)
+are *informational only* -- ``apply_domain_skill`` raises
+``SkillNotRunnableError`` for them. Bundled skills are dispatchable
+because they ship with a Python runner alongside the .md.
+
+#### Feature 4 -- Agent-editable Workspace (Rank 9, P2)
+
+* New module: ``web_agent/workspace.py`` -- ``Workspace`` class with
+  mode-gated read/write access to ``./.webtool-workspace/``.
+* New ``WorkspaceConfig``. Default ``enabled=False`` (opt-in for
+  safety, matching v1.6.6 isolation/CDP defaults). When enabled,
+  default ``mode="markdown_skills_only"``.
+* 4 safety modes:
+  * ``read_only`` -- blocks every write.
+  * ``markdown_skills_only`` (default) -- allows ``.md`` writes only
+    under ``domain-skills/``; blocks everything else including
+    ``helpers.py``.
+  * ``reviewed_python_helpers`` -- allows ``.md`` anywhere + a single
+    ``helpers.py`` at the workspace root. Execution requires a
+    *second* opt-in (``execute_helpers=True``) so a write-permission
+    grant alone doesn't enable Python execution.
+  * ``unsafe_python_helpers`` -- no restrictions.
+* Path traversal blocked unconditionally in every mode via
+  ``safe_join_path`` (v1.6.4 helper).
+* Workspace skills under ``domain-skills/`` are auto-loaded into the
+  ``SkillRegistry`` at startup as the "workspace" priority tier.
+
+#### Feature 5 -- Interaction Skill Library (Rank 12, P2)
+
+8 new top-level ``Agent`` convenience methods for common patterns:
+
+* ``Agent.handle_dialog(action, prompt_text, session_id, tab_id)``
+  -- pre-arm the next browser dialog handler.
+* ``Agent.select_dropdown(selector, value/label/index, ...)``
+  -- wraps existing ``SelectInput``.
+* ``Agent.upload_file(selector, paths, ...)``
+  -- NEW ``UploadFileInput`` action. Paths default to under
+  ``download.download_dir``; widen with
+  ``safety.allow_upload_outside_download_dir=True``.
+* ``Agent.drag_and_drop(source, target, ...)``
+  -- NEW ``DragAndDropInput`` action.
+* ``Agent.scroll_until_text(text, max_scrolls, ...)``
+  -- scroll until the target text is visible.
+* ``Agent.click_inside_iframe(iframe_selector, inner_selector, ...)``
+  -- NEW ``IframeClickInput`` action; uses Playwright's frame_locator.
+* ``Agent.click_shadow_dom(host_selector, inner_selector, ...)``
+  -- NEW ``ShadowDomClickInput`` action; uses ``>>`` pierce combinator.
+* ``Agent.print_page_as_pdf(url, output_path, ...)``
+  -- Chromium ``page.pdf()``. Reuses ``ScreenshotResult`` shape.
+
+4 new ``ActionType`` enum members (``UPLOAD_FILE``, ``IFRAME_CLICK``,
+``SHADOW_DOM_CLICK``, ``DRAG_AND_DROP``) and ``Action`` discriminated
+union entries. Every method available as both top-level ``Agent`` API
+AND inside ``interact()`` action sequences.
+
+8 new MCP tools: ``web_handle_dialog``, ``web_select_dropdown``,
+``web_upload_file``, ``web_drag_and_drop``, ``web_scroll_until_text``,
+``web_click_inside_iframe``, ``web_click_shadow_dom``,
+``web_print_page_as_pdf``.
+
+#### Safety additions to ``SafetyConfig``
+
+* ``allow_upload_outside_download_dir`` (default ``False``) -- gates
+  ``upload_file`` paths to the download directory unless explicitly
+  widened. Blocks prompt-injection attempts to exfiltrate arbitrary
+  local files.
+
+#### Backward-compat summary
+
+* All new flags default off / disabled.
+* New ``Action`` union members are purely additive -- legacy JSON
+  callers continue to dispatch correctly.
+* New ``python-frontmatter`` dep (~30 KB; pulls in PyYAML which we
+  already required).
+* ``WorkspaceConfig.workspace_dir`` is named explicitly (not ``path``)
+  because pydantic-settings would otherwise read the ``PATH`` environment
+  variable as a default on every OS -- documented in the field comment.
+* Bundled skills always-visible-by-default IS technically a behavior
+  change for ``Agent.list_domain_skills()``. Set
+  ``skills.builtin_skills_enabled=False`` to restore the empty registry.
+
 ## [1.6.6] - 2026-05-17
 
 ### Browser Control Foundation (6 features, inspired by browser-harness)
