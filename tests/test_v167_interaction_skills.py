@@ -119,6 +119,10 @@ async def test_upload_file_outside_dir_allowed_when_flag_on(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_upload_file_nonexistent_path_blocked(tmp_path: Path) -> None:
+    """Code-review M1: the path '/this/does/not/exist.txt' is absolute
+    and outside download_dir. The containment check fires FIRST (no
+    file-existence oracle), so the error names the containment failure,
+    not the existence failure."""
     cfg = AppConfig(base_dir=str(tmp_path))
     ba = BrowserActions(MagicMock(), cfg, sessions=None)
     page = _make_page()
@@ -127,7 +131,39 @@ async def test_upload_file_nonexistent_path_blocked(tmp_path: Path) -> None:
     result = await ba._do_upload_file(page, action)
 
     assert result.status == ActionStatus.FAILED
-    assert "does not exist" in (result.error_message or "")
+    assert "outside download_dir" in (result.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_upload_file_no_existence_oracle(tmp_path: Path) -> None:
+    """Regression for code-review M1: both an existing and a
+    non-existing absolute path outside download_dir must produce the
+    SAME error class (no information leak about which paths exist)."""
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    # Real file outside download_dir
+    real = tmp_path / "real.txt"
+    real.write_text("hi", encoding="utf-8")
+    fake = tmp_path / "does_not_exist.txt"
+
+    cfg = AppConfig(
+        base_dir=str(tmp_path),
+        download=DownloadConfig(download_dir=str(download_dir)),
+    )
+    ba = BrowserActions(MagicMock(), cfg, sessions=None)
+    page = _make_page()
+
+    r_real = await ba._do_upload_file(
+        page, UploadFileInput(selector="#f", paths=[str(real)])
+    )
+    r_fake = await ba._do_upload_file(
+        page, UploadFileInput(selector="#f", paths=[str(fake)])
+    )
+    assert r_real.status == ActionStatus.FAILED
+    assert r_fake.status == ActionStatus.FAILED
+    # Same error reason regardless of existence -- no oracle
+    assert "outside download_dir" in (r_real.error_message or "")
+    assert "outside download_dir" in (r_fake.error_message or "")
 
 
 # ----------------------------------------------------------------------

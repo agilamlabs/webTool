@@ -1064,27 +1064,29 @@ class BrowserActions:
                     operation="upload_file",
                 ) from exc
 
-        # Existence check first -- surfaces the most actionable error to
-        # the caller. A path that doesn't exist can't be exfiltrated, so
-        # we don't lose any safety guarantee by checking it before the
-        # download-dir containment check.
-        if not resolved.exists():
-            raise SafeModeBlockedError(
-                f"upload_file: path does not exist: {resolved}",
-                operation="upload_file",
-            )
-
+        # Containment check BEFORE existence to close the
+        # file-existence oracle: without this ordering, a caller can
+        # tell whether ``/etc/passwd`` exists by comparing the
+        # "does not exist" vs "outside download_dir" error messages.
+        # Any out-of-scope path now gets the same "outside" error
+        # regardless of existence.
         if not self._config.safety.allow_upload_outside_download_dir:
             base = Path(self._config.download.download_dir).resolve()
             try:
                 resolved.relative_to(base)
             except ValueError as exc:
                 raise SafeModeBlockedError(
-                    f"upload_file: path {resolved} is outside download_dir "
-                    f"{base}. Set safety.allow_upload_outside_download_dir=True "
+                    f"upload_file: path is outside download_dir {base}. "
+                    f"Set safety.allow_upload_outside_download_dir=True "
                     f"to permit arbitrary local files.",
                     operation="upload_file",
                 ) from exc
+
+        if not resolved.exists():
+            raise SafeModeBlockedError(
+                f"upload_file: path does not exist: {resolved}",
+                operation="upload_file",
+            )
 
         return str(resolved)
 
@@ -1325,19 +1327,31 @@ class BrowserActions:
                 filename = f"page_{cid or 'anon'}_{int(time.time() * 1000)}.pdf"
                 resolved = safe_join_path(shot_dir, filename)
             else:
-                p = Path(output_path)
-                resolved = p.resolve() if p.is_absolute() else safe_join_path(shot_dir, output_path)
+                # _is_cross_platform_absolute mirrors v1.6.4's project
+                # convention -- ``Path.is_absolute()`` is OS-dependent
+                # and would treat ``C:\\...`` as relative on POSIX.
+                resolved = (
+                    Path(output_path).resolve()
+                    if _is_cross_platform_absolute(output_path)
+                    else safe_join_path(shot_dir, output_path)
+                )
 
             await page.pdf(path=str(resolved))
             # PDFs reuse ScreenshotResult; format is PNG (the closest enum
             # we have today) -- callers identify PDFs via the .pdf suffix
-            # on ``path``. status=SUCCESS; size_bytes left at 0 to avoid an
-            # extra stat call.
+            # on ``path``. status=SUCCESS. We do stat the file for size --
+            # the cost is negligible vs. the chromium PDF render that
+            # just completed, and audit logs / size-budgets downstream
+            # would otherwise under-count.
+            try:
+                size = resolved.stat().st_size
+            except OSError:
+                size = 0
             return ScreenshotResult(
                 url=page.url,
                 path=str(resolved),
                 format=ScreenshotFormat.PNG,
-                size_bytes=0,
+                size_bytes=size,
                 status=ActionStatus.SUCCESS,
                 correlation_id=cid,
             )

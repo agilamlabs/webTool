@@ -8,10 +8,23 @@ heavy lifting -- this skill is mainly about query construction.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from web_agent.agent import Agent
+
+
+# Characters that have meaning to search-engine query parsers
+# (site:, OR, quoted phrases, grouping). Stripping these blocks
+# scope-escape attacks where a prompt-injected input contains something
+# like '" OR site:evil.com"' that would expand beyond github.com.
+_QUERY_OPERATOR_CHARS = re.compile(r'[\"\'()\[\]|]')
+
+
+def _sanitize_query_term(s: str) -> str:
+    """Strip search-operator metacharacters from a user-supplied term."""
+    return _QUERY_OPERATOR_CHARS.sub("", s).strip()
 
 
 async def run(agent: Agent, url: str, inputs: dict[str, Any]) -> dict[str, Any]:
@@ -25,16 +38,21 @@ async def run(agent: Agent, url: str, inputs: dict[str, Any]) -> dict[str, Any]:
     Returns:
         {release_tag, asset_url, asset_name, downloaded_path}
     """
-    repo = inputs.get("repo", "")
-    asset_pattern = inputs.get("asset_pattern", "") or ""
-    tag = inputs.get("tag", "") or ""
+    # Sanitize every user-supplied query term to block prompt-injection
+    # of search operators (site:, OR, quotes, parens). The downloader's
+    # domain allowlist would still catch a non-github asset URL, but
+    # only when an allowlist is configured -- under default-open
+    # SafetyConfig the only fence is this query scope.
+    repo = _sanitize_query_term(inputs.get("repo", ""))
+    asset_pattern = _sanitize_query_term(inputs.get("asset_pattern", "") or "")
+    tag = _sanitize_query_term(inputs.get("tag", "") or "")
 
     # Compose a targeted query so the existing find_and_download_file
     # recipe surfaces the right asset URL.
     if tag:
-        query = f'site:github.com {repo} releases tag {tag} {asset_pattern}'.strip()
+        query = f"site:github.com {repo} releases tag {tag} {asset_pattern}".strip()
     else:
-        query = f'site:github.com {repo} releases latest {asset_pattern}'.strip()
+        query = f"site:github.com {repo} releases latest {asset_pattern}".strip()
 
     download = await agent.find_and_download_file(query)
 

@@ -394,6 +394,50 @@ async def test_apply_runner_exception_returns_failed_result(tmp_path: Path) -> N
 # ----------------------------------------------------------------------
 
 
+def test_validate_inputs_caps_extra_keys(tmp_path: Path) -> None:
+    """Code-review M3 regression: caller-supplied extras are passed
+    through to the runner but capped at MAX_EXTRA_INPUTS to bound the
+    call-surface against prompt-injection."""
+    from web_agent.domain_skills import MAX_EXTRA_INPUTS
+
+    skill = DomainSkill(
+        name="x",
+        domain="example.com",
+        description="x",
+        inputs={"q": SkillInputSpec(type="str", required=True)},
+        source="builtin",
+        source_path="/dev/null",
+    )
+    too_many = {"q": "v"} | {f"extra_{i}": i for i in range(MAX_EXTRA_INPUTS + 1)}
+    with pytest.raises(SkillInputError, match="Too many extra input keys"):
+        validate_inputs(skill, too_many)
+
+    # Exactly at the cap is OK.
+    at_cap = {"q": "v"} | {f"extra_{i}": i for i in range(MAX_EXTRA_INPUTS)}
+    result = validate_inputs(skill, at_cap)
+    assert len(result) == MAX_EXTRA_INPUTS + 1  # +1 for 'q'
+
+
+def test_load_project_with_windows_absolute_skipped_safely(tmp_path: Path) -> None:
+    """Code-review C1 regression: a Windows-style absolute path
+    ('C:\\...') in skill_dirs is recognized as absolute on POSIX too
+    via the cross-platform helper. The path won't exist on a Linux
+    test runner, so the load is a no-op rather than a silent join to
+    base_dir that would have produced a bogus '<base>/C:\\...' tree."""
+    cfg = AppConfig(
+        base_dir=str(tmp_path),
+        skills=SkillsConfig(
+            enabled=True,
+            builtin_skills_enabled=False,
+            skill_dirs=[r"C:\not\a\real\directory\anywhere"],
+        ),
+    )
+    # Constructing the registry MUST NOT raise and MUST NOT spuriously
+    # land project skills under base_dir.
+    reg = SkillRegistry(cfg)
+    assert reg.list_all() == []
+
+
 def test_all_builtin_skills_have_runners(tmp_path: Path) -> None:
     """Every module in BUILTIN_SKILLS exposes a callable ``run``."""
     from web_agent.builtin_skills import BUILTIN_SKILLS
@@ -413,3 +457,18 @@ def test_all_builtin_skill_md_files_parse(tmp_path: Path) -> None:
         assert skill.name
         assert skill.domain
         assert skill.description
+
+
+def test_github_skill_sanitizes_query_operators() -> None:
+    """Code-review M4 regression: the github_release_download skill
+    composes a search query that includes user-supplied ``repo`` and
+    ``asset_pattern`` fields. Without sanitization, a prompt-injected
+    pattern like '" OR site:evil.com'' could escape the
+    ``site:github.com`` scope. The sanitizer strips quotes, parens,
+    pipes, and brackets that have search-operator meaning."""
+    from web_agent.builtin_skills.github_release_download import _sanitize_query_term
+
+    assert _sanitize_query_term('" OR site:evil.com"') == "OR site:evil.com"
+    assert _sanitize_query_term("(group1 | group2)") == "group1  group2"
+    assert _sanitize_query_term("normal-string_v1.0") == "normal-string_v1.0"
+    assert _sanitize_query_term("") == ""

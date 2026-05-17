@@ -31,7 +31,7 @@ from loguru import logger
 
 from .config import AppConfig
 from .exceptions import WebAgentError
-from .utils import safe_join_path
+from .utils import _is_cross_platform_absolute, safe_join_path
 
 if TYPE_CHECKING:
     from .audit import AuditLogger
@@ -74,7 +74,7 @@ class Workspace:
         care whether the workspace is active.
         """
         base = Path(self._config.base_dir).resolve()
-        if Path(self._ws_cfg.workspace_dir).is_absolute():
+        if _is_cross_platform_absolute(self._ws_cfg.workspace_dir):
             return Path(self._ws_cfg.workspace_dir)
         return safe_join_path(base, self._ws_cfg.workspace_dir)
 
@@ -122,11 +122,16 @@ class Workspace:
             p = Path(rel_path)
             if p.suffix.lower() == ".md":
                 return  # any .md ok
-            if rel_path == HELPERS_FILE or p.name == HELPERS_FILE:
-                return  # helpers.py at root ok
+            # Only the EXACT root-level helpers.py qualifies. We must NOT
+            # accept e.g. ``subdir/helpers.py`` -- that would let a caller
+            # write arbitrary .py anywhere under the workspace as long as
+            # the basename matched HELPERS_FILE, defeating the mode's
+            # "single reviewed helper file" intent.
+            if Path(rel_path) == Path(HELPERS_FILE):
+                return  # helpers.py at workspace root ok
             raise WorkspaceError(
                 f"Mode 'reviewed_python_helpers': writes limited to .md and "
-                f"'{HELPERS_FILE}' (got {rel_path!r})."
+                f"the root-level '{HELPERS_FILE}' (got {rel_path!r})."
             )
 
         # unsafe_python_helpers: no restrictions

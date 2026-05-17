@@ -77,7 +77,7 @@ from .models import (
     ToolSeverity,
     ToolWarning,
 )
-from .utils import safe_join_path
+from .utils import _is_cross_platform_absolute, safe_join_path
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -282,13 +282,22 @@ def _coerce_input(value: Any, spec: SkillInputSpec) -> Any:
     return bool(value)
 
 
+#: Maximum number of caller-supplied keys NOT declared in the skill's
+#: ``inputs`` schema that ``validate_inputs`` will pass through to the
+#: runner. Caps a prompt-injection vector that would otherwise let an
+#: LLM-supplied input dict bloat the runner's call surface arbitrarily.
+MAX_EXTRA_INPUTS = 20
+
+
 def validate_inputs(
     skill: DomainSkill, supplied: dict[str, Any] | None
 ) -> dict[str, Any]:
     """Validate caller-supplied inputs against the skill's declared schema.
 
     Fills in defaults; raises :class:`SkillInputError` for missing required
-    fields or type-coercion failures.
+    fields or type-coercion failures. Extra keys (not declared in the
+    skill's frontmatter) are passed through to the runner but capped at
+    ``MAX_EXTRA_INPUTS`` to bound the call-surface size.
     """
     supplied = supplied or {}
     out: dict[str, Any] = {}
@@ -304,10 +313,19 @@ def validate_inputs(
             raise SkillInputError(f"required input '{key}' missing")
         elif spec.default is not None:
             out[key] = spec.default
-    # Accept extra keys silently -- callers may pass session_id, tab_id, etc.
-    for key, value in supplied.items():
-        if key not in skill.inputs:
-            out.setdefault(key, value)
+
+    # Accept extra keys (callers may pass session_id, tab_id, ad-hoc
+    # context) but cap the count -- an unbounded passthrough is a
+    # prompt-injection vector for future runners that iterate
+    # ``inputs.items()``.
+    extras = {k: v for k, v in supplied.items() if k not in skill.inputs}
+    if len(extras) > MAX_EXTRA_INPUTS:
+        raise SkillInputError(
+            f"Too many extra input keys ({len(extras)}); "
+            f"maximum is MAX_EXTRA_INPUTS={MAX_EXTRA_INPUTS}."
+        )
+    for key, value in extras.items():
+        out[key] = value
     return out
 
 
@@ -413,7 +431,15 @@ class SkillRegistry:
         base = Path(self._config.base_dir).resolve()
         for raw_dir in self._config.skills.skill_dirs:
             try:
-                skill_root = safe_join_path(base, raw_dir) if not Path(raw_dir).is_absolute() else Path(raw_dir)
+                # Use _is_cross_platform_absolute (v1.6.4 helper) instead of
+                # Path.is_absolute() so a Windows-style 'C:\\...' path is
+                # recognized as absolute on POSIX too (matches the project
+                # convention documented in AGENTS.md).
+                skill_root = (
+                    Path(raw_dir)
+                    if _is_cross_platform_absolute(raw_dir)
+                    else safe_join_path(base, raw_dir)
+                )
             except ValueError as exc:
                 logger.warning("Skipping skill_dir {d}: {e}", d=raw_dir, e=exc)
                 continue
@@ -431,7 +457,7 @@ class SkillRegistry:
         if not ws_cfg.enabled:
             return None
         base = Path(self._config.base_dir).resolve()
-        if Path(ws_cfg.workspace_dir).is_absolute():
+        if _is_cross_platform_absolute(ws_cfg.workspace_dir):
             return Path(ws_cfg.workspace_dir)
         try:
             return safe_join_path(base, ws_cfg.workspace_dir)

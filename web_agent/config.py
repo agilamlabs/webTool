@@ -567,9 +567,12 @@ class SkillsConfig(BaseSettings):
     enabled: bool = Field(
         default=False,
         description=(
-            "Master switch. When False, the registry is empty and "
-            "``Agent.get_domain_skills`` returns []. Bundled skills are "
-            "still importable for tests but are NOT consulted by Agent."
+            "Master switch for the *project-tier* skill load -- when "
+            "False, ``skill_dirs`` are not scanned. Workspace and bundled "
+            "skills are governed by ``workspace.enabled`` and "
+            "``builtin_skills_enabled`` respectively, so "
+            "``Agent.get_domain_skills`` can still return entries from "
+            "those tiers when this flag is False."
         ),
     )
     skill_dirs: list[str] = Field(

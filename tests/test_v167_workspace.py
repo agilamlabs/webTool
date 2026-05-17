@@ -130,6 +130,20 @@ def test_reviewed_python_helpers_blocks_arbitrary_py(tmp_path: Path) -> None:
         ws.write_file("evil.py", "os.system('rm -rf')")
 
 
+def test_reviewed_python_helpers_blocks_subdir_helpers_py(tmp_path: Path) -> None:
+    """Code-review H2 regression: a caller in reviewed_python_helpers
+    mode cannot write ``subdir/helpers.py`` -- only the root-level
+    file qualifies. The earlier check used ``p.name == HELPERS_FILE``
+    which incorrectly matched any path whose basename was helpers.py,
+    letting an attacker write arbitrary Python anywhere under the
+    workspace."""
+    ws = _ws(tmp_path, mode="reviewed_python_helpers")
+    with pytest.raises(WorkspaceError, match="root-level"):
+        ws.write_file("subdir/helpers.py", "evil_code = True")
+    with pytest.raises(WorkspaceError, match="root-level"):
+        ws.write_file("a/b/helpers.py", "evil_code = True")
+
+
 def test_reviewed_python_helpers_execute_gate_default_false(tmp_path: Path) -> None:
     """Even with mode=reviewed_python_helpers, execute_helpers defaults
     False -- writing helpers.py is allowed but the module is NOT imported."""
