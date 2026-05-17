@@ -974,6 +974,58 @@ async def web_print_page_as_pdf(
 
 
 # ---------------------------------------------------------------------------
+# v1.6.8: Diagnostics + Replay + Remote CDP
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_get_remote_cdp_url(ctx: Context) -> dict:
+    """v1.6.8: return the remote_cdp ws:// URL the Agent connected to.
+
+    Mirror of ``web_get_cdp_endpoint`` for the third backend mode.
+    Returns ``{"backend": "...", "url": null}`` when the Agent is on
+    the ``playwright`` or ``cdp_owned`` backend.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    cfg = agent._config.browser
+    url = agent.get_remote_cdp_url()
+    return {
+        "backend": cfg.backend,
+        "url": url,
+        "configured_url": cfg.remote_cdp_url,
+    }
+
+
+@mcp.tool()
+async def web_list_traces(ctx: Context) -> dict:
+    """v1.6.8: list session_ids of replay traces under diagnostics.trace_dir.
+
+    Returns ``{"count": 0, "session_ids": [], "trace_dir": "..."}`` when
+    no traces have been written. Pair with ``web_replay_trace`` to
+    re-execute a session.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    sids = agent.list_traces()
+    return {
+        "count": len(sids),
+        "session_ids": sids,
+        "trace_dir": str(agent._trace_recorder.trace_dir),
+    }
+
+
+@mcp.tool()
+async def web_replay_trace(ctx: Context, trace_file: str) -> dict:
+    """v1.6.8: re-execute the action list recorded in *trace_file*.
+
+    Returns the resulting ``ActionSequenceResult`` as JSON. Raises
+    when the file lacks replayable action entries or has no starting URL.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.replay_trace(trace_file)
+    return r.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

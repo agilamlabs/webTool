@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 from playwright.async_api import BrowserContext
@@ -41,6 +41,9 @@ from .browser_manager import BrowserManager
 from .config import AppConfig
 from .models import SessionInfo
 from .tab_manager import INITIAL_TAB_ID, TabManager
+
+if TYPE_CHECKING:  # pragma: no cover -- avoid import cycle at runtime
+    from .network_collector import NetworkCollector
 
 
 class SessionManager:
@@ -51,7 +54,12 @@ class SessionManager:
         config: Application configuration.
     """
 
-    def __init__(self, bm: BrowserManager, config: AppConfig) -> None:
+    def __init__(
+        self,
+        bm: BrowserManager,
+        config: AppConfig,
+        network_collector: Optional[NetworkCollector] = None,
+    ) -> None:
         self._bm = bm
         self._config = config
         self._sessions: dict[str, BrowserContext] = {}
@@ -60,6 +68,9 @@ class SessionManager:
         # -- created in create(), dropped in close(). list_tabs/new_tab/etc.
         # all read from here.
         self._tabs: dict[str, TabManager] = {}
+        # v1.6.8: shared NetworkCollector handed to every TabManager so
+        # initial pages, popups, and new_tab() all auto-attach.
+        self._network_collector = network_collector
         self._lock = asyncio.Lock()
 
     async def create(self, name: Optional[str] = None) -> str:
@@ -90,7 +101,9 @@ class SessionManager:
             # v1.6.6: instantiate TabManager BEFORE opening the initial page
             # so the auto-popup listener (ctx.on("page", ...)) is attached
             # before any other code can spawn a popup.
-            tab_mgr = TabManager(ctx)
+            # v1.6.8: hand the NetworkCollector to TabManager so popups and
+            # new_tab() pages get capture wired automatically.
+            tab_mgr = TabManager(ctx, network_collector=self._network_collector)
 
             ua = None
             try:

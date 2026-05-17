@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -117,6 +117,7 @@ class Downloader:
         debug: Optional[DebugCapture] = None,
         rate_limiter: Optional[RateLimiter] = None,
         robots: Optional[RobotsChecker] = None,
+        network_collector: Optional[Any] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
@@ -125,6 +126,12 @@ class Downloader:
         self._rate_limiter = rate_limiter
         self._robots = robots
         self._download_dir = Path(config.download.download_dir)
+        # v1.6.8: shared NetworkCollector. The downloader's own
+        # expect_download() consumer still owns saving the file; this
+        # collector layer adds a separate page.on("download") notification
+        # so the download URL is recorded even when capture_download_intents
+        # is on. None when no Agent provided one (older test scaffolding).
+        self._network_collector = network_collector
 
     async def download(
         self,
@@ -346,11 +353,15 @@ class Downloader:
                 ctx = self._sessions.get(session_id)
                 self._sessions.touch(session_id)
                 page = await ctx.new_page()
+                # v1.6.8: attach network capture (no-op when disabled).
+                if self._network_collector is not None:
+                    self._network_collector.attach(page)
                 try:
                     return await self._do_save_page(page, url, filepath)
                 finally:
                     await page.close()
             else:
+                # BrowserManager.new_page() already attaches the collector.
                 async with self._bm.new_page(block_resources=False) as page:
                     return await self._do_save_page(page, url, filepath)
         except Exception as e:
@@ -522,6 +533,9 @@ class Downloader:
                 ctx = self._sessions.get(session_id)
                 self._sessions.touch(session_id)
                 page = await ctx.new_page()
+                # v1.6.8: attach network capture (no-op when disabled).
+                if self._network_collector is not None:
+                    self._network_collector.attach(page)
                 try:
                     async with page.expect_download(timeout=60000) as download_info:
                         await page.goto(url)
@@ -546,6 +560,9 @@ class Downloader:
             else:
                 async with self._bm.new_context(block_resources=False) as ctx:
                     page = await ctx.new_page()
+                    # v1.6.8: attach network capture (no-op when disabled).
+                    if self._network_collector is not None:
+                        self._network_collector.attach(page)
                     async with page.expect_download(timeout=60000) as download_info:
                         await page.goto(url)
                     download = await download_info.value

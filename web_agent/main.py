@@ -186,6 +186,16 @@ async def run_skills(args: argparse.Namespace) -> None:
                 raise SystemExit(2)
 
 
+async def run_replay(args: argparse.Namespace) -> None:
+    """v1.6.8: re-execute a recorded JSONL action trace."""
+    config = _load_config(args)
+    setup_logging(config.log_level)
+
+    async with Agent(config) as agent:
+        result = await agent.replay_trace(args.trace_file)
+    print(result.model_dump_json(indent=2))
+
+
 async def run_doctor(args: argparse.Namespace) -> None:
     """Run web_agent self-diagnostic and print the report."""
     # Doctor doesn't need a running Agent or Browser, but it does need
@@ -303,6 +313,16 @@ def main() -> None:
         help='Skill inputs as JSON, e.g. \'{"company":"Apple"}\'',
     )
 
+    # v1.6.8: replay a recorded session trace (Feature 5)
+    sp_replay = subparsers.add_parser(
+        "replay",
+        help="Re-execute a recorded JSONL action trace (v1.6.8)",
+    )
+    sp_replay.add_argument(
+        "trace_file",
+        help="Path to a <session_id>.jsonl file under diagnostics.trace_dir",
+    )
+
     # v1.6.6: doctor (Feature 6)
     sp_doctor = subparsers.add_parser(
         "doctor",
@@ -331,6 +351,7 @@ def main() -> None:
         "observe": run_observe,
         "doctor": run_doctor,
         "skills": run_skills,
+        "replay": run_replay,
     }
     asyncio.run(handler_map[args.command](args))
 

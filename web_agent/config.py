@@ -19,12 +19,38 @@ Supports three configuration methods (in priority order):
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    """v1.6.8 (review C-3 fix): True iff *host* is unambiguously loopback.
+
+    Accepts the entire ``127.0.0.0/8`` IPv4 block, ``::1`` (in any
+    canonical form ``urlparse`` returns -- it strips the brackets), and
+    the literal hostname ``localhost``. Returning False for everything
+    else is the strict default we want for the ``remote_cdp_url`` gate;
+    DNS-resolving private addresses (10/8, 192.168/16, etc.) is NOT
+    loopback and remote_cdp must not accept them.
+    """
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    # Strip IPv6 brackets if present (urlparse already does this, but
+    # be defensive in case a caller passes a raw [::1] literal).
+    h = host.strip("[]")
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback)
 
 
 def _normalize_domain_patterns(value: Any) -> Any:
@@ -132,13 +158,28 @@ class BrowserConfig(BaseSettings):
     )
 
     # --- v1.6.6: CDP attach to webTool-launched browser -----------------
-    backend: Literal["playwright", "cdp_owned"] = Field(
+    # v1.6.8 widened the Literal to include ``"remote_cdp"`` -- existing
+    # configs with ``playwright`` or ``cdp_owned`` keep working unchanged;
+    # the new value is opt-in only.
+    backend: Literal["playwright", "cdp_owned", "remote_cdp"] = Field(
         default="playwright",
         description=(
             "Browser control backend. ``playwright`` (default) drives "
             "Chromium directly via Playwright's CDP. ``cdp_owned`` is a "
             "forward-compat label indicating CDP must be enabled; today "
-            "it's identical to ``playwright`` with ``cdp_enabled=True``."
+            "it's identical to ``playwright`` with ``cdp_enabled=True``. "
+            "``remote_cdp`` (v1.6.8) attaches to an externally-launched "
+            "browser via ``chromium.connect_over_cdp(remote_cdp_url)``."
+        ),
+    )
+    remote_cdp_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "WebSocket URL for an externally-launched CDP browser. Required "
+            "when ``backend='remote_cdp'``. Example: "
+            "``ws://127.0.0.1:9222/devtools/browser/<uuid>``. Must be a "
+            "loopback address -- non-loopback URLs are rejected as a "
+            "security foot-gun (same rule as ``cdp_host``)."
         ),
     )
     cdp_enabled: bool = Field(
@@ -227,6 +268,58 @@ class BrowserConfig(BaseSettings):
                 "BrowserConfig.profile_mode='named' requires profile_dir to be "
                 "set. Either set profile_dir to a directory path or switch to "
                 "profile_mode='ephemeral'."
+            )
+
+        # --- v1.6.8: remote CDP backend ---
+        if self.backend == "remote_cdp":
+            if not self.remote_cdp_url:
+                raise ConfigError(
+                    "BrowserConfig.backend='remote_cdp' requires remote_cdp_url. "
+                    "Set remote_cdp_url to a ws://127.0.0.1:<port>/devtools/browser/<uuid> "
+                    "endpoint exposed by an externally-launched Chromium."
+                )
+            parsed = urlparse(self.remote_cdp_url)
+            if parsed.scheme not in {"ws", "wss"}:
+                raise ConfigError(
+                    f"BrowserConfig.remote_cdp_url must use ws:// or wss://, "
+                    f"got scheme {parsed.scheme!r}."
+                )
+            if not _is_loopback_host(parsed.hostname):
+                # v1.6.8 (review C-3): the old check used an exact-string
+                # allowlist {127.0.0.1, localhost, ::1} that missed the
+                # rest of the 127.0.0.0/8 range. Use ipaddress.ip_address
+                # so 127.0.0.2 / 127.255.255.254 are also classified as
+                # loopback while public IPs and DNS names (other than
+                # 'localhost') stay rejected.
+                raise ConfigError(
+                    f"BrowserConfig.remote_cdp_url host {parsed.hostname!r} is "
+                    "not loopback. Connecting to a non-loopback CDP endpoint "
+                    "would let an external process pose as the local browser. "
+                    "Use 127.0.0.0/8, ::1, or localhost."
+                )
+            # remote_cdp is incompatible with the owned-launch knobs -- we
+            # don't own the user-data-dir on a remote browser, and there's
+            # no DevToolsActivePort file to discover the port from.
+            if self.isolation_mode:
+                raise ConfigError(
+                    "BrowserConfig.backend='remote_cdp' is incompatible with "
+                    "isolation_mode=True. Isolation mode owns a user-data-dir; "
+                    "the remote browser already has its own profile."
+                )
+            if self.cdp_enabled:
+                raise ConfigError(
+                    "BrowserConfig.backend='remote_cdp' is incompatible with "
+                    "cdp_enabled=True. cdp_enabled triggers a launch flow with "
+                    "DevToolsActivePort discovery; remote_cdp connects to an "
+                    "already-running browser instead."
+                )
+        elif self.remote_cdp_url is not None:
+            # User set remote_cdp_url without flipping backend -- surface
+            # the no-op rather than letting it silently disappear.
+            raise ConfigError(
+                "BrowserConfig.remote_cdp_url was set but backend is "
+                f"{self.backend!r}. Set backend='remote_cdp' to use it, or "
+                "clear remote_cdp_url to silence this error."
             )
 
         return self
@@ -656,6 +749,102 @@ class WorkspaceConfig(BaseSettings):
     )
 
 
+class DiagnosticsConfig(BaseSettings):
+    """v1.6.8: Network capture, download-intent capture, post-action
+    screenshots, and session replay traces.
+
+    All switches default False to match the v1.6.6/v1.6.7 opt-in posture
+    -- existing callers see zero behavior change. Enable individually:
+
+    - ``capture_network=True`` hooks ``page.on(request|response|requestfailed)``
+      on every Page created by the Agent and surfaces them as
+      ``FetchResult.network_events`` / ``ActionSequenceResult.network_events``.
+    - ``capture_download_intents=True`` adds ``page.on("download")`` notification
+      (separate from the downloader's explicit ``page.expect_download`` consumer)
+      so the URL of any page-triggered download is recorded even when not saved.
+    - ``screenshot_after_action=True`` captures a best-effort screenshot
+      after every successful action in ``execute_sequence`` to
+      ``automation.screenshot_dir`` (paths guarded by ``safe_join_path``).
+    - ``trace_enabled=True`` writes a per-session JSONL action log under
+      ``trace_dir`` so ``Agent.replay_trace(<file>)`` can re-execute.
+    """
+
+    capture_network: bool = Field(
+        default=False,
+        description=(
+            "Hook ``page.on(request|response|requestfailed)`` on every Page "
+            "the Agent creates. Off by default; opt in to populate "
+            "``FetchResult.network_events`` and ``api_candidates``."
+        ),
+    )
+    max_network_events: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        description=(
+            "Hard cap on retained events per Page. The per-Page deque uses "
+            "``maxlen=max_network_events``; oldest events are evicted in "
+            "O(1) when the cap is exceeded."
+        ),
+    )
+    network_resource_types: list[str] = Field(
+        default_factory=lambda: ["xhr", "fetch", "document"],
+        description=(
+            "Playwright ``request.resource_type`` values to record. Default "
+            "skips image/font/stylesheet/media noise. Set to an empty list "
+            "to record all resource types."
+        ),
+    )
+    include_request_headers: bool = Field(
+        default=False,
+        description=(
+            "Capture request headers on each NetworkEvent. Off by default "
+            "because headers commonly contain Authorization / Cookie values "
+            "an LLM consumer shouldn't see."
+        ),
+    )
+    include_response_headers: bool = Field(
+        default=False,
+        description="Capture response headers on each NetworkEvent. Off by default.",
+    )
+    capture_download_intents: bool = Field(
+        default=False,
+        description=(
+            "Attach ``page.on('download')`` as a notification listener and "
+            "record the download URL on every Page. The listener also calls "
+            "``download.delete()`` so the tmpfile doesn't pile up when no "
+            "explicit ``expect_download`` consumer is active."
+        ),
+    )
+    screenshot_after_action: bool = Field(
+        default=False,
+        description=(
+            "When True, ``BrowserActions.execute_sequence`` captures a "
+            "best-effort PNG screenshot after each successful action under "
+            "``automation.screenshot_dir`` (file name "
+            "``verify-<correlation_id>-<index>.png``). Failures are logged "
+            "at DEBUG and never fail the sequence."
+        ),
+    )
+    trace_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True, every action executed inside an interactive Session "
+            "appends a JSONL entry to "
+            "``<trace_dir>/<session_id>.jsonl`` with "
+            "``{ts, ordinal, session_id, correlation_id, method, args, "
+            "status, elapsed_ms}``. Replayable via ``Agent.replay_trace``."
+        ),
+    )
+    trace_dir: str = Field(
+        default="./.webtool-audit/traces",
+        description=(
+            "Directory for per-session trace files. Resolved against "
+            "``AppConfig.base_dir`` when relative. Created on first write."
+        ),
+    )
+
+
 class AppConfig(BaseSettings):
     """Top-level configuration for the web_agent toolkit.
 
@@ -714,6 +903,9 @@ class AppConfig(BaseSettings):
     # v1.6.7: domain skills + agent-editable workspace
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
+    # v1.6.8: network capture, download intents, post-action screenshots,
+    # session replay traces
+    diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     log_level: str = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")
@@ -746,6 +938,8 @@ class AppConfig(BaseSettings):
         self.debug.debug_dir = _resolve(self.debug.debug_dir)
         self.audit.audit_log_path = _resolve(self.audit.audit_log_path)
         self.cache.cache_dir = _resolve(self.cache.cache_dir)
+        # v1.6.8: session replay traces live under base_dir by default
+        self.diagnostics.trace_dir = _resolve(self.diagnostics.trace_dir)
         return self
 
     @classmethod

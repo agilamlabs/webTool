@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.7**
+- Latest version: **1.6.8**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -28,7 +28,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~505 tests; full suite must pass
+python -m pytest -v          # ~574 tests; full suite must pass
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -64,6 +64,8 @@ web_agent/             # The package. One module = one responsibility.
   domain_skills.py     # Domain skill registry + dispatcher (v1.6.7)
   workspace.py         # Agent-editable workspace with mode gates (v1.6.7)
   builtin_skills/      # Bundled domain skills (sec.gov / github.com / ec.europa.eu)
+  network_collector.py # Per-Page request/response/download event collector (v1.6.8)
+  trace_recorder.py    # Per-session JSONL action traces for replay (v1.6.8)
   cache.py             # DiskCache with TTL + LRU eviction (opt-in)
   audit.py             # JSONL audit log of every public Agent call (opt-in)
   rate_limiter.py      # Per-host token-bucket gate
@@ -149,6 +151,52 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.8 added
+
+Diagnostics and Advanced Browser Intelligence: webTool becomes
+explainable and debuggable. Six features, all **off by default**:
+
+**Network event capture (Rank 7, P1)**
+- New `web_agent/network_collector.py`: `NetworkCollector` attaches
+  `page.on("request" / "response" / "requestfailed")` to every Page via
+  `WeakKeyDictionary[Page, deque(maxlen=N)]`. Popups auto-attach through
+  the existing `TabManager._on_new_page` hook.
+- New `NetworkEvent` model. New fields on `FetchResult` and
+  `ActionSequenceResult`: `network_events`, `api_candidates`,
+  `download_candidates_runtime` / `download_candidates`.
+
+**API endpoint discovery + download diagnostics**
+- `NetworkCollector.api_candidates_for(page)`: dedupes XHR/fetch JSON
+  response URLs.
+- `page.on("download")` notification listener (independent of the
+  downloader's `expect_download` consumer) records intents and calls
+  `download.delete()` to avoid Chromium tmpfile pileup.
+
+**Post-action screenshot verification**
+- `BrowserActions._capture_verification_screenshot` writes
+  `verify-<cid>-<index>.png` under `automation.screenshot_dir` after
+  each successful action. Best-effort; never fails the sequence.
+- New `ActionSequenceResult.verification_screenshots: list[str]`.
+
+**Session replay / audit traces**
+- New `web_agent/trace_recorder.py`: per-session JSONL action log
+  with `{ts, ordinal, session_id, correlation_id, method, args,
+  status, elapsed_ms, url}`. Distinct from the global `AuditLogger`.
+- 3 new Agent methods: `replay_trace(file)`, `list_traces()`,
+  `get_remote_cdp_url()`.
+- New CLI subcommand: `web-agent replay <trace_file>`.
+
+**Remote CDP backend (Rank 10, P2)**
+- Third `BrowserConfig.backend` literal `"remote_cdp"` +
+  `remote_cdp_url` field. `BrowserManager.start()` dispatches to
+  `chromium.connect_over_cdp(remote_cdp_url)` instead of `launch()`.
+  Config validator enforces loopback-only, `ws://`/`wss://`,
+  rejects combinations with isolation_mode or cdp_enabled.
+- `stop()` disconnects without killing the remote process.
+
+**Tests:** 64 new across 6 files (`tests/test_v168_*.py`). Total
+suite ~574, all green. No new core dependencies.
 
 ## What v1.6.7 added
 
