@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.5**
+- Latest version: **1.6.6**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -28,7 +28,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~409 tests; full suite must pass
+python -m pytest -v          # ~450 tests; full suite must pass
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -55,10 +55,12 @@ web_agent/             # The package. One module = one responsibility.
   web_fetcher.py       # WebFetcher.fetch / fetch_many / fetch_binary
   content_extractor.py # trafilatura -> bs4 -> raw, plus PDF / XLSX
   downloader.py        # 3-strategy file download with safety gates
-  browser_actions.py   # 12 action types with semantic locators + URL safety
+  browser_actions.py   # 15 action types incl. coord-click/type/press (v1.6.6)
   recipes.py           # search_and_open_best_result, find_and_download_file,
                        # web_research, fill_form_and_extract
   session_manager.py   # Persistent browser sessions (cookies, storage)
+  tab_manager.py       # Per-session tab lifecycle (v1.6.6)
+  doctor.py            # Self-diagnostic capability probes (v1.6.6)
   cache.py             # DiskCache with TTL + LRU eviction (opt-in)
   audit.py             # JSONL audit log of every public Agent call (opt-in)
   rate_limiter.py      # Per-host token-bucket gate
@@ -144,6 +146,54 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.6 added
+
+Six browser-control features, adapted from `browser-harness` but
+adjusted to webTool's structured architecture and safety stance:
+**webTool never attaches to the user's existing personal Chrome.**
+
+**Browser launch (Features 1 + 2)**
+- `BrowserConfig.isolation_mode` -- launches Chromium against a
+  webTool-owned `--user-data-dir` (ephemeral tempdir by default,
+  or a named persistent profile). Failed launches don't leak.
+- `BrowserConfig.cdp_enabled` -- adds `--remote-debugging-port` to
+  the launch args and exposes `Agent.get_cdp_endpoint()` for
+  external observers. CDP requires isolation; `attach_existing_browser`
+  is rejected at config validation.
+
+**Tabs (Feature 3)**
+- New `TabManager` per session: `agent.list_tabs / current_tab /
+  new_tab / switch_tab / close_tab`. Popups auto-register but don't
+  steal focus.
+- `BaseAction` parent class adds optional `tab_id` to every Action
+  input. Transparent to v1.6.5 JSON callers.
+- **Behavior change:** session-owned `interact()` calls now reuse
+  the session's current tab. Escape hatch:
+  `automation.fresh_tab_per_call=True`.
+
+**Coordinate fallbacks (Feature 4)**
+- Three new Action types: `click_xy`, `type_text`, `press_key`. Use
+  after `observe()` for canvas/shadow/iframe targets selectors can't
+  reach. Coordinates are CSS pixels; honor `device_pixel_ratio` from
+  observe.
+- Top-level `Agent.click_xy / type_text / press_key` (all require
+  `session_id`).
+
+**Observe (Feature 5)**
+- `Agent.observe(url, session_id, tab_id, include_text, include_aria)`
+  returns an `ObserveResult` with screenshot path, viewport / page /
+  scroll dimensions, DPR, optional truncated text, optional ARIA
+  snapshot. Powers the observe -> act -> verify loop.
+
+**Doctor (Feature 6)**
+- `Agent.doctor(quick=False)` runs 14 capability probes and returns
+  a `DoctorReport` with summary `healthy` | `usable_with_warnings` |
+  `unusable`. CLI: `web-agent doctor [--quick] [--json]` -- exits 2
+  on `unusable` so CI can gate on it.
+
+**Tests:** 41 new across 7 files (`tests/test_v166_*.py`). Total
+suite ~450, all green.
 
 ## What v1.6.5 added
 

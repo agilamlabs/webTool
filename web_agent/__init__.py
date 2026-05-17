@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.5"
+__version__ = "1.6.6"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -81,7 +81,11 @@ from .models import (
     ActionStatus,
     ActionType,
     AgentResult,
+    BaseAction,
     Citation,
+    ClickXYInput,
+    DoctorCheck,
+    DoctorReport,
     DownloadResult,
     ExtractionResult,
     FetchDiagnostic,
@@ -89,16 +93,20 @@ from .models import (
     FetchStatus,
     FormFilterSpec,
     LocatorSpec,
+    ObserveResult,
+    PressKeyInput,
     ResearchResult,
     ScreenshotResult,
     SearchResponse,
     SearchResultItem,
     SelectorLike,
     SessionInfo,
+    TabInfo,
     ToolError,
     ToolMessage,
     ToolSeverity,
     ToolWarning,
+    TypeTextInput,
 )
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
@@ -170,7 +178,11 @@ __all__ = [
     "ActionStatus",
     "ActionType",
     "AgentResult",
+    "BaseAction",
     "Citation",
+    "ClickXYInput",
+    "DoctorCheck",
+    "DoctorReport",
     "DownloadResult",
     "ExtractionResult",
     "FetchDiagnostic",
@@ -178,14 +190,18 @@ __all__ = [
     "FetchStatus",
     "FormFilterSpec",
     "LocatorSpec",
+    "ObserveResult",
+    "PressKeyInput",
     "ResearchResult",
     "ScreenshotResult",
     "SearchResponse",
     "SearchResultItem",
     "SelectorLike",
     "SessionInfo",
+    "TabInfo",
     "ToolError",
     "ToolMessage",
     "ToolSeverity",
     "ToolWarning",
+    "TypeTextInput",
 ]
