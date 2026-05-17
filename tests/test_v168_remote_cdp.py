@@ -50,6 +50,54 @@ def test_backend_remote_cdp_incompatible_with_isolation_mode() -> None:
         )
 
 
+# v1.6.8 review C-3 regression: the old exact-string allowlist
+# {"127.0.0.1", "localhost", "::1"} missed the rest of 127.0.0.0/8.
+# 127.0.0.2 still routes locally on every OS, but for safety we want the
+# ipaddress.is_loopback check to be the source of truth.
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ws://127.0.0.2:9222/devtools/browser/x",
+        "ws://127.255.255.254:9222/devtools/browser/x",
+        "wss://127.10.20.30:9222/devtools/browser/x",
+    ],
+)
+def test_backend_remote_cdp_accepts_127_8_range(url: str) -> None:
+    # No raise == accepted
+    bc = BrowserConfig(backend="remote_cdp", remote_cdp_url=url)
+    assert bc.backend == "remote_cdp"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Non-loopback IPv4
+        "ws://10.0.0.1:9222/devtools/browser/x",
+        "ws://192.168.1.1:9222/devtools/browser/x",
+        # Public IPv4
+        "ws://8.8.8.8:9222/devtools/browser/x",
+        # Non-loopback IPv6
+        "ws://[fe80::1]:9222/devtools/browser/x",
+        # Empty host (validators must reject)
+        "ws:///devtools/browser/x",
+    ],
+)
+def test_backend_remote_cdp_rejects_non_loopback_ip(url: str) -> None:
+    with pytest.raises((ConfigError, ValidationError), match="not loopback"):
+        BrowserConfig(backend="remote_cdp", remote_cdp_url=url)
+
+
+def test_backend_remote_cdp_accepts_ipv6_loopback_bracket_form() -> None:
+    # urlparse strips the brackets internally; verify ::1 passes.
+    bc = BrowserConfig(
+        backend="remote_cdp",
+        remote_cdp_url="ws://[::1]:9222/devtools/browser/x",
+    )
+    assert bc.backend == "remote_cdp"
+
+
 # ---------------------------------------------------------------------------
 # BrowserManager.start() dispatches to connect_over_cdp
 # ---------------------------------------------------------------------------

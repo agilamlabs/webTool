@@ -19,6 +19,7 @@ Supports three configuration methods (in priority order):
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from typing import Any, Literal, Optional
 from urllib.parse import urlparse
@@ -26,6 +27,30 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    """v1.6.8 (review C-3 fix): True iff *host* is unambiguously loopback.
+
+    Accepts the entire ``127.0.0.0/8`` IPv4 block, ``::1`` (in any
+    canonical form ``urlparse`` returns -- it strips the brackets), and
+    the literal hostname ``localhost``. Returning False for everything
+    else is the strict default we want for the ``remote_cdp_url`` gate;
+    DNS-resolving private addresses (10/8, 192.168/16, etc.) is NOT
+    loopback and remote_cdp must not accept them.
+    """
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    # Strip IPv6 brackets if present (urlparse already does this, but
+    # be defensive in case a caller passes a raw [::1] literal).
+    h = host.strip("[]")
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback)
 
 
 def _normalize_domain_patterns(value: Any) -> Any:
@@ -259,12 +284,18 @@ class BrowserConfig(BaseSettings):
                     f"BrowserConfig.remote_cdp_url must use ws:// or wss://, "
                     f"got scheme {parsed.scheme!r}."
                 )
-            if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            if not _is_loopback_host(parsed.hostname):
+                # v1.6.8 (review C-3): the old check used an exact-string
+                # allowlist {127.0.0.1, localhost, ::1} that missed the
+                # rest of the 127.0.0.0/8 range. Use ipaddress.ip_address
+                # so 127.0.0.2 / 127.255.255.254 are also classified as
+                # loopback while public IPs and DNS names (other than
+                # 'localhost') stay rejected.
                 raise ConfigError(
                     f"BrowserConfig.remote_cdp_url host {parsed.hostname!r} is "
                     "not loopback. Connecting to a non-loopback CDP endpoint "
                     "would let an external process pose as the local browser. "
-                    "Use 127.0.0.1, localhost, or ::1."
+                    "Use 127.0.0.0/8, ::1, or localhost."
                 )
             # remote_cdp is incompatible with the owned-launch knobs -- we
             # don't own the user-data-dir on a remote browser, and there's

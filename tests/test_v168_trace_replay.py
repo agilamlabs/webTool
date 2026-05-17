@@ -191,7 +191,11 @@ async def test_replay_trace_reconstructs_action_list(tmp_path: Path) -> None:
                 json.dumps(
                     {
                         "method": "action.wait",
-                        "args": {"duration_ms": 100, "action": "wait"},
+                        # WaitInput accepts ``timeout`` (ms) -- not duration_ms.
+                        # Pydantic ignores unknown fields silently by default,
+                        # but using a real WaitInput field makes the test
+                        # actually exercise the deserialisation it claims.
+                        "args": {"timeout": 100, "action": "wait"},
                         "status": "success",
                         "elapsed_ms": 100,
                     }

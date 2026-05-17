@@ -68,6 +68,14 @@ class NetworkCollector:
         # are cheap and short-lived; we wipe inner dict on Page close via
         # the WeakKeyDictionary parent.
         self._req_start: WeakKeyDictionary[Any, dict[str, float]] = WeakKeyDictionary()
+        # v1.6.8 (review C-2 fix): strong references for fire-and-forget
+        # tmpfile-cleanup tasks. asyncio.create_task returns a Task whose
+        # only reference here would be the inner local in _on_download --
+        # CPython's GC may collect it before .delete() completes, defeating
+        # the cleanup. We keep the Task alive until it finishes, then
+        # discard it via add_done_callback. See:
+        # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+        self._pending_deletes: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # public API
@@ -305,8 +313,14 @@ class NetworkCollector:
             return
         # Best-effort tmpfile cleanup. If no event loop is running (unlikely
         # in async Playwright), just skip -- Chromium will clean up on exit.
+        # v1.6.8 (review C-2 fix): keep a strong reference to the Task in
+        # ``self._pending_deletes`` until it finishes, otherwise CPython
+        # may GC the Task before ``download.delete()`` completes and the
+        # cleanup the listener was added for never actually runs.
         with contextlib.suppress(RuntimeError):
-            asyncio.get_running_loop().create_task(self._safe_delete(download))
+            task = asyncio.get_running_loop().create_task(self._safe_delete(download))
+            self._pending_deletes.add(task)
+            task.add_done_callback(self._pending_deletes.discard)
 
     @staticmethod
     async def _safe_delete(download: Any) -> None:

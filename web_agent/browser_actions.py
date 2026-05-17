@@ -507,17 +507,18 @@ class BrowserActions:
                         selector=_selector_repr(getattr(remaining, "selector", None)),
                     )
                 )
-            # v1.6.8: snapshot network events / api_candidates / download
-            # intents BEFORE the page is closed. The deques live in a
-            # WeakKeyDictionary so once the Page is GC'd the data is gone.
-            # Captured here (inside try) so the closer-than-finally locality
-            # makes the lifecycle obvious. The vars were initialised before
-            # the try block so an early exception still leaves them bound.
-            if self._network_collector is not None and page is not None:
-                net_events = self._network_collector.events_for(page)
-                api_cands = self._network_collector.api_candidates_for(page)
-                dl_intents = self._network_collector.download_intents_for(page)
         finally:
+            # v1.6.8 (review C-1 fix): snapshot network events BEFORE the
+            # page is closed. Must run on BOTH the success and exception
+            # paths -- the original placement inside ``except`` left every
+            # successful sequence's network_events / api_candidates /
+            # download_candidates empty. ``finally`` fires unconditionally
+            # and ``page`` is still alive here (close happens below).
+            if self._network_collector is not None and page is not None:
+                with contextlib.suppress(Exception):
+                    net_events = self._network_collector.events_for(page)
+                    api_cands = self._network_collector.api_candidates_for(page)
+                    dl_intents = self._network_collector.download_intents_for(page)
             # v1.6.6: only close pages WE created. Persistent session tabs
             # outlive sequences so subsequent interact() calls share state.
             if page is not None and owner == "session_ephemeral":
