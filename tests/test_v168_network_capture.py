@@ -45,7 +45,9 @@ def _make_request(
     return req
 
 
-def _make_response(req: MagicMock, status: int = 200, content_type: str = "application/json") -> MagicMock:
+def _make_response(
+    req: MagicMock, status: int = 200, content_type: str = "application/json"
+) -> MagicMock:
     resp = MagicMock()
     resp.request = req
     resp.status = status
@@ -125,9 +127,7 @@ def test_network_collector_enforces_max_events_cap() -> None:
 
 def test_network_collector_resource_type_filter_excludes_image() -> None:
     nc = NetworkCollector(
-        DiagnosticsConfig(
-            capture_network=True, network_resource_types=["xhr", "fetch"]
-        )
+        DiagnosticsConfig(capture_network=True, network_resource_types=["xhr", "fetch"])
     )
     page = _make_mock_page()
     nc.attach(page)
@@ -148,14 +148,10 @@ def test_network_collector_omits_headers_by_default() -> None:
 
 
 def test_network_collector_includes_headers_when_opted_in() -> None:
-    nc = NetworkCollector(
-        DiagnosticsConfig(capture_network=True, include_request_headers=True)
-    )
+    nc = NetworkCollector(DiagnosticsConfig(capture_network=True, include_request_headers=True))
     page = _make_mock_page()
     nc.attach(page)
-    _emit(
-        page, "request", _make_request(headers={"authorization": "Bearer secret"})
-    )
+    _emit(page, "request", _make_request(headers={"authorization": "Bearer secret"}))
     events = nc.events_for(page)
     assert events[0].request_headers.get("authorization") == "Bearer secret"
 
@@ -178,9 +174,7 @@ def test_api_candidates_filter_xhr_json() -> None:
 
 def test_api_candidates_filter_excludes_html_documents() -> None:
     nc = NetworkCollector(
-        DiagnosticsConfig(
-            capture_network=True, network_resource_types=["xhr", "fetch", "document"]
-        )
+        DiagnosticsConfig(capture_network=True, network_resource_types=["xhr", "fetch", "document"])
     )
     page = _make_mock_page()
     nc.attach(page)

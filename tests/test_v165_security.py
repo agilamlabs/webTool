@@ -77,9 +77,7 @@ async def test_cookies_for_session_subdomain_match():
 async def test_cookies_for_session_exact_host_match_with_no_domain_attr():
     """Domainless cookies pin to the target host (Playwright per-host cookie)."""
     fake_ctx = MagicMock()
-    fake_ctx.cookies = AsyncMock(
-        return_value=[{"name": "csrf", "value": "abc", "domain": ""}]
-    )
+    fake_ctx.cookies = AsyncMock(return_value=[{"name": "csrf", "value": "abc", "domain": ""}])
     fake_sessions = MagicMock()
     fake_sessions.get = MagicMock(return_value=fake_ctx)
 
@@ -225,9 +223,7 @@ async def test_save_page_blocks_redirect_to_denied_host(tmp_path: Path):
     downloader = _make_downloader(tmp_path)
 
     fake_page = MagicMock()
-    fake_page.goto = AsyncMock(
-        return_value=MagicMock(headers={"content-type": "text/html"})
-    )
+    fake_page.goto = AsyncMock(return_value=MagicMock(headers={"content-type": "text/html"}))
     # type-level property so accessing fake_page.url returns the redirected URL
     type(fake_page).url = property(lambda _self: "https://evil.example.com/landing")
     fake_page.content = AsyncMock(return_value="<html>evil content</html>")
@@ -247,9 +243,7 @@ async def test_save_page_allows_when_redirect_stays_in_policy(tmp_path: Path):
     downloader = _make_downloader(tmp_path)
 
     fake_page = MagicMock()
-    fake_page.goto = AsyncMock(
-        return_value=MagicMock(headers={"content-type": "text/html"})
-    )
+    fake_page.goto = AsyncMock(return_value=MagicMock(headers={"content-type": "text/html"}))
     type(fake_page).url = property(lambda _self: "https://allowed.com/landing")
     fake_page.content = AsyncMock(return_value="<html>ok</html>")
 

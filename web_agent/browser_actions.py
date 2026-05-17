@@ -434,18 +434,12 @@ class BrowserActions:
                 # v1.6.8: per-action trace recording. Off by default; only
                 # active when DiagnosticsConfig.trace_enabled and a
                 # session_id is known (replay requires session context).
-                if (
-                    session_id
-                    and self._trace_recorder is not None
-                    and self._trace_recorder.enabled
-                ):
+                if session_id and self._trace_recorder is not None and self._trace_recorder.enabled:
                     with contextlib.suppress(Exception):
                         await self._trace_recorder.record(
                             session_id=session_id,
                             method=f"action.{action_input.action}",
-                            args=action_input.model_dump(
-                                exclude_none=True, exclude={"tab_id"}
-                            ),
+                            args=action_input.model_dump(exclude_none=True, exclude={"tab_id"}),
                             status=result.status.value,
                             elapsed_ms=result.duration_ms,
                             url=url,
@@ -1255,9 +1249,7 @@ class BrowserActions:
             },
         )
 
-    async def _do_shadow_dom_click(
-        self, page: Page, action: ShadowDomClickInput
-    ) -> ActionResult:
+    async def _do_shadow_dom_click(self, page: Page, action: ShadowDomClickInput) -> ActionResult:
         """Click an element inside a shadow DOM tree.
 
         Playwright auto-pierces shadow DOM for CSS selectors. The ``>>``
@@ -1297,9 +1289,7 @@ class BrowserActions:
             await source_loc.drag_to(target_loc, timeout=action.timeout)
         else:
             await source_loc.drag_to(target_loc)
-        logger.debug(
-            "Dragged {src} -> {tgt}", src=action.source, tgt=action.target
-        )
+        logger.debug("Dragged {src} -> {tgt}", src=action.source, tgt=action.target)
         return ActionResult(
             action=ActionType.DRAG_AND_DROP,
             status=ActionStatus.SUCCESS,
@@ -1334,9 +1324,7 @@ class BrowserActions:
         tab_mgr = self._sessions.get_tab_manager(session_id)
         page = tab_mgr.get_or_current(tab_id)
         if page is None:
-            raise ValueError(
-                f"Session {session_id!r} has no current tab. Open one first."
-            )
+            raise ValueError(f"Session {session_id!r} has no current tab. Open one first.")
         self._sessions.touch(session_id)
 
         # Already on the page? Quick win.
@@ -1411,9 +1399,7 @@ class BrowserActions:
         try:
             if page is None:
                 if not url:
-                    raise ValueError(
-                        "print_page_as_pdf() requires either session_id or url."
-                    )
+                    raise ValueError("print_page_as_pdf() requires either session_id or url.")
                 if not check_domain_allowed(url, safety):
                     host = urlparse(url).hostname or ""
                     raise ValueError(f"Domain not allowed: {host}")
@@ -1637,15 +1623,13 @@ class BrowserActions:
         """
         if self._sessions is None:
             raise RuntimeError(
-                "Agent has no SessionManager wired up; cannot run "
-                "session-targeted single actions."
+                "Agent has no SessionManager wired up; cannot run session-targeted single actions."
             )
         tab_mgr = self._sessions.get_tab_manager(session_id)
         page = tab_mgr.get_or_current(tab_id)
         if page is None:
             raise ValueError(
-                f"Session {session_id!r} has no current tab. "
-                f"Open one with agent.new_tab(...)."
+                f"Session {session_id!r} has no current tab. Open one with agent.new_tab(...)."
             )
         self._sessions.touch(session_id)
         return await self.execute_action(page, action)

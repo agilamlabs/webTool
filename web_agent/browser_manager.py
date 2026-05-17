@@ -322,7 +322,9 @@ class BrowserManager:
                 except Exception as exc:
                     logger.warning(
                         "Error {action}: {e}",
-                        action="disconnecting remote CDP" if self._is_remote_cdp else "closing browser",
+                        action="disconnecting remote CDP"
+                        if self._is_remote_cdp
+                        else "closing browser",
                         e=exc,
                     )
                 self._browser = None

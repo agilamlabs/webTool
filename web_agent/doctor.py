@@ -87,9 +87,7 @@ async def _check_package_version(_cfg: AppConfig) -> DoctorCheck:
             status="fail",
             message=f"web_agent.__version__ unavailable: {exc}",
         )
-    return DoctorCheck(
-        name="package_version", status="ok", message=f"web_agent {__version__}"
-    )
+    return DoctorCheck(name="package_version", status="ok", message=f"web_agent {__version__}")
 
 
 async def _check_playwright_import(_cfg: AppConfig) -> DoctorCheck:
@@ -103,9 +101,7 @@ async def _check_playwright_import(_cfg: AppConfig) -> DoctorCheck:
             status="fail",
             message=f"playwright import failed: {exc}",
         )
-    return DoctorCheck(
-        name="playwright_import", status="ok", message=f"playwright {version}"
-    )
+    return DoctorCheck(name="playwright_import", status="ok", message=f"playwright {version}")
 
 
 async def _check_chromium_installed(_cfg: AppConfig) -> DoctorCheck:
@@ -141,10 +137,7 @@ async def _check_chromium_installed(_cfg: AppConfig) -> DoctorCheck:
     return DoctorCheck(
         name="chromium_installed",
         status="fail",
-        message=(
-            f"Playwright driver not found at {p}. "
-            f"Run: python -m playwright install chromium"
-        ),
+        message=(f"Playwright driver not found at {p}. Run: python -m playwright install chromium"),
     )
 
 
@@ -236,9 +229,7 @@ async def _check_binary_extra(name: str, module: str) -> DoctorCheck:
             status="warn",
             message=f"{module} not available: {exc} ({name} extraction disabled)",
         )
-    return DoctorCheck(
-        name=f"binary_extra_{name}", status="ok", message=f"{module} importable"
-    )
+    return DoctorCheck(name=f"binary_extra_{name}", status="ok", message=f"{module} importable")
 
 
 async def _check_dir_writable(name: str, path: str) -> DoctorCheck:
@@ -254,9 +245,7 @@ async def _check_dir_writable(name: str, path: str) -> DoctorCheck:
             status="fail",
             message=f"{path}: {exc}",
         )
-    return DoctorCheck(
-        name=f"dir_writable_{name}", status="ok", message=f"{path} is writable"
-    )
+    return DoctorCheck(name=f"dir_writable_{name}", status="ok", message=f"{path} is writable")
 
 
 async def _check_network_connectivity(_cfg: AppConfig) -> DoctorCheck:
@@ -393,9 +382,7 @@ async def run_doctor(config: AppConfig, *, quick: bool = False) -> DoctorReport:
         await _timed("binary_extra_openpyxl", _check_binary_extra, "openpyxl", "openpyxl")
     )
     checks.append(
-        await _timed(
-            "binary_extra_python_docx", _check_binary_extra, "python_docx", "docx"
-        )
+        await _timed("binary_extra_python_docx", _check_binary_extra, "python_docx", "docx")
     )
     checks.append(
         await _timed(
@@ -414,13 +401,9 @@ async def run_doctor(config: AppConfig, *, quick: bool = False) -> DoctorReport:
         )
     )
     checks.append(
-        await _timed(
-            "dir_writable_debug", _check_dir_writable, "debug", config.debug.debug_dir
-        )
+        await _timed("dir_writable_debug", _check_dir_writable, "debug", config.debug.debug_dir)
     )
-    checks.append(
-        await _timed("network_connectivity", _check_network_connectivity, config)
-    )
+    checks.append(await _timed("network_connectivity", _check_network_connectivity, config))
     checks.append(await _timed("robots_rate_sanity", _check_robots_rate_sanity, config))
     checks.append(await _timed("config_file_parse", _check_config_file_parse, config))
 
@@ -442,9 +425,7 @@ def format_report_human(report: DoctorReport) -> str:
     sym = {"ok": "[OK]", "warn": "[WARN]", "fail": "[FAIL]", "skip": "[SKIP]"}
     lines: list[str] = []
     lines.append(f"webTool Doctor -- {report.platform}")
-    lines.append(
-        f"Python {report.python_version}  web_agent {report.web_agent_version}"
-    )
+    lines.append(f"Python {report.python_version}  web_agent {report.web_agent_version}")
     lines.append("")
     for c in report.checks:
         lines.append(f"{sym.get(c.status, '[?]'):7} {c.name:32}  {c.message}")

@@ -1038,15 +1038,12 @@ class ObserveResult(BaseModel):
     scroll_y: int = Field(description="Current vertical scroll offset (CSS pixels)")
     device_pixel_ratio: float = Field(
         description=(
-            "window.devicePixelRatio. Multiply CSS pixels by DPR to get "
-            "screenshot pixels."
+            "window.devicePixelRatio. Multiply CSS pixels by DPR to get screenshot pixels."
         )
     )
     visible_text: Optional[str] = Field(
         default=None,
-        description=(
-            "Truncated document.body.innerText. None when include_text=False."
-        ),
+        description=("Truncated document.body.innerText. None when include_text=False."),
     )
     aria_snapshot: Optional[dict[str, Any]] = Field(
         default=None,

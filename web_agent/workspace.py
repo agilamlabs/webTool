@@ -88,18 +88,14 @@ class Workspace:
 
     def _check_enabled(self) -> None:
         if not self._ws_cfg.enabled:
-            raise WorkspaceError(
-                "Workspace is disabled. Set workspace.enabled=True to opt in."
-            )
+            raise WorkspaceError("Workspace is disabled. Set workspace.enabled=True to opt in.")
 
     def _check_write_allowed(self, rel_path: str) -> None:
         """Raise WorkspaceError if the configured mode forbids writing rel_path."""
         self._check_enabled()
         mode = self._ws_cfg.mode
         if mode == "read_only":
-            raise WorkspaceError(
-                f"Workspace mode is 'read_only'; cannot write {rel_path!r}."
-            )
+            raise WorkspaceError(f"Workspace mode is 'read_only'; cannot write {rel_path!r}.")
 
         # markdown_skills_only: must be .md AND under domain-skills/
         if mode == "markdown_skills_only":

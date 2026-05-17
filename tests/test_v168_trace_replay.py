@@ -162,9 +162,7 @@ async def test_replay_trace_reconstructs_action_list(tmp_path: Path) -> None:
 
     cfg = AppConfig(
         base_dir=str(tmp_path),
-        diagnostics=DiagnosticsConfig(
-            trace_enabled=True, trace_dir=str(tmp_path / "traces")
-        ),
+        diagnostics=DiagnosticsConfig(trace_enabled=True, trace_dir=str(tmp_path / "traces")),
     )
     agent = Agent(cfg)
     # Stub execute_sequence so we don't actually launch a browser.
@@ -223,9 +221,7 @@ async def test_replay_trace_raises_when_no_replayable_actions(tmp_path: Path) ->
 
     cfg = AppConfig(
         base_dir=str(tmp_path),
-        diagnostics=DiagnosticsConfig(
-            trace_enabled=True, trace_dir=str(tmp_path / "traces")
-        ),
+        diagnostics=DiagnosticsConfig(trace_enabled=True, trace_dir=str(tmp_path / "traces")),
     )
     agent = Agent(cfg)
     trace_dir = Path(cfg.diagnostics.trace_dir)
@@ -242,9 +238,7 @@ async def test_agent_list_traces_returns_session_ids(tmp_path: Path) -> None:
 
     cfg = AppConfig(
         base_dir=str(tmp_path),
-        diagnostics=DiagnosticsConfig(
-            trace_enabled=True, trace_dir=str(tmp_path / "traces")
-        ),
+        diagnostics=DiagnosticsConfig(trace_enabled=True, trace_dir=str(tmp_path / "traces")),
     )
     agent = Agent(cfg)
     # Initially empty

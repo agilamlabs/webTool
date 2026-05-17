@@ -33,7 +33,6 @@ from .correlation import get_correlation_id
 from .models import NetworkEvent
 
 if TYPE_CHECKING:  # pragma: no cover -- runtime types come from Playwright
-
     from .config import DiagnosticsConfig
 
 
@@ -55,9 +54,7 @@ class NetworkCollector:
         # WeakKeyDictionary: closed Pages drop out automatically, so we
         # don't need a separate detach path -- Playwright's Page.close()
         # is the only signal we need.
-        self._events: WeakKeyDictionary[Any, collections.deque[NetworkEvent]] = (
-            WeakKeyDictionary()
-        )
+        self._events: WeakKeyDictionary[Any, collections.deque[NetworkEvent]] = WeakKeyDictionary()
         self._download_intents: WeakKeyDictionary[Any, list[str]] = WeakKeyDictionary()
         # Tracks which Pages we've already wired hooks for; without it,
         # repeated attach() calls (from e.g. TabManager and SessionManager
@@ -193,10 +190,7 @@ class NetworkCollector:
     def _on_request(self, page: Any, req: Any) -> None:
         try:
             rtype = req.resource_type
-            if (
-                self._diag.network_resource_types
-                and rtype not in self._diag.network_resource_types
-            ):
+            if self._diag.network_resource_types and rtype not in self._diag.network_resource_types:
                 return
             self._req_start.setdefault(page, {})[req.url] = time.monotonic()
             headers = dict(req.headers) if self._diag.include_request_headers else {}
@@ -218,10 +212,7 @@ class NetworkCollector:
         try:
             req = resp.request
             rtype = req.resource_type
-            if (
-                self._diag.network_resource_types
-                and rtype not in self._diag.network_resource_types
-            ):
+            if self._diag.network_resource_types and rtype not in self._diag.network_resource_types:
                 return
             start = self._req_start.get(page, {}).pop(req.url, None)
             timing_ms = (time.monotonic() - start) * 1000.0 if start else 0.0
@@ -243,9 +234,7 @@ class NetworkCollector:
                 resource_type=rtype,
                 status_code=resp.status,
                 content_type=ctype,
-                request_headers=(
-                    dict(req.headers) if self._diag.include_request_headers else {}
-                ),
+                request_headers=(dict(req.headers) if self._diag.include_request_headers else {}),
                 response_headers=headers,
                 timing_ms=round(timing_ms, 2),
                 correlation_id=get_correlation_id(),
@@ -259,19 +248,14 @@ class NetworkCollector:
     def _on_failed(self, page: Any, req: Any) -> None:
         try:
             rtype = req.resource_type
-            if (
-                self._diag.network_resource_types
-                and rtype not in self._diag.network_resource_types
-            ):
+            if self._diag.network_resource_types and rtype not in self._diag.network_resource_types:
                 return
             failure = ""
             try:
                 f = req.failure
                 if f is not None:
                     # In Playwright, failure can be a dict or string-like.
-                    failure = (
-                        f.get("errorText", "") if isinstance(f, dict) else str(f)
-                    )
+                    failure = f.get("errorText", "") if isinstance(f, dict) else str(f)
             except Exception:
                 pass
             self._req_start.get(page, {}).pop(req.url, None)
@@ -281,9 +265,7 @@ class NetworkCollector:
                 method=req.method,
                 resource_type=rtype,
                 failure_text=failure or None,
-                request_headers=(
-                    dict(req.headers) if self._diag.include_request_headers else {}
-                ),
+                request_headers=(dict(req.headers) if self._diag.include_request_headers else {}),
                 correlation_id=get_correlation_id(),
             )
             buf = self._events.get(page)

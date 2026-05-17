@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 # (site:, OR, quoted phrases, grouping). Stripping these blocks
 # scope-escape attacks where a prompt-injected input contains something
 # like '" OR site:evil.com"' that would expand beyond github.com.
-_QUERY_OPERATOR_CHARS = re.compile(r'[\"\'()\[\]|]')
+_QUERY_OPERATOR_CHARS = re.compile(r"[\"\'()\[\]|]")
 
 
 def _sanitize_query_term(s: str) -> str:

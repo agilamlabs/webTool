@@ -76,9 +76,7 @@ async def test_verify_screenshot_sanitizes_cid_with_path_chars(tmp_path: Path) -
     page = _make_page()
     # Even though cids are UUIDs in practice, defensive: separators
     # become underscores so safe_join_path doesn't reject them.
-    out = await actions._capture_verification_screenshot(
-        page, action_index=1, cid="../../escape"
-    )
+    out = await actions._capture_verification_screenshot(page, action_index=1, cid="../../escape")
     assert out is not None
     p = Path(out)
     assert "escape" in p.name

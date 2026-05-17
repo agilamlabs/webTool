@@ -75,9 +75,7 @@ class SessionTraceRecorder:
         # _is_cross_platform_absolute is the v1.6.4 utility that handles
         # the Windows vs POSIX absolute-path semantics correctly. It takes
         # a string (not a Path), so we pass raw_str.
-        self._dir = (
-            raw if _is_cross_platform_absolute(raw_str) else Path(base_dir).resolve() / raw
-        )
+        self._dir = raw if _is_cross_platform_absolute(raw_str) else Path(base_dir).resolve() / raw
         self._lock = asyncio.Lock()
         # ordinal counter per-session so concurrent record() calls for
         # the same session_id always produce a strict monotonic ordering

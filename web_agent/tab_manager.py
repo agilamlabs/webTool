@@ -124,9 +124,7 @@ class TabManager:
     # registration (called by SessionManager)
     # ------------------------------------------------------------------
 
-    async def register_initial_page(
-        self, page: Page, tab_id: str = INITIAL_TAB_ID
-    ) -> str:
+    async def register_initial_page(self, page: Page, tab_id: str = INITIAL_TAB_ID) -> str:
         """Register the first page of a freshly-created session.
 
         Called by ``SessionManager.create()`` after ``ctx.new_page()``.

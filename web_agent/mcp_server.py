@@ -104,9 +104,7 @@ def _load_mcp_config() -> AppConfig:
                     e=exc,
                 )
         else:
-            logger.warning(
-                "WEB_AGENT_CONFIG={p} not found; using defaults", p=path
-            )
+            logger.warning("WEB_AGENT_CONFIG={p} not found; using defaults", p=path)
     return AppConfig()
 
 
@@ -550,9 +548,7 @@ async def web_current_tab(ctx: Context, session_id: str) -> dict:
 
 
 @mcp.tool()
-async def web_new_tab(
-    ctx: Context, session_id: str, url: Optional[str] = None
-) -> dict:
+async def web_new_tab(ctx: Context, session_id: str, url: Optional[str] = None) -> dict:
     """Open a fresh tab in a session.
 
     The new tab becomes the active tab. If ``url`` is provided, the tab
@@ -647,9 +643,7 @@ async def web_press_key(
     ``key="a", modifiers=["Control"]``.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    r = await agent.press_key(
-        key, session_id=session_id, tab_id=tab_id, modifiers=modifiers
-    )
+    r = await agent.press_key(key, session_id=session_id, tab_id=tab_id, modifiers=modifiers)
     return r.model_dump(mode="json")
 
 
@@ -874,9 +868,7 @@ async def web_upload_file(
     ``safety.allow_upload_outside_download_dir=True`` to widen.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    r = await agent.upload_file(
-        selector, paths, session_id=session_id, tab_id=tab_id
-    )
+    r = await agent.upload_file(selector, paths, session_id=session_id, tab_id=tab_id)
     return r.model_dump(mode="json")
 
 
@@ -890,9 +882,7 @@ async def web_drag_and_drop(
 ) -> dict:
     """Drag an element from ``source`` and drop on ``target``."""
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    r = await agent.drag_and_drop(
-        source, target, session_id=session_id, tab_id=tab_id
-    )
+    r = await agent.drag_and_drop(source, target, session_id=session_id, tab_id=tab_id)
     return r.model_dump(mode="json")
 
 
