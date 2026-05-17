@@ -67,13 +67,36 @@ jobs:
 
       - name: Run unit tests with coverage
         # Skip browser/network integration tests -- those run elsewhere.
+        # Tee output to a file so the failure step below can publish it to
+        # the publicly-visible job summary even when raw logs require auth.
         run: |
-          python -m pytest \
+          set -o pipefail
+          python -m pytest -v --tb=long \
             --cov \
             --cov-report=term-missing \
             --cov-report=xml \
             --ignore=tests/test_browser_actions.py \
-            --ignore=tests/test_agent.py
+            --ignore=tests/test_agent.py 2>&1 | tee pytest-output.txt
+
+      - name: Publish pytest output to job summary on failure
+        if: failure()
+        run: |
+          {
+            echo "## Pytest failure tail (Python ${{ matrix.python-version }})"
+            echo ""
+            echo '```'
+            tail -n 300 pytest-output.txt || echo "no pytest-output.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload pytest output artifact on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output-py${{ matrix.python-version }}
+          path: pytest-output.txt
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Upload coverage artifact
         if: matrix.python-version == '3.12'
