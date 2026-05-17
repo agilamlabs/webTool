@@ -28,7 +28,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~574 tests; full suite must pass
+python -m pytest -v          # ~583 tests on Windows / 557 + 5 platform-conditional skips on Linux
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -82,21 +82,53 @@ tests/                 # All tests; mirrors the package layout 1:1
 
 ## Public API surface
 
-Everything an agent should import comes from the package root:
+Everything an agent should import comes from the package root (`web_agent/__init__.py` exports 87 names as of v1.6.8):
 
 ```python
 from web_agent import (
-    Agent, AppConfig,
+    # Core entry points
+    Agent, Recipes, AppConfig,
+
+    # Result models
     AgentResult, ExtractionResult, FetchResult, FetchDiagnostic,
-    SearchResultItem, ResearchResult, DownloadResult, ScreenshotResult,
-    ActionType, Action, LocatorSpec, FormFilterSpec,
-    # Configs
+    SearchResponse, SearchResultItem, ResearchResult, DownloadResult,
+    ScreenshotResult, ActionResult, ActionSequenceResult,
+    SessionInfo, TabInfo, ObserveResult, DoctorReport, DoctorCheck,
+    DomainSkill, SkillInputSpec, SkillApplicationResult,
+    NetworkEvent, Citation, ToolMessage, ToolError, ToolWarning, ToolSeverity,
+
+    # Action discriminated union + members
+    Action, ActionType, ActionStatus, BaseAction,
+    ClickXYInput, PressKeyInput, TypeTextInput,            # v1.6.6 coord fallbacks
+    UploadFileInput, IframeClickInput,                     # v1.6.7 interaction lib
+    ShadowDomClickInput, DragAndDropInput,
+    # (12 selector-based members -- ClickInput, FillInput, etc. -- live in models.py
+    # but aren't re-exported individually; they enter through the `Action` union.)
+
+    # Specs / helpers
+    LocatorSpec, SelectorLike, FormFilterSpec,
+
+    # Configs (12 sub-configs)
     BrowserConfig, FetchConfig, SearchConfig, SafetyConfig,
     CacheConfig, AuditConfig, AutomationConfig, ExtractionConfig, DownloadConfig,
+    SkillsConfig, WorkspaceConfig,                         # v1.6.7
+    DiagnosticsConfig,                                     # v1.6.8
+
+    # v1.6.8 diagnostic primitives
+    NetworkCollector, SessionTraceRecorder,
+
+    # Correlation + infra
+    correlation_scope, get_correlation_id, new_correlation_id,
+    AuditLogger, RateLimiter, RobotsChecker, Cache, DiskCache,
+    BudgetTracker, RetryPolicy, get_retry_policy,
+
+    # Search providers (for custom chain configs)
+    SearchProvider, SearXNGProvider, DDGSProvider, PlaywrightProvider,
+
     # Exceptions (raised in strict=True paths)
     WebAgentError, NavigationError, SearchError, DownloadError,
     BrowserError, ExtractionError, ConfigError,
-    DomainNotAllowedError, SafeModeBlockedError,
+    DomainNotAllowedError, SafeModeBlockedError, BudgetExceededError,
     ActionError, ActionTimeoutError, SelectorNotFoundError,
 )
 ```

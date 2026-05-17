@@ -62,10 +62,17 @@ The following classes of attack are explicit goals to mitigate:
   configured download / screenshot directory. Cross-platform: POSIX
   absolute, Windows drive-rooted (`C:\...`), and UNC (`\\server\...`)
   paths are all rejected even when the check runs on the "wrong" OS.
+  This same `safe_join_path()` defence applies to v1.6.7 workspace
+  writes and v1.6.8 verification-screenshot paths.
 - **Disk-fill via large download.** All download paths enforce
   `DownloadConfig.max_file_size_mb`. The httpx streaming path aborts
   mid-stream; the Playwright paths pre-check `Content-Length` where
   available and unlink any oversize result.
+- **Disk-fill via download-intent tmpfile pileup (v1.6.8).** When
+  `diagnostics.capture_download_intents=True`, the
+  `page.on('download')` notification listener calls `download.delete()`
+  in a tracked task (`NetworkCollector._pending_deletes`) so each
+  intent doesn't leak a Chromium tmpfile across long-running sessions.
 - **Robots.txt non-compliance.** When `SafetyConfig.respect_robots_txt`
   is on (default: True), every fetch and download checks
   `robots.txt` against the configured user-agent before any network
@@ -73,6 +80,12 @@ The following classes of attack are explicit goals to mitigate:
 - **Per-host abuse.** Per-host token-bucket rate limiting
   (`SafetyConfig.rate_limit_per_host_rps`) bounds outbound RPS per
   origin.
+- **Cross-session cookie leakage (closed in v1.6.5).** Persistent
+  browser sessions use a domain-aware `httpx.Cookies` jar in
+  `WebFetcher._cookies_for_session`; cookies for `bank.com` no longer
+  spill to `attacker.com` when both share a `session_id`. Playwright
+  download paths also re-validate `page.url` / `download.url`
+  post-redirect before any `save_as`.
 - **Action drift in browser automation.** Per-action URL drift
   detection in `BrowserActions.execute_sequence` aborts the sequence
   if a click or JS-driven nav lands on a denied domain or private IP.
@@ -84,6 +97,68 @@ The following classes of attack are explicit goals to mitigate:
   submit-typed elements and gates them on
   `SafetyConfig.allow_form_submit` (default: True; flip to False for
   read-only browsing).
+- **Arbitrary-file upload via prompt injection (closed in v1.6.7).**
+  `Agent.upload_file()` and `UploadFileInput` only accept paths under
+  `DownloadConfig.download_dir` unless the operator explicitly sets
+  `SafetyConfig.allow_upload_outside_download_dir=True`. Without that
+  fence, a prompt injection could trick the agent into uploading
+  `~/.ssh/id_rsa`.
+
+### Browser-control attack surface (v1.6.6 / v1.6.8)
+
+The CDP attach + remote-CDP features introduce a second class of
+attack surface around browser process control:
+
+- **Never attaches to user's existing Chrome.**
+  `BrowserConfig.attach_existing_browser=True` is **explicitly rejected
+  at config validation time.** webTool only controls browsers it
+  launched itself. The rationale: attaching to a user's personal
+  Chrome would expose real cookies, history, and logged-in accounts.
+- **CDP bind is loopback-only.** `BrowserConfig.cdp_host` must be a
+  loopback address (`127.0.0.1` / `localhost`); non-loopback values
+  are rejected at validation. The `--remote-debugging-port` is bound
+  to `127.0.0.1` so external network observers can't attach.
+- **CDP requires isolation.** `cdp_enabled=True` requires
+  `isolation_mode=True`. The remote-debugging-port discovery reads
+  `DevToolsActivePort` from the webTool-owned user-data-dir; without
+  isolation we'd be reading the wrong process's file.
+- **`remote_cdp` validator uses `ipaddress.is_loopback` (v1.6.8).**
+  `backend="remote_cdp"` + `remote_cdp_url` accepts the entire
+  `127.0.0.0/8` range plus `::1` plus `localhost`, and rejects every
+  other host (public, private RFC1918, link-local). The check uses
+  `ipaddress.ip_address(host).is_loopback` rather than an exact-string
+  allowlist so `ws://127.0.0.2:9222/...` is correctly classified as
+  loopback and `ws://10.0.0.1:9222/...` is rejected.
+- **Remote-CDP is incompatible with isolation + cdp_enabled.** The
+  validator rejects these combinations: `remote_cdp` connects to a
+  pre-existing browser whose profile we don't own.
+
+### Workspace + diagnostic data (v1.6.7 / v1.6.8)
+
+- **Workspace mode gates.** The agent-editable workspace defaults to
+  `mode="markdown_skills_only"` — only `.md` files under
+  `domain-skills/`. The two python-enabled modes
+  (`reviewed_python_helpers` / `unsafe_python_helpers`) are second
+  opt-ins; even when `mode=reviewed_python_helpers`,
+  `workspace.execute_helpers` defaults to `False` so the file may
+  exist but is not imported.
+- **Helpers-file mode is strict.** `reviewed_python_helpers` only
+  matches the literal root-level `helpers.py`; `subdir/helpers.py` is
+  rejected (closed in v1.6.7 review pass).
+- **Network header capture defaults off.** `NetworkEvent.request_headers`
+  and `response_headers` are populated only when
+  `diagnostics.include_request_headers` / `include_response_headers`
+  are explicitly True. Default off because `Authorization` and
+  `Cookie` headers are commonly sensitive.
+- **Trace-file path traversal.** `SessionTraceRecorder` validates
+  every `session_id` against `^[A-Za-z0-9._-]+$` before using it as
+  a filename. Sessions are minted internally, but defence-in-depth.
+- **Skill query operator sanitization.** Bundled search-driven
+  skills (e.g. `github_release_download`) strip search-engine
+  operator metacharacters (`"`, `'`, `(`, `)`, `[`, `]`, `|`) from
+  user-supplied query terms before composing `site:github.com ...`
+  queries, so a prompt injection like `"x OR site:evil.com"` can't
+  break out of the intended scope.
 
 ### Known limitations / out of scope
 
@@ -122,31 +197,52 @@ These are documented limitations. PRs welcome.
 The current safety layers, in order of when they apply:
 
 1. **`SafetyConfig.allowed_domains` / `denied_domains`** — domain
-   allow/deny list, checked before any network I/O.
+   allow/deny list, checked before any network I/O. URL-shaped
+   patterns auto-normalised (`"https://Evil.com/"` → `"evil.com"`).
 2. **`SafetyConfig.block_private_ips`** — RFC1918 / loopback /
-   link-local / reserved address blocking via `is_private_address()`.
-3. **Path traversal protection** — `safe_join_path()` rejects any
-   absolute path on any major platform plus any traversal-by-
-   `..` candidate before file write.
-4. **`robots.txt`** — `RobotsChecker` honors the site's robots.txt
+   link-local / reserved address blocking via `is_private_address()`
+   (DNS cached via a 2048-entry LRU since v1.6.5).
+3. **Per-host cookie isolation** (v1.6.5) — `WebFetcher._cookies_for_session`
+   returns a domain-aware `httpx.Cookies` jar so cross-domain leakage
+   inside a shared `session_id` is impossible.
+4. **Path traversal protection** — `safe_join_path()` rejects any
+   absolute path on any major platform plus any traversal-by-`..`
+   candidate before file write. Applied to download paths, screenshot
+   paths, workspace writes (v1.6.7), and verification screenshots (v1.6.8).
+5. **`robots.txt`** — `RobotsChecker` honors the site's robots.txt
    for the configured user-agent.
-5. **Per-host rate limit** — token-bucket gate per origin.
-6. **Pre-fetch URL gate** — fetch / download / classify_url all
+6. **Per-host rate limit** — token-bucket gate per origin.
+7. **Pre-fetch URL gate** — fetch / download / classify_url all
    call `check_domain_allowed()` before launching any I/O.
-7. **Post-redirect re-validation** — every layer re-validates the
+8. **Post-redirect re-validation** — every layer re-validates the
    final URL after redirects (fetcher, downloader, binary fetch,
-   HEAD probe).
-8. **Per-action drift detection** — browser automation aborts on
+   HEAD probe, Playwright `_do_save_page` / `_download_with_playwright`).
+9. **Per-action drift detection** — browser automation aborts on
    the first action whose post-condition lands on a disallowed URL.
-9. **Granular allow flags** — `allow_js_evaluation`,
-   `allow_downloads`, `allow_form_submit` gate dangerous actions.
-10. **Master kill-switch** — `safe_mode=True` forces all
+10. **Granular allow flags** — `allow_js_evaluation`,
+    `allow_downloads`, `allow_form_submit`,
+    `allow_upload_outside_download_dir` gate dangerous actions.
+11. **Master kill-switch** — `safe_mode=True` forces all
     `allow_*` flags to False.
-11. **Per-call budgets** — `max_pages_per_call`, `max_chars_per_call`,
+12. **Per-call budgets** — `max_pages_per_call`, `max_chars_per_call`,
     `max_time_per_call_seconds` bound resource use per request.
-12. **Download size cap** — streaming paths enforce
+13. **Download size cap** — streaming paths enforce
     `max_file_size_mb` mid-stream; Playwright paths enforce it via
     `Content-Length` pre-check + post-save stat + unlink.
+14. **Browser isolation profile** (v1.6.6) — `isolation_mode=True`
+    launches Chromium against a webTool-owned `--user-data-dir` so
+    cookies / localStorage / cache / downloads never touch the user's
+    real Chrome profile.
+15. **CDP loopback enforcement** (v1.6.6 + v1.6.8) — `cdp_host` and
+    `remote_cdp_url` are validated as loopback-only; the
+    `attach_existing_browser` knob is rejected unconditionally.
+16. **Workspace mode gates** (v1.6.7) — default
+    `markdown_skills_only` blocks Python writes; even
+    `reviewed_python_helpers` requires a second opt-in
+    (`execute_helpers=True`) before `helpers.py` is imported.
+17. **Diagnostic-data minimisation** (v1.6.8) — network header
+    capture and trace recording all default off; when enabled,
+    `session_id` is regex-validated before being used as a filename.
 
 ## Hardening Recommendations for Production
 
@@ -162,9 +258,35 @@ If you're embedding `web-agent-toolkit` in a production agent:
 4. Keep `safety.respect_robots_txt=True` (default).
 5. Set a conservative `download.max_file_size_mb` (default 100 MB
    is fine for documents; lower for adversarial environments).
-6. Mount `output_dir`, `audit_log_path`, `cache_dir`, `debug_dir`
-   on encrypted volumes with restrictive ACLs.
-7. Rotate audit logs and debug captures; they may contain
-   sensitive URLs or cookies.
+6. Mount `output_dir`, `audit_log_path`, `cache_dir`, `debug_dir`,
+   `diagnostics.trace_dir`, `automation.screenshot_dir`, and any
+   workspace dir on encrypted volumes with restrictive ACLs.
+7. Rotate audit logs, debug captures, replay traces, and verification
+   screenshots; they may contain sensitive URLs, cookies, headers
+   (when `diagnostics.include_*_headers=True`), or page contents.
 8. Pin the toolkit to a specific commit SHA, not a branch, until
    we publish to PyPI.
+9. **Browser isolation** (v1.6.6): set `browser.isolation_mode=True`
+   so cookies / cache / downloads stay in a webTool-owned tempdir.
+   Pair with `browser.profile_mode="ephemeral"` +
+   `cleanup_on_exit=True` for short-lived agents; use
+   `profile_mode="named"` for logged-in workflows that should survive
+   restarts.
+10. **CDP attach** (v1.6.6 + v1.6.8): only enable when an external
+    observer (debugger, browser-use, MCP client) genuinely needs CDP
+    access. Keep `cdp_host="127.0.0.1"`; rely on the validator to
+    reject anything else. When using `backend="remote_cdp"`, the
+    remote browser process must already be locked down — webTool
+    only inherits the security posture of the endpoint it connects to.
+11. **Workspace** (v1.6.7): leave `workspace.enabled=False` unless the
+    agent actually needs to read / write skill files. When enabled,
+    `mode="markdown_skills_only"` (the default) is the safe choice;
+    only flip to `reviewed_python_helpers` when a trusted human
+    reviews the helper file, and even then keep `execute_helpers=False`
+    until the helper is reviewed every change.
+12. **Diagnostics** (v1.6.8): leave the whole `DiagnosticsConfig`
+    off in production unless you're actively debugging. When
+    `capture_network=True`, keep `include_request_headers=False` and
+    `include_response_headers=False` (defaults) so cookies and bearer
+    tokens don't land in `FetchResult.network_events`. Treat
+    `diagnostics.trace_dir` as you would any audit log.

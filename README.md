@@ -10,53 +10,96 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.4** — external-review pass: fixes the long-running
-> Linux-only CI failure (Windows drive paths slipped through `safe_join_path`
-> on POSIX); mypy clean on bs4 meta-content reads; Playwright download
-> paths now enforce `max_file_size_mb` (the httpx path already did);
-> HEAD probe re-validates the final URL after redirects (last remaining
-> SSRF gap closed); `SECURITY.md` published with full threat model;
-> README CI badge + clarified install. See [CHANGELOG.md](CHANGELOG.md).
+> **What's new in 1.6.8** — *Diagnostics and Advanced Browser Intelligence.*
+> Six new features, all off by default, make webTool explainable and
+> debuggable: **network event capture** (`page.on(request|response|requestfailed)`
+> hooks via `WeakKeyDictionary`-backed `NetworkCollector`); **API endpoint
+> candidate discovery** derived from captured events; **download event
+> diagnostics** (separate `page.on('download')` notification listener that
+> auto-deletes the Chromium tmpfile); **post-action screenshot
+> verification** (`verify-<cid>-<index>.png` after each successful action);
+> **session replay / audit traces** with new `Agent.replay_trace(file)` +
+> CLI `web-agent replay <trace_file>`; **remote CDP backend** —
+> `backend="remote_cdp"` + `remote_cdp_url` dispatches to
+> `chromium.connect_over_cdp()` with a loopback-only validator. See
+> [CHANGELOG.md](CHANGELOG.md#168) for the full list.
 >
-> **v1.6.3** added: smart routing for direct-URL search path; parallel
-> HEAD-probe of search results for extensionless PDFs/XLSX/DOCX;
-> `classify_url(session_id=...)`; structured warnings/errors at the
-> source via `_MessageBag`; `AppConfig.ranking_profiles` makes profiles
-> user-extensible and overridable.
+> **v1.6.7** added: *Skills and Playbooks.* Domain skill registry
+> (`Agent.list_domain_skills / get_domain_skills(url) / apply_domain_skill`),
+> markdown skills with YAML frontmatter at three priority tiers (project >
+> workspace > builtin), 3 bundled runnable skills (sec.gov, github.com,
+> ec.europa.eu), agent-editable workspace with 4 safety modes
+> (`read_only` / `markdown_skills_only` (default) / `reviewed_python_helpers`
+> / `unsafe_python_helpers`), and 8 new interaction-library methods
+> (`handle_dialog`, `select_dropdown`, `upload_file`, `drag_and_drop`,
+> `scroll_until_text`, `click_inside_iframe`, `click_shadow_dom`,
+> `print_page_as_pdf`).
 >
-> **v1.6.2** added: smart binary routing in `fetch_and_extract` (HEAD-based
-> detection of extensionless PDF/XLSX URLs), streaming binary fetches with
-> `max_file_size_mb` cap, browser-session cookies reused for authenticated
-> `fetch_binary`, CSV + DOCX extraction (`[binary]` extra), named ranking
-> profiles (`official_sources` / `docs` / `research` / `news` / `files`),
-> structured `ToolError`/`ToolWarning`, MCP exposure, Python 3.13 in CI,
-> default `wait_until=domcontentloaded`.
+> **v1.6.6** added: *Browser Control Foundation.* Isolation-profile
+> launcher (`BrowserConfig.isolation_mode` + ephemeral/named profiles),
+> Chrome DevTools Protocol attach to webTool-launched browsers
+> (`BrowserConfig.cdp_enabled` + `Agent.get_cdp_endpoint()`), per-session
+> tab management (`agent.list_tabs / new_tab / switch_tab / close_tab`),
+> coordinate-level click fallbacks (`click_xy / type_text / press_key`),
+> observe mode (`Agent.observe()` returns screenshot + viewport + DPR +
+> ARIA snapshot), and `Agent.doctor()` self-diagnostic with 14 capability
+> probes (CLI: `web-agent doctor`).
 >
-> v1.6.1 added: warnings/errors split, `download_candidates`, per-URL
-> `FetchDiagnostic`, search-engine URL unwrap, `fill_form_and_extract` recipe.
-> See the [Failure-Surface Diagnostics](#failure-surface-diagnostics) section.
+> **Earlier versions** (1.6.5 cookie isolation / SSRF hardening; 1.6.4
+> cross-platform paths; 1.6.3 smart routing; 1.6.2 binary fetch +
+> ranking profiles; 1.6.1 failure surface) live in
+> [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 
-- **Web Search** -- Free-first provider chain: SearXNG -> DDGS -> Playwright fallback. URL-as-query short-circuits to direct fetch.
-- **Page Fetching** -- Renders JavaScript, retries with exponential backoff, detects download URLs. Optional disk cache (TTL-based)
-- **Content Extraction** -- Three-tier fallback: trafilatura (F1 ~0.958) -> BeautifulSoup4 -> raw text. Markdown rendering populated automatically when trafilatura wins
-- **File Download** -- Three strategies: httpx streaming -> Playwright page save -> Playwright JS download
-- **Browser Automation** -- 12 action types composable into scripted sequences
-- **Semantic Locators** -- Find elements by ARIA role, label, text, or test_id (not just CSS)
-- **Browser Sessions** -- Persistent named contexts retain cookies/login across multi-call workflows
-- **High-Level Recipes** -- `search_and_open_best_result`, `find_and_download_file`, `web_research`
-- **Safety Controls** -- Domain allow/deny lists, granular `allow_*` flags, SSRF protection, per-call budgets
-- **Politeness Layer** -- Per-host rate limiter + robots.txt obedience (both opt-out)
-- **Audit Log** -- Append-only JSONL of every Agent operation (off by default)
-- **Disk Cache** -- TTL cache for fetch + search results, with LRU-by-mtime eviction (off by default)
-- **Retry Profiles** -- Declarative `fast`/`balanced`/`paranoid` retry policies
-- **Debug Mode** -- Auto-capture HTML/screenshot/error JSON on failures
-- **Correlation IDs** -- Trace single requests across all subsystems via auto-injected log fields
-- **Screenshots** -- Viewport, full-page, or element-specific captures
-- **Anti-Detection** -- playwright-stealth, user-agent rotation, resource blocking
-- **Structured Output** -- All results are Pydantic v2 models serializable to JSON
-- **MCP Server** -- 12 tools exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client
+### Core web pipeline
+- **Web Search** — Free-first provider chain: SearXNG → DDGS → Playwright fallback. URL-as-query short-circuits to direct fetch.
+- **Page Fetching** — Renders JavaScript, retries with exponential backoff, detects download URLs. Optional disk cache (TTL-based).
+- **Content Extraction** — Three-tier fallback: trafilatura (F1 ≈ 0.958) → BeautifulSoup4 → raw text. CSV / PDF / XLSX / DOCX extraction via the `[binary]` extra.
+- **File Download** — Three strategies: httpx streaming → Playwright page save → Playwright JS download. Per-strategy size caps enforced.
+- **High-Level Recipes** — `search_and_open_best_result`, `find_and_download_file`, `web_research`, `fill_form_and_extract`.
+
+### Browser automation (v1.6.5 – v1.6.7)
+- **19 Action Types** — composable into scripted sequences. Includes `click_xy / type_text / press_key` (coordinate fallbacks for canvas/shadow/iframe), `upload_file`, `drag_and_drop`, `iframe_click`, `shadow_dom_click`.
+- **Semantic Locators** — Find elements by ARIA role, label, text, or test_id (not just CSS).
+- **Browser Sessions** — Persistent named contexts retain cookies/login across multi-call workflows.
+- **Tab Management** (v1.6.6) — `agent.list_tabs / new_tab / switch_tab / close_tab`. Popups auto-register without stealing focus.
+- **Observe Mode** (v1.6.6) — `Agent.observe()` returns screenshot path + viewport + page size + DPR + optional ARIA snapshot. Powers observe → act → verify loops.
+- **8 Top-Level Interaction Methods** (v1.6.7) — `handle_dialog`, `select_dropdown`, `upload_file`, `drag_and_drop`, `scroll_until_text`, `click_inside_iframe`, `click_shadow_dom`, `print_page_as_pdf`.
+
+### Browser-control backends (v1.6.6 / v1.6.8)
+- **Isolation Profile Launcher** — webTool-owned `--user-data-dir` (ephemeral tempdir or named persistent profile). Isolates cookies / localStorage / cache / downloads from the user's real Chrome.
+- **CDP Attach** — `backend="cdp_owned"` opens a `--remote-debugging-port` on the webTool-launched browser; external tools attach via `Agent.get_cdp_endpoint()`. **Never attaches to the user's existing Chrome** (rejected at config validation).
+- **Remote CDP Backend** (v1.6.8) — `backend="remote_cdp"` + `remote_cdp_url` dispatches to `chromium.connect_over_cdp(url)`. Loopback-only validator rejects non-`127.0.0.0/8` URLs.
+
+### Domain skills + workspace (v1.6.7)
+- **Domain Skills Registry** — Markdown skills with YAML frontmatter at three priority tiers (project > workspace > builtin). `agent.list_domain_skills() / get_domain_skills(url) / apply_domain_skill(url, name, inputs)`.
+- **3 Bundled Runnable Skills** — `sec.gov/filing_search`, `github.com/release_download`, `ec.europa.eu/document_search`.
+- **Agent-Editable Workspace** — Four safety modes: `read_only` / `markdown_skills_only` (default) / `reviewed_python_helpers` / `unsafe_python_helpers`. Workspace skills auto-load into the registry.
+
+### Diagnostics (v1.6.8)
+- **Network Event Capture** — `page.on(request|response|requestfailed)` hooks attached to every Page. Surfaced as `FetchResult.network_events` / `ActionSequenceResult.network_events`.
+- **API Endpoint Candidate Discovery** — XHR/fetch JSON responses, de-duplicated, on `FetchResult.api_candidates`.
+- **Download Event Diagnostics** — separate `page.on('download')` notification (auto-deletes Chromium tmpfile) surfaces as `download_candidates_runtime`.
+- **Post-Action Screenshot Verification** — best-effort `verify-<cid>-<index>.png` per successful action.
+- **Session Replay** — per-session JSONL trace at `<base_dir>/.webtool-audit/traces/<sid>.jsonl`. Replay via `Agent.replay_trace(file)` or CLI `web-agent replay <file>`.
+- **Doctor** (v1.6.6) — `Agent.doctor()` runs 14 capability probes; CLI `web-agent doctor [--json]` exits 2 on `unusable` so CI can gate on it.
+
+### Safety + observability
+- **Safety Controls** — Domain allow/deny lists, granular `allow_*` flags, SSRF protection (RFC1918 + loopback + link-local), per-call budgets.
+- **Per-Host Cookie Isolation** (v1.6.5) — Domain-aware `httpx.Cookies` jar; cookies for `bank.com` never leak to `attacker.com` when both share a `session_id`.
+- **Politeness Layer** — Per-host rate limiter + robots.txt obedience (both opt-out).
+- **Audit Log** — Append-only JSONL of every Agent operation (off by default).
+- **Disk Cache** — TTL cache for fetch + search results, LRU-by-mtime eviction (off by default).
+- **Retry Profiles** — Declarative `fast` / `balanced` / `paranoid` policies.
+- **Debug Mode** — Auto-capture HTML / screenshot / error JSON on failures.
+- **Correlation IDs** — Single-request tracing across all subsystems via auto-injected log fields.
+- **Anti-Detection** — playwright-stealth, user-agent rotation, resource blocking.
+- **Structured Output** — All results are Pydantic v2 models serializable to JSON.
+
+### Integration
+- **MCP Server** — **37 tools** exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client.
+- **CLI** — `web-agent search / fetch / download / interact / screenshot / observe / skills / doctor / replay`.
 
 ## Installation
 
@@ -219,19 +262,131 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `debug` | `capture_html` | `true` | Save HTML snapshot on failure |
 | `debug` | `capture_screenshot` | `true` | Save PNG snapshot on failure |
 
+**Isolation + CDP** (v1.6.6):
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `browser` | `isolation_mode` | `false` | Launch with `--user-data-dir` so cookies/cache/downloads are isolated from real Chrome |
+| `browser` | `profile_mode` | `"ephemeral"` | `"ephemeral"` (auto tempdir) or `"named"` (persistent at `profile_dir`) |
+| `browser` | `profile_dir` | `None` | Required when `profile_mode="named"`. Resolved against `base_dir` if relative |
+| `browser` | `cleanup_on_exit` | `true` | Remove the ephemeral profile dir on Agent exit |
+| `browser` | `backend` | `"playwright"` | `"playwright"` / `"cdp_owned"` / `"remote_cdp"` (v1.6.8) |
+| `browser` | `cdp_enabled` | `false` | Launch with `--remote-debugging-port` so external tools can attach via CDP. Requires `isolation_mode=true` |
+| `browser` | `cdp_host` | `"127.0.0.1"` | Loopback only -- non-loopback rejected at validation |
+| `browser` | `cdp_port` | `0` | `0` = OS-assigned, discovered via `DevToolsActivePort` |
+| `browser` | `remote_cdp_url` | `None` | Required when `backend="remote_cdp"`. Must be a loopback `ws://` / `wss://` URL (v1.6.8) |
+
+**Skills + workspace** (v1.6.7):
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `skills` | `enabled` | `false` | Master switch for the project-tier skill load (workspace + builtin tiers govern themselves) |
+| `skills` | `skill_dirs` | `["./.webtool-skills"]` | Project skill directories (highest priority). First match on `(domain, name)` wins |
+| `skills` | `builtin_skills_enabled` | `true` | Include bundled `sec.gov` / `github.com` / `ec.europa.eu` skills |
+| `workspace` | `enabled` | `false` | Master switch -- workspace is invisible to Agent when false |
+| `workspace` | `workspace_dir` | `"./.webtool-workspace"` | Workspace root (resolved against `base_dir` if relative) |
+| `workspace` | `mode` | `"markdown_skills_only"` | `read_only` / `markdown_skills_only` / `reviewed_python_helpers` / `unsafe_python_helpers` |
+| `workspace` | `execute_helpers` | `false` | Second opt-in: import and expose `helpers.py` to skills |
+
+**Diagnostics** (v1.6.8 — all default-off):
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `diagnostics` | `capture_network` | `false` | Hook `page.on(request/response/requestfailed)` on every Page |
+| `diagnostics` | `max_network_events` | `500` | Hard cap on retained events per Page (deque maxlen) |
+| `diagnostics` | `network_resource_types` | `["xhr","fetch","document"]` | Playwright `resource_type` values to record |
+| `diagnostics` | `include_request_headers` | `false` | Capture request headers (off by default — Authorization / Cookie are sensitive) |
+| `diagnostics` | `include_response_headers` | `false` | Capture response headers |
+| `diagnostics` | `capture_download_intents` | `false` | Attach `page.on('download')` notification + auto-delete tmpfile |
+| `diagnostics` | `screenshot_after_action` | `false` | Best-effort `verify-<cid>-<index>.png` per successful action |
+| `diagnostics` | `trace_enabled` | `false` | Write per-session JSONL action log to `trace_dir` |
+| `diagnostics` | `trace_dir` | `"./.webtool-audit/traces"` | Trace JSONL directory (resolved against `base_dir` if relative) |
+
+**Safety** (additional v1.6.5+ knobs):
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `safety` | `allow_js_evaluation` | `false` | Allow `EvaluateInput` actions (LLM-supplied JS can exfiltrate cookies) |
+| `safety` | `allow_downloads` | `true` | Permit download actions |
+| `safety` | `allow_form_submit` | `true` | Permit clicks on submit-typed buttons |
+| `safety` | `block_private_ips` | `true` | SSRF protection: blocks RFC1918, loopback, link-local |
+| `safety` | `allow_upload_outside_download_dir` | `false` | Widen `upload_file` paths beyond `download.download_dir` (v1.6.7) |
+| `safety` | `probe_binary_urls` | `true` | HEAD-probe extensionless URLs to detect PDF / XLSX (v1.6.2) |
+| `safety` | `rate_limit_per_host_rps` | `2.0` | Per-host rate cap (req/sec); `0` to disable |
+| `safety` | `respect_robots_txt` | `true` | Fetch + obey robots.txt before each request |
+| `safety` | `robots_user_agent` | `"web-agent-toolkit"` | UA for robots.txt fetches + rule matching |
+| `audit` | `enabled` | `false` | Append-only JSONL log of every public Agent call |
+| `audit` | `audit_log_path` | `"./audit.jsonl"` | Audit log path (resolved against `base_dir` if relative) |
+| `cache` | `enabled` | `false` | Disk-backed TTL cache for fetch + search |
+| `cache` | `cache_dir` | `"./cache"` | Cache directory |
+| `cache` | `ttl_seconds` | `3600` | Entry TTL |
+| `cache` | `max_cache_mb` | `100` | Cap (LRU-by-mtime eviction) |
+
 ## API Reference
 
 ### Agent Methods
 
+The public surface grew across versions; every method below is on the `Agent` class. Each `async def` wraps a correlation scope + audit log entry. Pass `session_id=...` to reuse a persistent browser session for cookie / login continuity.
+
 ```python
 class Agent:
-    async def search_and_extract(query: str, max_results: int = None) -> AgentResult
-    async def fetch_and_extract(url: str) -> ExtractionResult
-    async def download(url: str, filename: str = None) -> DownloadResult
-    async def screenshot(url: str, path: str = None, full_page: bool = False) -> ScreenshotResult
-    async def interact(url: str, actions: list[Action], stop_on_error: bool = None) -> ActionSequenceResult
-    async def save_results(result: AgentResult, output_path: str = None) -> Path
+    # --- Core pipeline ---
+    async def search_and_extract(query, max_results=None, *, session_id=None, extract_files=False) -> AgentResult
+    async def fetch_and_extract(url, *, session_id=None) -> ExtractionResult
+    async def download(url, filename=None, *, session_id=None) -> DownloadResult
+    async def screenshot(url, path=None, full_page=False, *, session_id=None) -> ScreenshotResult
+    async def interact(url, actions, stop_on_error=None, *, session_id=None) -> ActionSequenceResult
+
+    # --- Recipes ---
+    async def search_and_open_best_result(query, *, prefer_domains=None, domain_profile=None) -> ExtractionResult
+    async def find_and_download_file(query, *, file_types=None) -> DownloadResult
+    async def web_research(query, max_pages=5, depth=1, *, prefer_domains=None) -> ResearchResult
+    async def fill_form_and_extract(url, spec: FormFilterSpec) -> AgentResult
+
+    # --- Sessions + tabs ---  (v1.6.6)
+    async def create_session(name=None) -> str
+    async def close_session(session_id) -> None
+    def list_sessions() -> list[SessionInfo]
+    async def list_tabs(session_id) -> list[TabInfo]
+    async def current_tab(session_id) -> TabInfo | None
+    async def new_tab(session_id, url=None) -> str
+    async def switch_tab(session_id, tab_id) -> None
+    async def close_tab(session_id, tab_id) -> None
+
+    # --- Observe + low-level fallbacks ---  (v1.6.6)
+    async def observe(url, *, session_id, tab_id=None, include_text=True, include_aria=False) -> ObserveResult
+    async def click_xy(x, y, *, session_id, tab_id=None, button="left", modifiers=None) -> ActionResult
+    async def type_text(text, *, session_id, tab_id=None, delay=0) -> ActionResult
+    async def press_key(key, *, session_id, tab_id=None, repeat=1) -> ActionResult
+
+    # --- Domain skills + workspace ---  (v1.6.7)
+    def list_domain_skills() -> list[DomainSkill]
+    def get_domain_skills(url) -> list[DomainSkill]
+    async def get_domain_skill(url, name) -> DomainSkill | None
+    async def apply_domain_skill(url, name, inputs=None, *, session_id=None) -> SkillApplicationResult
+
+    # --- Interaction-skill library ---  (v1.6.7)
+    async def handle_dialog(action="accept", prompt_text=None, *, session_id) -> ActionResult
+    async def select_dropdown(selector, *, session_id, value=None, label=None, index=None) -> ActionResult
+    async def upload_file(selector, paths, *, session_id) -> ActionResult
+    async def drag_and_drop(source, target, *, session_id) -> ActionResult
+    async def scroll_until_text(text, *, session_id, max_scrolls=10, scroll_step=800) -> ActionResult
+    async def click_inside_iframe(iframe_selector, inner_selector, *, session_id) -> ActionResult
+    async def click_shadow_dom(host_selector, inner_selector, *, session_id) -> ActionResult
+    async def print_page_as_pdf(url=None, output_path=None, *, session_id=None) -> ScreenshotResult
+
+    # --- Diagnostics + replay ---  (v1.6.6 + v1.6.8)
+    def get_cdp_endpoint() -> str | None
+    def get_remote_cdp_url() -> str | None
+    async def doctor(quick=False) -> DoctorReport
+    def list_traces() -> list[str]
+    async def replay_trace(trace_file) -> ActionSequenceResult
+
+    # --- Output ---
+    async def save_results(result, output_path=None) -> Path
 ```
+
+For exhaustive parameter docs, read the docstrings on each method (`help(agent.fetch_and_extract)`). Every signature is also exercised in `tests/`.
 
 ### Result Models
 
@@ -286,7 +441,7 @@ result.status     # "success" | "failed"
 
 ### Browser Automation Actions
 
-12 action types composable into sequences:
+**19 action types** composable into sequences (selector-based + coordinate-based + frame / shadow / file-upload):
 
 | Action | Description | Key Fields |
 |--------|-------------|------------|
@@ -301,7 +456,16 @@ result.status     # "success" | "failed"
 | `SelectInput` | Select dropdown option | `selector`, `value` / `label` / `index` |
 | `KeyboardInput` | Press keys or combos | `key` (e.g. `"Enter"`, `"Control+A"`), `repeat` |
 | `WaitInput` | Wait for condition | `target` (selector/text/url/network_idle), `value` |
-| `EvaluateInput` | Run JavaScript | `expression` |
+| `EvaluateInput` | Run JavaScript (gated by `safety.allow_js_evaluation`) | `expression` |
+| `ClickXYInput` *(v1.6.6)* | Click at CSS-pixel coordinates | `x`, `y`, `button`, `modifiers` |
+| `TypeTextInput` *(v1.6.6)* | Type at current focus | `text`, `delay` |
+| `PressKeyInput` *(v1.6.6)* | Press a single key combo | `key`, `repeat` |
+| `UploadFileInput` *(v1.6.7)* | Upload one or more files | `selector`, `paths` |
+| `IframeClickInput` *(v1.6.7)* | Click inside a frame | `iframe_selector`, `inner_selector` |
+| `ShadowDomClickInput` *(v1.6.7)* | Pierce shadow DOM | `host_selector`, `inner_selector` |
+| `DragAndDropInput` *(v1.6.7)* | Drag between selectors | `source`, `target` |
+
+Every action accepts an optional `tab_id` (v1.6.6) to target a specific tab within a session.
 
 #### Example: Form Automation
 
@@ -783,35 +947,86 @@ python -m web_agent serve-mcp
 
 The server uses stdio transport -- it's invoked by the MCP client, not run standalone.
 
-### Exposed Tools (11 total)
+### Exposed Tools (37 total)
 
-**Single-shot tools** -- one URL or query, one result:
+**Single-shot pipeline tools** — one URL or query, one result:
 
-| Tool | Description | Key Parameters |
-|------|-------------|----------------|
-| `web_search` | Search the web and extract content from top results | `query`, `max_results=10`, `session_id=None` |
-| `web_fetch` | Fetch a single URL and extract main content | `url`, `session_id=None` |
-| `web_download` | Download a file or save a web page | `url`, `filename=None`, `session_id=None` |
-| `web_screenshot` | Take a screenshot of a page | `url`, `full_page=False`, `path=None`, `session_id=None` |
-| `web_interact` | Execute a browser action sequence | `url`, `actions: list[dict]`, `stop_on_error=True`, `session_id=None` |
+| Tool | Description |
+|------|-------------|
+| `web_search` | Search the web and extract content from top results |
+| `web_fetch` | Fetch a single URL and extract main content |
+| `web_download` | Download a file or save a web page |
+| `web_screenshot` | Take a screenshot of a page |
+| `web_interact` | Execute a browser action sequence |
+| `web_fill_form_and_extract` | Fill a form (`FormFilterSpec`) and extract the result page |
 
-**High-level recipes** -- composite workflows for common goals:
+**High-level recipes** — composite workflows:
 
-| Tool | Description | Key Parameters |
-|------|-------------|----------------|
-| `web_search_best` | Search, rank results, return extracted top hit | `query`, `ranking="default"`, `session_id=None` |
-| `web_find_and_download` | Search and download first matching file | `query`, `file_types=["pdf"]`, `session_id=None` |
-| `web_research` | Multi-page research with citations | `query`, `max_pages=5`, `depth=1`, `session_id=None` |
+| Tool | Description |
+|------|-------------|
+| `web_search_best` | Search, rank, return extracted top hit |
+| `web_find_and_download` | Search + download first matching file |
+| `web_research` | Multi-page research with citations |
 
-**Browser session management** -- retain cookies/login across calls:
+**Browser session management** (cookies / login continuity):
 
-| Tool | Description | Key Parameters |
-|------|-------------|----------------|
-| `create_browser_session` | Create a persistent browser session | `name=None` |
-| `close_browser_session` | Close a session and free resources | `session_id` |
-| `list_browser_sessions` | List all live sessions | -- |
+| Tool | Description |
+|------|-------------|
+| `create_browser_session` | Create a persistent session |
+| `close_browser_session` | Close a session, free its context |
+| `list_browser_sessions` | List all live sessions |
 
-All tools return structured Pydantic models that auto-serialize to JSON for the client. Every tool accepts an optional `session_id` to reuse a persistent browser context for cookie/login continuity.
+**Tab management** (v1.6.6):
+
+| Tool | Description |
+|------|-------------|
+| `web_list_tabs` | List tabs in a session |
+| `web_current_tab` | Get the session's current tab |
+| `web_new_tab` | Open a new tab in the session |
+| `web_switch_tab` | Switch the current tab |
+| `web_close_tab` | Close a tab |
+
+**Coordinate-level fallbacks** (v1.6.6, for canvas / shadow / iframe):
+
+| Tool | Description |
+|------|-------------|
+| `web_click_xy` | Click at CSS-pixel coordinates |
+| `web_type_text` | Type via keyboard at the current focus |
+| `web_press_key` | Press a single key combo (e.g. `Shift+Enter`) |
+
+**Observe + diagnostics** (v1.6.6 + v1.6.8):
+
+| Tool | Description |
+|------|-------------|
+| `web_observe` | Screenshot + viewport + page-size + DPR + optional ARIA snapshot |
+| `web_doctor` | Run 14 capability probes; returns `DoctorReport` |
+| `web_get_cdp_endpoint` | Return CDP ws:// URL when `cdp_enabled=True` |
+| `web_get_remote_cdp_url` | Return ws:// URL when `backend="remote_cdp"` |
+| `web_list_traces` | Session-ids of replay traces under `diagnostics.trace_dir` |
+| `web_replay_trace` | Re-execute the action list in a trace JSONL |
+
+**Domain skills** (v1.6.7):
+
+| Tool | Description |
+|------|-------------|
+| `list_domain_skills` | All registered skills (builtin + workspace + project) |
+| `get_domain_skill` | Single skill by `(url, name)` |
+| `apply_domain_skill` | Run a runnable skill end-to-end |
+
+**Interaction-skill library** (v1.6.7):
+
+| Tool | Description |
+|------|-------------|
+| `web_handle_dialog` | Accept / dismiss browser dialogs |
+| `web_select_dropdown` | Select `<option>` by value / label / index |
+| `web_upload_file` | Upload one or more files |
+| `web_drag_and_drop` | Drag from source selector to target selector |
+| `web_scroll_until_text` | Scroll until visible text appears or attempts exhaust |
+| `web_click_inside_iframe` | Click inside a frame located by selector |
+| `web_click_shadow_dom` | Pierce shadow DOM via `host >> inner` |
+| `web_print_page_as_pdf` | Render the current page as PDF |
+
+All tools return structured Pydantic models that auto-serialize to JSON for the client. Every tool accepts an optional `session_id` to reuse a persistent browser context for cookie / login continuity.
 
 ### Claude Desktop Setup
 
@@ -1077,48 +1292,58 @@ CMD ["python", "-m", "web_agent", "search", "example query"]
 ## Testing
 
 ```bash
-# Run all 213 tests
+# Full suite (~583 tests on Windows + 5 platform-conditional skips on Linux)
 python -m pytest -v
 
-# Unit tests only (no network) -- 192 tests, runs in ~2 seconds
-python -m pytest --ignore=tests/test_agent.py --ignore=tests/test_browser_actions.py -v
+# Unit tests only (no network) -- the CI invocation
+python -m pytest \
+  --ignore=tests/test_agent.py --ignore=tests/test_browser_actions.py -v
 
-# Integration tests (requires network + Chromium) -- 21 tests, ~2 minutes
-python -m pytest tests/test_agent.py tests/test_browser_actions.py -v
+# Integration tests (requires network + Chromium) under the `integration` marker
+python -m pytest -v -m integration
 ```
+
+CI runs `ruff check`, `ruff format --check`, `mypy`, and the unit-test job on Python 3.10 / 3.12 / 3.13. The integration job runs Playwright + network tests on push-to-main and on a nightly schedule (it's `continue-on-error: true` so transient CAPTCHAs on free search providers don't block legitimate merges).
 
 ## Project Structure
 
 ```
-web_agent/
-  __init__.py            # v1.5.0, public API exports (60 names)
-  py.typed               # PEP 561 type checking support
-  exceptions.py          # Exception hierarchy (12 classes)
-  config.py              # Programmatic + env var + YAML configuration
-  models.py              # 30+ Pydantic v2 models (incl. LocatorSpec, SessionInfo, Citation, ResearchResult)
-  utils.py               # Retry decorator, RetryPolicy, BudgetTracker, domain checks
-  correlation.py         # ContextVar-based correlation IDs + loguru patcher
-  debug.py               # DebugCapture for failure HTML/screenshot/JSON snapshots
-  agent.py               # Main entry point (Agent class)
-  browser_manager.py     # Chromium lifecycle, stealth, semaphore + persistent contexts
-  browser_actions.py     # 12 automation action handlers + semantic locators
-  session_manager.py     # Persistent named BrowserContext sessions
-  search_engine.py       # Multi-provider search chain orchestrator (v1.4)
-  search_providers.py    # SearchProvider ABC + SearXNG/DDGS/Playwright impls (v1.4)
-  rate_limiter.py        # Per-host async rate gate (v1.3)
-  robots.py              # robots.txt fetcher + TTL cache (v1.3)
-  audit.py               # Append-only JSONL audit log (v1.3)
-  cache.py               # Disk-backed TTL cache for fetch + search (v1.5)
-  web_fetcher.py         # Page fetching with retry, safety, debug, sessions, cache
-  content_extractor.py   # trafilatura -> BS4 -> raw + markdown rendering (v1.5)
-  downloader.py          # Three-strategy file/page download with safety + sessions
-  recipes.py             # High-level recipes (search_and_open_best, find_and_download, web_research)
-  mcp_server.py          # FastMCP server with 12 tools
-  main.py                # CLI (search, fetch, download, interact, screenshot, serve-mcp)
-docker/searxng/          # Self-hosted SearXNG quickstart (compose + tuned settings)
-tests/                   # 213 tests (192 unit + 21 integration)
-config.example.yaml      # Reference configuration (all v1.2-1.5 options annotated)
-sample_data/             # Test fixtures and example action sequences
+web_agent/                       # 30 modules, ~5,100 LOC, mypy strict-clean
+  __init__.py                    # v1.6.8 -- 87 public exports
+  py.typed                       # PEP 561 marker
+  exceptions.py                  # WebAgentError hierarchy
+  config.py                      # AppConfig + 12 sub-configs (programmatic / env / YAML)
+  models.py                      # 40+ Pydantic v2 models (single source of wire shape)
+  utils.py                       # async_retry, safe_join_path, is_private_address, BudgetTracker
+  correlation.py                 # ContextVar correlation IDs + loguru patcher
+  debug.py                       # DebugCapture: HTML + screenshot + JSON on failure
+  audit.py                       # Append-only JSONL audit log of every public Agent call (opt-in)
+  cache.py                       # Disk-backed TTL cache for fetch + search (opt-in)
+  rate_limiter.py                # Per-host async token-bucket gate
+  robots.py                      # robots.txt fetcher + TTL cache
+  agent.py                       # Public Agent orchestrator (entry point)
+  browser_manager.py             # Chromium lifecycle + stealth + 3 backends (playwright | cdp_owned | remote_cdp)
+  browser_actions.py             # 19 action handlers + per-action verify screenshot + trace recording
+  session_manager.py             # Persistent named BrowserContext sessions
+  tab_manager.py                 # Per-session tab lifecycle + popup auto-register (v1.6.6)
+  doctor.py                      # 14 capability probes + DoctorReport (v1.6.6)
+  domain_skills.py               # Skill registry + dispatcher (v1.6.7)
+  workspace.py                   # Agent-editable workspace with 4 safety modes (v1.6.7)
+  builtin_skills/                # 3 bundled skills: sec.gov / github.com / ec.europa.eu (v1.6.7)
+  network_collector.py           # Per-Page request/response/download event collector (v1.6.8)
+  trace_recorder.py              # Per-session JSONL action traces for replay (v1.6.8)
+  search_engine.py               # Multi-provider search chain
+  search_providers.py            # SearchProvider ABC + SearXNG / DDGS / Playwright impls
+  web_fetcher.py                 # Page + binary fetch with retry, safety, debug, sessions, cache
+  content_extractor.py           # trafilatura -> BS4 -> raw; PDF / XLSX / DOCX / CSV via [binary]
+  downloader.py                  # Three-strategy file/page download with safety + sessions
+  recipes.py                     # search_and_open_best, find_and_download, web_research, fill_form_and_extract
+  mcp_server.py                  # FastMCP server -- 37 tools
+  main.py                        # CLI: search / fetch / download / interact / screenshot / observe / skills / doctor / replay
+docker/searxng/                  # Self-hosted SearXNG quickstart (compose + tuned settings)
+tests/                           # 48 test files; mirrors the package layout
+config.example.yaml              # Reference configuration (annotated)
+sample_data/                     # Test fixtures and example action sequences
 ```
 
 ## License
