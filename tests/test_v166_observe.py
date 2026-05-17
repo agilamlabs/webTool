@@ -41,6 +41,7 @@ def _make_page(url: str = "https://example.com/page") -> MagicMock:
 
 def _make_browser_manager(page: MagicMock) -> MagicMock:
     """Fake BrowserManager that yields a fake new_page ctx-manager."""
+
     class _PageCtx:
         async def __aenter__(self):
             return page

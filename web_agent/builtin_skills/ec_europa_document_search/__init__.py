@@ -27,9 +27,7 @@ async def run(agent: Agent, url: str, inputs: dict[str, Any]) -> dict[str, Any]:
     max_results = int(inputs.get("max_results") or 5)
 
     # Site-restrict to the EC domains we care about.
-    composed_query = (
-        f'({" OR ".join(f"site:{h}" for h in _EC_HOSTS)}) {query}'
-    )
+    composed_query = f"({' OR '.join(f'site:{h}' for h in _EC_HOSTS)}) {query}"
 
     results = await agent.search_and_extract(composed_query, max_results=max_results)
 

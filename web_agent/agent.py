@@ -253,12 +253,8 @@ class Agent:
         # traces under diagnostics.trace_dir. Disabled by default.
         from .trace_recorder import SessionTraceRecorder
 
-        self._trace_recorder = SessionTraceRecorder(
-            self._config.diagnostics, self._config.base_dir
-        )
-        self._bm = BrowserManager(
-            self._config, network_collector=self._network_collector
-        )
+        self._trace_recorder = SessionTraceRecorder(self._config.diagnostics, self._config.base_dir)
+        self._bm = BrowserManager(self._config, network_collector=self._network_collector)
         self._sessions = SessionManager(
             self._bm, self._config, network_collector=self._network_collector
         )
@@ -977,17 +973,13 @@ class Agent:
 
     async def switch_tab(self, tab_id: str, *, session_id: str) -> None:
         """Make ``tab_id`` the active tab. Brings it to front when possible."""
-        async with self._call_scope(
-            "switch_tab", {"tab_id": tab_id, "session_id": session_id}
-        ):
+        async with self._call_scope("switch_tab", {"tab_id": tab_id, "session_id": session_id}):
             tm = self._sessions.get_tab_manager(session_id)
             await tm.switch_tab(tab_id)
 
     async def close_tab(self, tab_id: str, *, session_id: str) -> None:
         """Close a tab. If it was the active tab, another tab becomes active."""
-        async with self._call_scope(
-            "close_tab", {"tab_id": tab_id, "session_id": session_id}
-        ):
+        async with self._call_scope("close_tab", {"tab_id": tab_id, "session_id": session_id}):
             tm = self._sessions.get_tab_manager(session_id)
             await tm.close_tab(tab_id)
 
@@ -1255,7 +1247,13 @@ class Agent:
 
         async with self._call_scope(
             "select_dropdown",
-            {"session_id": session_id, "tab_id": tab_id, "value": value, "label": label, "index": index},
+            {
+                "session_id": session_id,
+                "tab_id": tab_id,
+                "value": value,
+                "label": label,
+                "index": index,
+            },
         ):
             si = SelectInput(
                 selector=selector,
@@ -1306,9 +1304,7 @@ class Agent:
         """Drag from one element and drop on another."""
         from .models import DragAndDropInput
 
-        async with self._call_scope(
-            "drag_and_drop", {"session_id": session_id, "tab_id": tab_id}
-        ):
+        async with self._call_scope("drag_and_drop", {"session_id": session_id, "tab_id": tab_id}):
             dd = DragAndDropInput(source=source, target=target, tab_id=tab_id)
             return await self._actions.execute_single_on_session(
                 dd, session_id=session_id, tab_id=tab_id
@@ -1584,19 +1580,13 @@ class Agent:
 
         from .models import Action
 
-        async with self._call_scope(
-            "replay_trace", {"trace_file": str(trace_file)}
-        ) as cid:
+        async with self._call_scope("replay_trace", {"trace_file": str(trace_file)}) as cid:
             entries = self._trace_recorder.load_entries(trace_file)
             # Only entries whose method starts with "action." replay cleanly.
             # Other (future) entry types like "scope.start" are skipped.
-            action_entries = [
-                e for e in entries if str(e.get("method", "")).startswith("action.")
-            ]
+            action_entries = [e for e in entries if str(e.get("method", "")).startswith("action.")]
             if not action_entries:
-                raise ValueError(
-                    f"Trace {trace_file} has no replayable action entries"
-                )
+                raise ValueError(f"Trace {trace_file} has no replayable action entries")
             start_url: str | None = None
             for e in entries:
                 if e.get("url"):

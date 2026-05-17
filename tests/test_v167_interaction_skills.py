@@ -153,12 +153,8 @@ async def test_upload_file_no_existence_oracle(tmp_path: Path) -> None:
     ba = BrowserActions(MagicMock(), cfg, sessions=None)
     page = _make_page()
 
-    r_real = await ba._do_upload_file(
-        page, UploadFileInput(selector="#f", paths=[str(real)])
-    )
-    r_fake = await ba._do_upload_file(
-        page, UploadFileInput(selector="#f", paths=[str(fake)])
-    )
+    r_real = await ba._do_upload_file(page, UploadFileInput(selector="#f", paths=[str(real)]))
+    r_fake = await ba._do_upload_file(page, UploadFileInput(selector="#f", paths=[str(fake)]))
     assert r_real.status == ActionStatus.FAILED
     assert r_fake.status == ActionStatus.FAILED
     # Same error reason regardless of existence -- no oracle
@@ -182,9 +178,7 @@ async def test_iframe_click_uses_frame_locator() -> None:
     fake_frame.locator = MagicMock(return_value=fake_inner)
     page.frame_locator = MagicMock(return_value=fake_frame)
 
-    action = IframeClickInput(
-        iframe_selector="iframe#consent", inner_selector="button#agree"
-    )
+    action = IframeClickInput(iframe_selector="iframe#consent", inner_selector="button#agree")
     result = await ba._do_iframe_click(page, action)
 
     page.frame_locator.assert_called_once_with("iframe#consent")
@@ -208,9 +202,7 @@ async def test_shadow_dom_click_uses_pierce_combinator() -> None:
     fake_loc.click = AsyncMock()
     page.locator = MagicMock(return_value=fake_loc)
 
-    action = ShadowDomClickInput(
-        host_selector="cookie-banner", inner_selector="button.accept"
-    )
+    action = ShadowDomClickInput(host_selector="cookie-banner", inner_selector="button.accept")
     result = await ba._do_shadow_dom_click(page, action)
 
     page.locator.assert_called_once_with("cookie-banner >> button.accept")
@@ -237,9 +229,7 @@ async def test_drag_and_drop_calls_locator_drag_to() -> None:
         return resolved.pop(0)
 
     action = DragAndDropInput(source="#a", target="#b")
-    with patch(
-        "web_agent.browser_actions._resolve_locator", side_effect=_fake_resolve
-    ):
+    with patch("web_agent.browser_actions._resolve_locator", side_effect=_fake_resolve):
         result = await ba._do_drag_and_drop(page, action)
 
     src.drag_to.assert_awaited_once_with(tgt)
@@ -264,9 +254,7 @@ async def test_scroll_until_text_finds_text_in_initial_view() -> None:
     fake_sessions.touch = MagicMock()
 
     ba = BrowserActions(MagicMock(), cfg, sessions=fake_sessions)
-    result = await ba.scroll_until_text(
-        "target string", session_id="sid", max_scrolls=3
-    )
+    result = await ba.scroll_until_text("target string", session_id="sid", max_scrolls=3)
 
     assert result.status == ActionStatus.SUCCESS
     assert result.data is not None

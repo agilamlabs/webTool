@@ -173,9 +173,7 @@ async def test_backend_remote_cdp_connection_failure_wraps_as_browser_error() ->
     )
     bm = BrowserManager(cfg)
     fake_pw = MagicMock(name="Playwright")
-    fake_pw.chromium.connect_over_cdp = AsyncMock(
-        side_effect=Exception("connection refused")
-    )
+    fake_pw.chromium.connect_over_cdp = AsyncMock(side_effect=Exception("connection refused"))
     fake_cm = MagicMock()
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)

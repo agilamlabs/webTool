@@ -80,9 +80,7 @@ async def test_do_press_key_with_modifiers_builds_combo() -> None:
     page.keyboard.press.assert_awaited_with("Enter")
 
     # With modifiers
-    await ba._do_press_key(
-        page, PressKeyInput(key="a", modifiers=["Control", "Shift"])
-    )
+    await ba._do_press_key(page, PressKeyInput(key="a", modifiers=["Control", "Shift"]))
     page.keyboard.press.assert_awaited_with("Control+Shift+a")
 
 

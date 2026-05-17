@@ -152,11 +152,7 @@ async def run_skills(args: argparse.Namespace) -> None:
             if args.json:
                 import json as _json
 
-                print(
-                    _json.dumps(
-                        [s.model_dump(mode="json") for s in skills], indent=2
-                    )
-                )
+                print(_json.dumps([s.model_dump(mode="json") for s in skills], indent=2))
                 return
             for s in skills:
                 runner = "runnable" if s.runnable else "info-only"
@@ -165,7 +161,11 @@ async def run_skills(args: argparse.Namespace) -> None:
             print(f"\nTotal: {len(skills)} skill(s)")
 
         elif args.skills_subcommand == "show":
-            matches = [s for s in agent.list_domain_skills() if s.domain == args.domain and s.name == args.name]
+            matches = [
+                s
+                for s in agent.list_domain_skills()
+                if s.domain == args.domain and s.name == args.name
+            ]
             if not matches:
                 print(f"No skill found: {args.domain}/{args.name}")
                 raise SystemExit(1)
@@ -295,9 +295,7 @@ def main() -> None:
     sk_sub = sp_skills.add_subparsers(dest="skills_subcommand", required=True)
     sp_skills_list = sk_sub.add_parser("list", help="List every registered skill")
     sp_skills_list.add_argument("--json", action="store_true", help="Emit JSON")
-    sp_skills_show = sk_sub.add_parser(
-        "show", help="Print one skill's full metadata as JSON"
-    )
+    sp_skills_show = sk_sub.add_parser("show", help="Print one skill's full metadata as JSON")
     sp_skills_show.add_argument("domain", help="Skill domain, e.g. sec.gov")
     sp_skills_show.add_argument("name", help="Skill name, e.g. filing_search")
     sp_skills_apply = sk_sub.add_parser(
@@ -331,9 +329,7 @@ def main() -> None:
     sp_doctor.add_argument(
         "--quick", action="store_true", help="Skip the slow chromium launch probe"
     )
-    sp_doctor.add_argument(
-        "--json", action="store_true", help="Emit DoctorReport as JSON (for CI)"
-    )
+    sp_doctor.add_argument("--json", action="store_true", help="Emit DoctorReport as JSON (for CI)")
 
     args = parser.parse_args()
 

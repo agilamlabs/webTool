@@ -112,9 +112,7 @@ class SkillInputError(SkillError):
 class BuiltinSkillRunner(Protocol):
     """Bundled skills expose this callable so the registry can dispatch."""
 
-    async def __call__(
-        self, agent: Agent, url: str, inputs: dict[str, Any]
-    ) -> dict[str, Any]: ...
+    async def __call__(self, agent: Agent, url: str, inputs: dict[str, Any]) -> dict[str, Any]: ...
 
 
 # ----------------------------------------------------------------------
@@ -196,9 +194,7 @@ def _parse_section_text(body: str, header: str) -> Optional[str]:
     return text or None
 
 
-def parse_skill_file(
-    path: Path, source: str = "project"
-) -> DomainSkill:
+def parse_skill_file(path: Path, source: str = "project") -> DomainSkill:
     """Parse one .md skill file into a :class:`DomainSkill`.
 
     Raises ``SkillError`` if the frontmatter is missing required fields
@@ -289,9 +285,7 @@ def _coerce_input(value: Any, spec: SkillInputSpec) -> Any:
 MAX_EXTRA_INPUTS = 20
 
 
-def validate_inputs(
-    skill: DomainSkill, supplied: dict[str, Any] | None
-) -> dict[str, Any]:
+def validate_inputs(skill: DomainSkill, supplied: dict[str, Any] | None) -> dict[str, Any]:
     """Validate caller-supplied inputs against the skill's declared schema.
 
     Fills in defaults; raises :class:`SkillInputError` for missing required
@@ -306,9 +300,7 @@ def validate_inputs(
             try:
                 out[key] = _coerce_input(supplied[key], spec)
             except (TypeError, ValueError) as exc:
-                raise SkillInputError(
-                    f"input '{key}' must be {spec.type}: {exc}"
-                ) from exc
+                raise SkillInputError(f"input '{key}' must be {spec.type}: {exc}") from exc
         elif spec.required:
             raise SkillInputError(f"required input '{key}' missing")
         elif spec.default is not None:
@@ -407,7 +399,9 @@ class SkillRegistry:
             except Exception as exc:
                 logger.warning(
                     "Failed to load builtin skill module {mod}: {e}",
-                    mod=skill_module.__name__ if hasattr(skill_module, "__name__") else skill_module,
+                    mod=skill_module.__name__
+                    if hasattr(skill_module, "__name__")
+                    else skill_module,
                     e=exc,
                 )
 
@@ -513,9 +507,7 @@ class SkillRegistry:
         # Resolve which skill: find one matching the URL's domain by name.
         matches = [s for s in self.get_for_url(url) if s.name == name]
         if not matches:
-            raise SkillNotFoundError(
-                f"No skill '{name}' for {urlparse(url).hostname or url!r}"
-            )
+            raise SkillNotFoundError(f"No skill '{name}' for {urlparse(url).hostname or url!r}")
         # If multiple match (different domain entries both match), prefer
         # the most-specific (longest domain) one.
         skill = max(matches, key=lambda s: len(s.domain))
@@ -568,8 +560,7 @@ class SkillRegistry:
                     ToolWarning(
                         code="skill_output_missing_field",
                         message=(
-                            f"Output schema declares '{expected_key}' but runner "
-                            f"did not return it."
+                            f"Output schema declares '{expected_key}' but runner did not return it."
                         ),
                         severity=ToolSeverity.WARNING,
                     )

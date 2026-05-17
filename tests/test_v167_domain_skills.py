@@ -140,12 +140,15 @@ def test_parse_domain_lowercased(tmp_path: Path) -> None:
 
 def test_validate_inputs_fills_default() -> None:
     skill = DomainSkill(
-        name="x", domain="example.com", description="x",
+        name="x",
+        domain="example.com",
+        description="x",
         inputs={
             "q": SkillInputSpec(type="str", required=True),
             "n": SkillInputSpec(type="int", default=5),
         },
-        source="builtin", source_path="/dev/null",
+        source="builtin",
+        source_path="/dev/null",
     )
     out = validate_inputs(skill, {"q": "hello"})
     assert out == {"q": "hello", "n": 5}
@@ -153,9 +156,12 @@ def test_validate_inputs_fills_default() -> None:
 
 def test_validate_inputs_missing_required_raises() -> None:
     skill = DomainSkill(
-        name="x", domain="example.com", description="x",
+        name="x",
+        domain="example.com",
+        description="x",
         inputs={"q": SkillInputSpec(type="str", required=True)},
-        source="builtin", source_path="/dev/null",
+        source="builtin",
+        source_path="/dev/null",
     )
     with pytest.raises(SkillInputError, match="required input 'q'"):
         validate_inputs(skill, {})
@@ -163,9 +169,12 @@ def test_validate_inputs_missing_required_raises() -> None:
 
 def test_validate_inputs_coerces_int() -> None:
     skill = DomainSkill(
-        name="x", domain="example.com", description="x",
+        name="x",
+        domain="example.com",
+        description="x",
         inputs={"n": SkillInputSpec(type="int")},
-        source="builtin", source_path="/dev/null",
+        source="builtin",
+        source_path="/dev/null",
     )
     out = validate_inputs(skill, {"n": "42"})
     assert out == {"n": 42}
@@ -173,9 +182,12 @@ def test_validate_inputs_coerces_int() -> None:
 
 def test_validate_inputs_bool_string_coercion() -> None:
     skill = DomainSkill(
-        name="x", domain="example.com", description="x",
+        name="x",
+        domain="example.com",
+        description="x",
         inputs={"flag": SkillInputSpec(type="bool")},
-        source="builtin", source_path="/dev/null",
+        source="builtin",
+        source_path="/dev/null",
     )
     for raw, expected in [("true", True), ("0", False), ("yes", True), ("nope", False)]:
         out = validate_inputs(skill, {"flag": raw})
@@ -232,9 +244,9 @@ def test_registry_project_overrides_builtin(tmp_path: Path) -> None:
 def test_registry_workspace_skills_loaded(tmp_path: Path) -> None:
     ws_skills = tmp_path / ".webtool-workspace" / "domain-skills"
     ws_skills.mkdir(parents=True)
-    md = SAMPLE_SKILL_MD.replace(
-        "name: filing_search", "name: workspace_skill"
-    ).replace("domain: sec.gov", "domain: workspace-only.test")
+    md = SAMPLE_SKILL_MD.replace("name: filing_search", "name: workspace_skill").replace(
+        "domain: sec.gov", "domain: workspace-only.test"
+    )
     (ws_skills / "skill.md").write_text(md, encoding="utf-8")
 
     cfg = AppConfig(
@@ -364,9 +376,7 @@ async def test_apply_validates_required_inputs(tmp_path: Path) -> None:
     fake_agent = MagicMock()
     fake_agent._correlation_id = None
     with pytest.raises(SkillInputError, match="required input 'company'"):
-        await reg.apply(
-            fake_agent, "https://www.sec.gov/", "filing_search", {}
-        )
+        await reg.apply(fake_agent, "https://www.sec.gov/", "filing_search", {})
 
 
 @pytest.mark.asyncio

@@ -538,9 +538,7 @@ class SafetyConfig(BaseSettings):
     _normalize_allowed = field_validator("allowed_domains", mode="before")(
         _normalize_domain_patterns
     )
-    _normalize_denied = field_validator("denied_domains", mode="before")(
-        _normalize_domain_patterns
-    )
+    _normalize_denied = field_validator("denied_domains", mode="before")(_normalize_domain_patterns)
     probe_binary_urls: bool = Field(
         default=True,
         description=(
