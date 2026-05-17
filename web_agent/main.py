@@ -127,6 +127,41 @@ def run_serve_mcp(args: argparse.Namespace) -> None:
     mcp_main()
 
 
+async def run_observe(args: argparse.Namespace) -> None:
+    """Capture an observe snapshot for a URL: screenshot + dimensions + DPR."""
+    config = _load_config(args)
+    setup_logging(config.log_level)
+
+    async with Agent(config) as agent:
+        obs = await agent.observe(
+            args.url,
+            include_text=not args.no_text,
+            include_aria=args.aria,
+        )
+        print(obs.model_dump_json(indent=2))
+
+
+async def run_doctor(args: argparse.Namespace) -> None:
+    """Run web_agent self-diagnostic and print the report."""
+    # Doctor doesn't need a running Agent or Browser, but it does need
+    # a config to know which paths to probe. Build one without starting Agent.
+    config = _load_config(args)
+    setup_logging(config.log_level)
+
+    from .doctor import format_report_human
+    from .doctor import run_doctor as _run_doctor
+
+    report = await _run_doctor(config, quick=args.quick)
+    if args.json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(format_report_human(report))
+
+    # Exit non-zero if anything failed so CI can gate on `web-agent doctor`.
+    if report.summary == "unusable":
+        raise SystemExit(2)
+
+
 # ------------------------------------------------------------------
 # CLI parser
 # ------------------------------------------------------------------
@@ -186,6 +221,30 @@ def main() -> None:
         help="Run as an MCP server (stdio transport) for Claude Desktop/Code, Cursor, etc.",
     )
 
+    # v1.6.6: observe (Feature 5)
+    sp_observe = subparsers.add_parser(
+        "observe", help="Capture a page's screenshot + viewport / scroll / DPR snapshot"
+    )
+    sp_observe.add_argument("url", help="URL to observe")
+    sp_observe.add_argument(
+        "--no-text", action="store_true", help="Skip document.body.innerText capture"
+    )
+    sp_observe.add_argument(
+        "--aria", action="store_true", help="Include accessibility snapshot (may be large)"
+    )
+
+    # v1.6.6: doctor (Feature 6)
+    sp_doctor = subparsers.add_parser(
+        "doctor",
+        help="Self-diagnostic: Playwright, Chromium, MCP, binary extras, dirs, network",
+    )
+    sp_doctor.add_argument(
+        "--quick", action="store_true", help="Skip the slow chromium launch probe"
+    )
+    sp_doctor.add_argument(
+        "--json", action="store_true", help="Emit DoctorReport as JSON (for CI)"
+    )
+
     args = parser.parse_args()
 
     # serve-mcp is synchronous (it manages its own event loop internally)
@@ -199,6 +258,8 @@ def main() -> None:
         "download": run_download,
         "interact": run_interact,
         "screenshot": run_screenshot,
+        "observe": run_observe,
+        "doctor": run_doctor,
     }
     asyncio.run(handler_map[args.command](args))
 

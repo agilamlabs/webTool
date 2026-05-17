@@ -62,20 +62,28 @@ from .debug import DebugCapture
 from .downloader import Downloader
 from .models import (
     Action,
+    ActionResult,
     ActionSequenceResult,
     AgentResult,
+    ClickXYInput,
+    DoctorReport,
     DownloadResult,
     ExtractionResult,
     FetchDiagnostic,
     FetchResult,
     FetchStatus,
     FormFilterSpec,
+    MouseButton,
+    ObserveResult,
+    PressKeyInput,
     ResearchResult,
     ScreenshotResult,
     SearchResultItem,
     SessionInfo,
+    TabInfo,
     ToolMessage,
     ToolSeverity,
+    TypeTextInput,
 )
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
@@ -872,6 +880,241 @@ class Agent:
     def list_sessions(self) -> list[SessionInfo]:
         """Return SessionInfo snapshots for all live sessions."""
         return self._sessions.list()
+
+    # ------------------------------------------------------------------
+    # v1.6.6 Tabs (Feature 3)
+    # ------------------------------------------------------------------
+
+    async def list_tabs(self, session_id: str) -> list[TabInfo]:
+        """Return snapshots of every tab in a session.
+
+        The active tab (the one execute_sequence will target by default)
+        has ``active=True``. Use ``switch_tab`` to change it.
+        """
+        async with self._call_scope("list_tabs", {"session_id": session_id}):
+            tm = self._sessions.get_tab_manager(session_id)
+            return await tm.list()
+
+    async def current_tab(self, session_id: str) -> Optional[TabInfo]:
+        """Return the active tab's snapshot, or None if the session has none."""
+        async with self._call_scope("current_tab", {"session_id": session_id}):
+            tm = self._sessions.get_tab_manager(session_id)
+            tabs = await tm.list()
+            for t in tabs:
+                if t.active:
+                    return t
+            return None
+
+    async def new_tab(
+        self,
+        url: str | None = None,
+        *,
+        session_id: str,
+    ) -> str:
+        """Open a fresh tab in a session and return its tab_id.
+
+        The new tab becomes the session's active tab. If ``url`` is
+        provided, the tab navigates to it.
+
+        Raises:
+            DomainNotAllowedError: if ``url`` is set and the host fails
+                ``SafetyConfig.allowed_domains`` / ``denied_domains`` /
+                ``block_private_ips`` checks. This matches the SSRF
+                protection applied to ``fetch_and_extract`` /
+                ``interact`` / ``observe`` -- ``new_tab`` cannot be a
+                back door into the private-IP space.
+        """
+        async with self._call_scope("new_tab", {"url": url, "session_id": session_id}):
+            if url is not None and not check_domain_allowed(url, self._config.safety):
+                from .exceptions import DomainNotAllowedError
+
+                host = urlparse(url).hostname or ""
+                raise DomainNotAllowedError(
+                    f"new_tab: domain not allowed: {host!r}", url=url, host=host
+                )
+            tm = self._sessions.get_tab_manager(session_id)
+            return await tm.new_tab(url=url)
+
+    async def switch_tab(self, tab_id: str, *, session_id: str) -> None:
+        """Make ``tab_id`` the active tab. Brings it to front when possible."""
+        async with self._call_scope(
+            "switch_tab", {"tab_id": tab_id, "session_id": session_id}
+        ):
+            tm = self._sessions.get_tab_manager(session_id)
+            await tm.switch_tab(tab_id)
+
+    async def close_tab(self, tab_id: str, *, session_id: str) -> None:
+        """Close a tab. If it was the active tab, another tab becomes active."""
+        async with self._call_scope(
+            "close_tab", {"tab_id": tab_id, "session_id": session_id}
+        ):
+            tm = self._sessions.get_tab_manager(session_id)
+            await tm.close_tab(tab_id)
+
+    # ------------------------------------------------------------------
+    # v1.6.6 Coordinate-level fallbacks (Feature 4)
+    # ------------------------------------------------------------------
+
+    async def click_xy(
+        self,
+        x: float,
+        y: float,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+        button: str = "left",
+        clicks: int = 1,
+        delay: int = 0,
+    ) -> ActionResult:
+        """Click at viewport coordinates (CSS pixels) on a session's tab.
+
+        Requires a live session_id -- coord clicks are meaningful only
+        against an observed page (see :meth:`observe`). Bypasses selector
+        resolution; pair with ``observe()`` for verify-after-act loops.
+        """
+        async with self._call_scope(
+            "click_xy", {"x": x, "y": y, "session_id": session_id, "tab_id": tab_id}
+        ):
+            action = ClickXYInput(
+                x=x,
+                y=y,
+                button=MouseButton(button),
+                clicks=clicks,
+                delay=delay,
+                tab_id=tab_id,
+            )
+            return await self._actions.execute_single_on_session(
+                action, session_id=session_id, tab_id=tab_id
+            )
+
+    async def type_text(
+        self,
+        text: str,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+        delay: int = 0,
+    ) -> ActionResult:
+        """Type ``text`` into whatever currently has keyboard focus.
+
+        Pair with a preceding ``click_xy`` (or any focusing action) to
+        direct keystrokes at the right element. Requires session_id.
+        """
+        async with self._call_scope(
+            "type_text", {"length": len(text), "session_id": session_id, "tab_id": tab_id}
+        ):
+            action = TypeTextInput(text=text, delay=delay, tab_id=tab_id)
+            return await self._actions.execute_single_on_session(
+                action, session_id=session_id, tab_id=tab_id
+            )
+
+    async def press_key(
+        self,
+        key: str,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+        modifiers: list[str] | None = None,
+    ) -> ActionResult:
+        """Press ``key`` (with optional modifiers) at page level.
+
+        Modifiers list values: ``'Shift'``, ``'Control'``, ``'Alt'``, ``'Meta'``.
+        Requires session_id.
+        """
+        async with self._call_scope(
+            "press_key", {"key": key, "session_id": session_id, "tab_id": tab_id}
+        ):
+            action = PressKeyInput(
+                key=key,
+                modifiers=list(modifiers) if modifiers else [],
+                tab_id=tab_id,
+            )
+            return await self._actions.execute_single_on_session(
+                action, session_id=session_id, tab_id=tab_id
+            )
+
+    # ------------------------------------------------------------------
+    # v1.6.6 Observe (Feature 5)
+    # ------------------------------------------------------------------
+
+    async def observe(
+        self,
+        url: Optional[str] = None,
+        *,
+        session_id: Optional[str] = None,
+        tab_id: Optional[str] = None,
+        include_text: bool = True,
+        include_aria: bool = False,
+    ) -> ObserveResult:
+        """Capture a page's visual + structural state.
+
+        Use cases:
+          * Decide where to click next (returns ``screenshot_path``,
+            ``device_pixel_ratio`` for screenshot-to-CSS-px mapping).
+          * Verify the result of a previous action ran successfully
+            (URL, title, visible_text, scroll position).
+          * Snapshot the accessibility tree for assistive flows
+            (``include_aria=True``).
+
+        Args:
+            url: Open this URL (ephemeral page if no session_id; or
+                navigate the session's current tab to it). Optional when
+                session_id is provided -- omit to observe the current
+                state in place.
+            session_id: Live session whose tab to observe.
+            tab_id: Specific tab to observe within the session.
+            include_text: Capture ``document.body.innerText`` (truncated
+                to safety.max_chars_per_call). Default True.
+            include_aria: Capture ``page.accessibility.snapshot()``.
+                Default False (snapshots can be megabytes).
+        """
+        async with self._call_scope(
+            "observe", {"url": url, "session_id": session_id, "tab_id": tab_id}
+        ):
+            return await self._actions.observe(
+                url,
+                session_id=session_id,
+                tab_id=tab_id,
+                include_text=include_text,
+                include_aria=include_aria,
+            )
+
+    # ------------------------------------------------------------------
+    # v1.6.6 CDP endpoint accessor (Feature 2)
+    # ------------------------------------------------------------------
+
+    def get_cdp_endpoint(self) -> str | None:
+        """Return the CDP WebSocket endpoint of webTool's browser, or None.
+
+        Returns ``None`` when ``browser.cdp_enabled=False`` or before
+        the browser has started. External CDP tools (chrome://inspect,
+        custom debuggers) can connect to this endpoint -- webTool never
+        attaches to other endpoints.
+        """
+        return self._bm.get_cdp_endpoint()
+
+    # ------------------------------------------------------------------
+    # v1.6.6 Doctor (Feature 6)
+    # ------------------------------------------------------------------
+
+    async def doctor(self, *, quick: bool = False) -> DoctorReport:
+        """Run a self-diagnostic and return a structured report.
+
+        Probes Python/web_agent versions, Playwright + Chromium install,
+        optional providers (DDGS, SearXNG), MCP, binary extras
+        (pypdf/openpyxl/python-docx), directory writability, and basic
+        network connectivity.
+
+        Bypasses ``_call_scope`` (no audit log entry) and SafetyConfig
+        gates by design -- doctor is a capability self-check, not a
+        regular operation.
+
+        Args:
+            quick: Skip the actual chromium.launch test (saves ~3-5s).
+        """
+        from .doctor import run_doctor
+
+        return await run_doctor(self._config, quick=quick)
 
     # ------------------------------------------------------------------
     # High-Level Recipes

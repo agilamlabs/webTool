@@ -514,6 +514,241 @@ async def list_browser_sessions(ctx: Context) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# v1.6.6 Feature 3: Tab management
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_list_tabs(ctx: Context, session_id: str) -> dict:
+    """List every tab in a browser session.
+
+    Tabs are created either explicitly via ``web_new_tab`` or
+    automatically when the page opens a popup / target=_blank link.
+    The ``active`` tab is the one ``web_interact`` / ``web_observe``
+    target by default.
+
+    Args:
+        session_id: The session_id from ``create_browser_session``.
+
+    Returns:
+        Dict with ``count`` and ``tabs`` (list of TabInfo dicts).
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    tabs = await agent.list_tabs(session_id)
+    return {
+        "count": len(tabs),
+        "tabs": [t.model_dump(mode="json") for t in tabs],
+    }
+
+
+@mcp.tool()
+async def web_current_tab(ctx: Context, session_id: str) -> dict:
+    """Return the active tab of a session, or ``{"tab": null}`` if none."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    t = await agent.current_tab(session_id)
+    return {"tab": t.model_dump(mode="json") if t else None}
+
+
+@mcp.tool()
+async def web_new_tab(
+    ctx: Context, session_id: str, url: Optional[str] = None
+) -> dict:
+    """Open a fresh tab in a session.
+
+    The new tab becomes the active tab. If ``url`` is provided, the tab
+    navigates to it. Use ``web_list_tabs`` to see the new tab_id.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    tab_id = await agent.new_tab(url=url, session_id=session_id)
+    return {"tab_id": tab_id, "session_id": session_id, "url": url}
+
+
+@mcp.tool()
+async def web_switch_tab(ctx: Context, session_id: str, tab_id: str) -> dict:
+    """Make ``tab_id`` the active tab. Brings it to front when possible."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    await agent.switch_tab(tab_id, session_id=session_id)
+    return {"switched": True, "tab_id": tab_id, "session_id": session_id}
+
+
+@mcp.tool()
+async def web_close_tab(ctx: Context, session_id: str, tab_id: str) -> dict:
+    """Close a tab. If it was the active tab, another becomes active."""
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    await agent.close_tab(tab_id, session_id=session_id)
+    return {"closed": True, "tab_id": tab_id, "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6 Feature 4: coordinate-level fallback actions
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_click_xy(
+    ctx: Context,
+    session_id: str,
+    x: float,
+    y: float,
+    tab_id: Optional[str] = None,
+    button: str = "left",
+    clicks: int = 1,
+    delay: int = 0,
+) -> dict:
+    """Click at viewport coordinates (CSS pixels) on a session's tab.
+
+    Use after ``web_observe`` returns ``device_pixel_ratio`` so you can
+    map screenshot pixels to CSS pixels (Playwright's mouse API expects
+    CSS pixels, not device pixels). Bypasses selector resolution.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.click_xy(
+        x,
+        y,
+        session_id=session_id,
+        tab_id=tab_id,
+        button=button,
+        clicks=clicks,
+        delay=delay,
+    )
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_type_text(
+    ctx: Context,
+    session_id: str,
+    text: str,
+    tab_id: Optional[str] = None,
+    delay: int = 0,
+) -> dict:
+    """Type ``text`` into whatever currently has keyboard focus.
+
+    Pair with a preceding ``web_click_xy`` to direct keystrokes at the
+    right element. Requires a live session.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.type_text(text, session_id=session_id, tab_id=tab_id, delay=delay)
+    return r.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_press_key(
+    ctx: Context,
+    session_id: str,
+    key: str,
+    tab_id: Optional[str] = None,
+    modifiers: Optional[list[str]] = None,
+) -> dict:
+    """Press a key (with optional modifiers) at page level.
+
+    Modifiers: ``Shift``, ``Control``, ``Alt``, ``Meta``. The combo
+    ``Control+a`` works as either ``key="Control+a"`` or
+    ``key="a", modifiers=["Control"]``.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    r = await agent.press_key(
+        key, session_id=session_id, tab_id=tab_id, modifiers=modifiers
+    )
+    return r.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6 Feature 5: observe mode
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_observe(
+    ctx: Context,
+    url: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tab_id: Optional[str] = None,
+    include_text: bool = True,
+    include_aria: bool = False,
+) -> dict:
+    """Capture a page's visual + structural state for observe-act-verify loops.
+
+    Returns a screenshot path, viewport / page dimensions, scroll
+    position, device pixel ratio, plus optional visible text and ARIA
+    accessibility tree. Use the DPR to map screenshot pixels to the
+    CSS pixels that ``web_click_xy`` expects.
+
+    Args:
+        url: Open this URL (ephemeral page if no session_id, or
+            navigate the session's current tab to it). Optional when
+            session_id is given -- omit to observe current state.
+        session_id: Live session whose tab to observe.
+        tab_id: Specific tab to observe within the session.
+        include_text: Capture document.body.innerText (truncated to
+            safety.max_chars_per_call). Default True.
+        include_aria: Capture page.accessibility.snapshot(). Default
+            False (snapshots can be megabytes).
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    obs = await agent.observe(
+        url,
+        session_id=session_id,
+        tab_id=tab_id,
+        include_text=include_text,
+        include_aria=include_aria,
+    )
+    return obs.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6 Feature 6: doctor
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_doctor(ctx: Context, quick: bool = False) -> dict:
+    """Self-diagnostic for the web_agent install.
+
+    Probes Python + web_agent versions, Playwright + Chromium install,
+    optional providers (DDGS, SearXNG), MCP, binary extras
+    (pypdf/openpyxl/python-docx), directory writability, and basic
+    network connectivity. Bypasses SafetyConfig.
+
+    Args:
+        quick: Skip the actual chromium launch test (~3-5s).
+
+    Returns:
+        DoctorReport as a dict with ``summary`` (healthy /
+        usable_with_warnings / unusable) and per-check details.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    report = await agent.doctor(quick=quick)
+    return report.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6 Feature 2: CDP endpoint
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_get_cdp_endpoint(ctx: Context) -> dict:
+    """Return the Chrome DevTools Protocol endpoint of the webTool-launched browser.
+
+    Returns ``{"enabled": false, "endpoint": null}`` when
+    ``browser.cdp_enabled=False``. External CDP tools (chrome://inspect,
+    custom debuggers, browser-use, playwright-inspector) can connect to
+    the returned ws:// URL. webTool itself never attaches to other
+    endpoints -- this is the only browser it controls.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    cfg = agent._config.browser
+    endpoint = agent.get_cdp_endpoint()
+    return {
+        "enabled": cfg.cdp_enabled,
+        "endpoint": endpoint,
+        "host": cfg.cdp_host,
+        "port": cfg.cdp_port,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

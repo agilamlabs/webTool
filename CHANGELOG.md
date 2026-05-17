@@ -1,5 +1,164 @@
 # Changelog
 
+## [1.6.6] - 2026-05-17
+
+### Browser Control Foundation (6 features, inspired by browser-harness)
+
+A major capability expansion adapting `browser-harness` ideas to
+`web_agent`'s structured architecture, with a firm safety boundary:
+**webTool never attaches to the user's existing personal Chrome.** It
+may launch its own isolated browser and attach to that browser over
+CDP, but never reuses a user-owned profile or process.
+
+All six features are opt-in via config flags; defaults preserve v1.6.5
+behavior. Test count grew from 409 to **450** (41 new tests across 7
+new files).
+
+#### Feature 1 — Browser Isolation Profile Launcher (Rank 1)
+
+`BrowserManager.start()` now optionally launches Chromium with
+`--user-data-dir=<webTool-owned-path>`, isolating cookies / localStorage
+/ sessionStorage / cache / downloads from the user's real Chrome.
+
+* New config: `browser.isolation_mode` (default `False`),
+  `browser.profile_mode` (`"ephemeral"` | `"named"`, default
+  `"ephemeral"`), `browser.profile_dir`, `browser.cleanup_on_exit`
+  (default `True`).
+* Ephemeral profiles auto-generate a tempdir under
+  `<base_dir>/.webtool/browser-profiles/run-<token>/` and remove it on
+  `Agent.__aexit__`. Failed launches do NOT leak tempdirs.
+* Named profiles persist across runs (e.g. for logged-in workflows)
+  under a user-specified path; `cleanup_on_exit` is a no-op for named.
+* New `BrowserConfig` validator: `profile_mode="named"` requires
+  `profile_dir`, else `ConfigError`.
+* The existing `BrowserConfig.user_data_dir` field is now marked
+  deprecated; if both are set, `profile_dir` wins.
+
+#### Feature 2 — CDP Attach to webTool-Launched Browser (Rank 2)
+
+When `browser.cdp_enabled=True`, launch args grow
+`--remote-debugging-port=<port>` and `--remote-debugging-address=<host>`.
+The actual port (when `cdp_port=0` for OS-assigned) and ws URL are
+discovered from `<user-data-dir>/DevToolsActivePort` and exposed via
+`Agent.get_cdp_endpoint() -> ws://host:port/devtools/browser/<uuid>`.
+
+* New config: `browser.backend` (`"playwright"` | `"cdp_owned"`),
+  `browser.cdp_enabled` (default `False`), `browser.cdp_host` (default
+  `"127.0.0.1"`), `browser.cdp_port` (default `0`),
+  `browser.launch_owned_cdp_browser`, `browser.attach_existing_browser`.
+* `BrowserConfig` validator rejects four foot-guns:
+  - `attach_existing_browser=True` -> `ConfigError`.
+  - `cdp_enabled=True` without `isolation_mode=True` -> `ConfigError`
+    (DevToolsActivePort needs a user-data-dir).
+  - `cdp_host` not in `{"127.0.0.1", "localhost"}` -> `ConfigError`
+    (no public CDP binding).
+  - `backend="cdp_owned"` without `cdp_enabled=True` -> `ConfigError`.
+* New MCP tool `web_get_cdp_endpoint`. No `connect_over_cdp` re-attach
+  path is provided -- deferred to v1.7 if real demand surfaces.
+
+#### Feature 3 — Tab Management (Rank 6)
+
+Sessions now own a `TabManager` that maps `tab_id -> Page`, with a
+sticky `_current_tab_id` pointer and popup auto-registration via
+`ctx.on("page", ...)`. New `BaseAction` parent class adds an optional
+`tab_id: Optional[str] = None` to every Action input -- transparent to
+v1.6.5 JSON callers (Pydantic discriminated union dispatches on the
+`action` literal, not class identity).
+
+* New module: `web_agent/tab_manager.py`.
+* New models: `TabInfo`, `BaseAction`.
+* `SessionManager.create()` instantiates the TabManager BEFORE the
+  initial UA-probe page, registering that page as the `"main"` tab.
+* New `Agent` methods (all session-scoped): `list_tabs`, `current_tab`,
+  `new_tab`, `switch_tab`, `close_tab`.
+* New MCP tools: `web_list_tabs`, `web_current_tab`, `web_new_tab`,
+  `web_switch_tab`, `web_close_tab`.
+* `_PAGE_DIALOG_STATES`-style `WeakKeyDictionary` pattern reused for
+  `TabManager._reverse: Page -> tab_id` -- auto-evicts on page close.
+
+**Behavior change:** `execute_sequence` against an existing `session_id`
+now reuses the session's current tab instead of opening a fresh page
+per call. Cookies/storage were already shared in v1.6.5; now scroll,
+viewport, and `Page` identity are shared too -- more intuitive but
+different. Escape hatch: set `automation.fresh_tab_per_call=True` to
+restore v1.6.5 fresh-page behavior.
+
+#### Feature 4 — Coordinate Click + Low-Level Input (Rank 5)
+
+Three new Action discriminator types for when selectors fail (canvas
+apps, shadow DOM, cross-origin iframes, visual-only controls):
+`ClickXYInput`, `TypeTextInput`, `PressKeyInput`. Coordinates are CSS
+pixels (what `page.mouse.click` expects), not device pixels -- always
+honor `ObserveResult.device_pixel_ratio` when mapping from a screenshot.
+
+* New action types: `ActionType.CLICK_XY`, `TYPE_TEXT`, `PRESS_KEY`.
+* New `Agent` methods (all require `session_id`): `click_xy`,
+  `type_text`, `press_key`.
+* New `BrowserActions.execute_single_on_session(action, session_id,
+  tab_id)` helper -- shared by all three top-level methods.
+* New MCP tools: `web_click_xy`, `web_type_text`, `web_press_key`.
+* Safety note: coord click bypasses the `_looks_like_submit` heuristic
+  (no selector to inspect). Under `safety.safe_mode=True`, a WARNING
+  is logged but the click runs -- safe_mode was a config-level opt-in,
+  not a per-coord-click block.
+
+#### Feature 5 — Screenshot-First `observe()` Mode (Rank 4)
+
+`Agent.observe(url, session_id, tab_id, include_text, include_aria)`
+returns an `ObserveResult` with screenshot path, viewport / page /
+scroll dimensions, `device_pixel_ratio`, optional truncated visible
+text, and optional ARIA snapshot. One `page.evaluate(...)` round-trip
+for all dimensions.
+
+* New model: `ObserveResult`.
+* Screenshot path resolution goes through the v1.6.4 cross-platform
+  `safe_join_path`. Files land under `automation.screenshot_dir/
+  observe_<correlation_id>_<timestamp>.png`.
+* Text capture truncates to `safety.max_chars_per_call` so observed
+  pages can't blow the context budget.
+* ARIA capture is opt-in (`include_aria=True`) -- snapshots can be
+  megabytes on complex pages.
+* New MCP tool: `web_observe`.
+* New CLI subcommand: `web-agent observe <url>`.
+
+#### Feature 6 — Doctor Command (Rank 8)
+
+`Agent.doctor(quick=False)` runs 14 capability probes and returns a
+`DoctorReport` with summary `healthy` | `usable_with_warnings` |
+`unusable`. Probes: Python + web_agent version, Playwright import,
+Chromium driver path, headless browser launch (skipped with `quick=True`),
+DDGS, SearXNG reachability, FastMCP, three binary-extraction extras
+(pypdf / openpyxl / python-docx), three writable dirs (downloads /
+screenshots / debug), network connectivity to example.com,
+robots/rate-limit sanity, and YAML config parse from
+`WEB_AGENT_CONFIG`.
+
+* New module: `web_agent/doctor.py`.
+* New models: `DoctorCheck`, `DoctorReport`.
+* Bypasses `Agent._call_scope` audit logging and `SafetyConfig`
+  domain gating by design -- doctor is a capability self-check, not
+  a regular agent operation.
+* Each probe wrapped in `asyncio.wait_for(..., 5.0)` -- the run never
+  crashes; per-check failures become `fail`-status entries.
+* New MCP tool: `web_doctor`.
+* New CLI subcommand: `web-agent doctor [--quick] [--json]`. CI gate
+  via exit code 2 when `summary == "unusable"`.
+
+#### New automation config
+
+* `automation.fresh_tab_per_call: bool = False` -- restore v1.6.5
+  fresh-page-per-call behavior for session-owned `interact()` calls.
+
+#### Backward-compat summary
+
+* All new `BrowserConfig` fields default to off / disabled.
+* `BaseAction` parent class is purely additive; `tab_id` defaults to
+  None and is omitted from JSON via `exclude_none=True`.
+* Legacy Action JSON without `tab_id` continues to parse cleanly
+  through `TypeAdapter[Action]`.
+* The single behavioral change is per-call tab reuse for sessions
+  (Feature 3); flip `automation.fresh_tab_per_call=True` to restore.
+
 ## [1.6.5] - 2026-05-11
 
 ### Self-review pass (16 findings: SSRF + cookie isolation + polish)

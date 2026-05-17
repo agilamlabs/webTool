@@ -47,6 +47,7 @@ from .models import (
     ActionStatus,
     ActionType,
     ClickInput,
+    ClickXYInput,
     DialogInput,
     DialogResponse,
     EvaluateInput,
@@ -56,6 +57,8 @@ from .models import (
     LocatorSpec,
     NavigateDirection,
     NavigateInput,
+    ObserveResult,
+    PressKeyInput,
     ScreenshotFormat,
     ScreenshotInput,
     ScreenshotResult,
@@ -64,6 +67,7 @@ from .models import (
     SelectInput,
     SelectorLike,
     TypeInput,
+    TypeTextInput,
     WaitInput,
     WaitTarget,
 )
@@ -312,20 +316,53 @@ class BrowserActions:
         # Initialize cleanup state BEFORE the branch so the finally block is
         # safe even if page-acquisition raises (e.g. unknown session_id, or
         # ctx.new_page() fails on a closed browser context).
+        #
+        # v1.6.6 ownership semantics:
+        #   "ephemeral"          -- no session_id; ctx_mgr owns lifecycle.
+        #   "session_persistent" -- reused the session's current tab.
+        #                            DO NOT close at sequence end -- the
+        #                            tab outlives the sequence so subsequent
+        #                            interact() calls share state.
+        #   "session_ephemeral"  -- legacy v1.6.5 behavior under
+        #                            automation.fresh_tab_per_call=True OR
+        #                            the session has no current tab. We
+        #                            opened the page; we close it at the end.
         page = None
         ctx_mgr = None
         owner = "ephemeral"
 
         try:
             if session_id and self._sessions is not None:
-                owner = "session"
                 ctx = self._sessions.get(session_id)
                 self._sessions.touch(session_id)
-                page = await ctx.new_page()
+                # v1.6.6: prefer the session's current tab unless the operator
+                # explicitly opted into fresh-page-per-call behavior.
+                fresh = self._config.automation.fresh_tab_per_call
+                tab_mgr = None
+                with contextlib.suppress(KeyError):
+                    tab_mgr = self._sessions.get_tab_manager(session_id)
+
+                reused = False
+                if not fresh and tab_mgr is not None:
+                    current = tab_mgr.current()
+                    if current is not None and not current.is_closed():
+                        page = current
+                        owner = "session_persistent"
+                        reused = True
+
+                if not reused:
+                    # Either fresh_tab_per_call=True, no TabManager (shouldn't
+                    # happen in v1.6.6 but defensive), or the current page
+                    # was closed externally. Fall back to opening a new page.
+                    page = await ctx.new_page()
+                    owner = "session_ephemeral"
             else:
                 ctx_mgr = self._bm.new_page(block_resources=False)
                 page = await ctx_mgr.__aenter__()
 
+            # All branches above set ``page``; mypy can't follow the
+            # cross-branch reassignment so we narrow here.
+            assert page is not None
             await page.goto(url, wait_until="domcontentloaded")
 
             # Post-navigation re-check: the initial goto may have followed a
@@ -408,7 +445,9 @@ class BrowserActions:
                     )
                 )
         finally:
-            if page is not None and owner == "session":
+            # v1.6.6: only close pages WE created. Persistent session tabs
+            # outlive sequences so subsequent interact() calls share state.
+            if page is not None and owner == "session_ephemeral":
                 with contextlib.suppress(Exception):
                     await page.close()
             elif ctx_mgr is not None:
@@ -926,6 +965,251 @@ class BrowserActions:
         )
 
     # ------------------------------------------------------------------
+    # v1.6.6 Feature 4: coordinate-level fallback handlers
+    # ------------------------------------------------------------------
+
+    async def _do_click_xy(self, page: Page, action: ClickXYInput) -> ActionResult:
+        """Click at viewport coordinates (CSS pixels). No selector resolution.
+
+        Safety note: this bypasses ``_looks_like_submit`` -- there is no
+        selector to inspect. Callers in safe_mode get a WARNING but the
+        click still runs (the user opted into safe_mode at config level,
+        not per-coord-click).
+        """
+        if self._config.safety.safe_mode:
+            logger.warning(
+                "click_xy in safe_mode: no submit-button heuristic available "
+                "(coordinate click at x={x}, y={y})",
+                x=action.x,
+                y=action.y,
+            )
+        await page.mouse.click(
+            action.x,
+            action.y,
+            button=action.button.value,
+            click_count=action.clicks,
+            delay=action.delay,
+        )
+        logger.debug("Coordinate click at ({x}, {y})", x=action.x, y=action.y)
+        return ActionResult(
+            action=ActionType.CLICK_XY,
+            status=ActionStatus.SUCCESS,
+            data={"x": action.x, "y": action.y, "button": action.button.value},
+        )
+
+    async def _do_type_text(self, page: Page, action: TypeTextInput) -> ActionResult:
+        """Type ``text`` into whatever currently has keyboard focus.
+
+        No selector resolution -- pair with a preceding click_xy or click
+        to direct keystrokes at a specific element.
+        """
+        await page.keyboard.type(action.text, delay=action.delay)
+        logger.debug("Typed {n} chars into current focus target", n=len(action.text))
+        return ActionResult(
+            action=ActionType.TYPE_TEXT,
+            status=ActionStatus.SUCCESS,
+            data={"length": len(action.text)},
+        )
+
+    async def _do_press_key(self, page: Page, action: PressKeyInput) -> ActionResult:
+        """Press ``key`` (with optional ``modifiers``) at page level.
+
+        Modifiers are sent as a Playwright key combo string:
+        ``["Control", "Shift"]`` + ``"a"`` -> ``"Control+Shift+a"``.
+        """
+        combo = "+".join([*action.modifiers, action.key]) if action.modifiers else action.key
+        await page.keyboard.press(combo)
+        logger.debug("Pressed key: {k}", k=combo)
+        return ActionResult(
+            action=ActionType.PRESS_KEY,
+            status=ActionStatus.SUCCESS,
+            data={"key": combo},
+        )
+
+    # ------------------------------------------------------------------
+    # v1.6.6 Feature 5: observe mode
+    # ------------------------------------------------------------------
+
+    async def observe(
+        self,
+        url: Optional[str] = None,
+        *,
+        session_id: Optional[str] = None,
+        tab_id: Optional[str] = None,
+        include_text: bool = True,
+        include_aria: bool = False,
+    ) -> ObserveResult:
+        """Capture a page's visual and structural state for observe-act-verify loops.
+
+        Resolution order for the target page:
+          1. If ``session_id`` is set, use the session's TabManager:
+             ``tab_id`` (if given) or the session's current tab.
+          2. Else, if ``url`` is given, open an ephemeral page and navigate.
+          3. Else raise.
+
+        Always returns a screenshot path plus viewport / page / scroll /
+        DPR. ``include_text`` (default True) captures
+        ``document.body.innerText`` truncated to
+        ``safety.max_chars_per_call``. ``include_aria`` (default False)
+        runs ``page.accessibility.snapshot()`` -- off by default because
+        snapshots can be megabytes on complex pages.
+        """
+        cid = get_correlation_id()
+        safety = self._config.safety
+
+        # Resolve target page
+        page: Optional[Page] = None
+        ctx_mgr_local = None
+        used_tab_id: Optional[str] = None
+        owner_mode = "ephemeral"
+
+        if session_id and self._sessions is not None:
+            tab_mgr = self._sessions.get_tab_manager(session_id)
+            page = tab_mgr.get_or_current(tab_id)
+            if page is None:
+                raise ValueError(
+                    f"Session {session_id!r} has no current tab. "
+                    f"Open one with agent.new_tab(url, session_id=...)."
+                )
+            used_tab_id = tab_id if tab_id is not None else tab_mgr.current_tab_id()
+            owner_mode = "session_persistent"
+            self._sessions.touch(session_id)
+
+        try:
+            if page is None:
+                if not url:
+                    raise ValueError(
+                        "observe() requires either session_id (to use the session's "
+                        "current tab) or url (to open an ephemeral page)."
+                    )
+                if not check_domain_allowed(url, safety):
+                    host = urlparse(url).hostname or ""
+                    raise ValueError(f"Domain not allowed: {host}")
+                ctx_mgr_local = self._bm.new_page(block_resources=False)
+                page = await ctx_mgr_local.__aenter__()
+
+            # All branches above set ``page``; narrow for mypy.
+            assert page is not None
+
+            # Navigate if URL given. For session+tab mode without a URL,
+            # we observe the current state in place.
+            if url:
+                # Snapshot the session tab's previous URL so we can roll
+                # back if the goto lands on a denied host. Without this,
+                # a thwarted observe() permanently navigates the session's
+                # main tab away from whatever the user was on.
+                prev_url = page.url if owner_mode == "session_persistent" else None
+                await page.goto(url, wait_until=self._config.fetch.wait_until)  # type: ignore[arg-type]
+                # Post-redirect re-check
+                if not check_domain_allowed(page.url, safety):
+                    host = urlparse(page.url).hostname or ""
+                    if prev_url and prev_url != "about:blank":
+                        with contextlib.suppress(Exception):
+                            await page.goto(prev_url)
+                    raise ValueError(f"Page redirected to disallowed domain: {host}")
+
+            # Screenshot to screenshot_dir
+            screenshot_dir = Path(self._config.automation.screenshot_dir)
+            screenshot_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"observe_{cid or 'anon'}_{int(time.time() * 1000)}.png"
+            shot_path = safe_join_path(screenshot_dir, filename)
+            await page.screenshot(path=str(shot_path), full_page=False)
+
+            # Collect viewport / page / scroll / DPR in one IPC hop
+            dims = await page.evaluate(
+                "() => ({"
+                " vw: window.innerWidth,"
+                " vh: window.innerHeight,"
+                " pw: document.documentElement.scrollWidth,"
+                " ph: document.documentElement.scrollHeight,"
+                " sx: window.scrollX,"
+                " sy: window.scrollY,"
+                " dpr: window.devicePixelRatio"
+                " })"
+            )
+
+            title: Optional[str]
+            try:
+                title = await page.title()
+            except Exception:
+                title = None
+
+            visible_text: Optional[str] = None
+            if include_text:
+                try:
+                    raw = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                    if raw and isinstance(raw, str):
+                        cap = safety.max_chars_per_call
+                        visible_text = raw[:cap] if cap and len(raw) > cap else raw
+                except Exception as exc:
+                    logger.debug("observe innerText capture failed: {e}", e=exc)
+
+            aria_snapshot: Optional[dict[str, Any]] = None
+            if include_aria:
+                try:
+                    # Playwright's stubs hide page.accessibility from public API
+                    # but the runtime attribute exists across versions.
+                    aria_snapshot = await page.accessibility.snapshot()  # type: ignore[attr-defined]
+                except Exception as exc:
+                    logger.debug("observe aria snapshot failed: {e}", e=exc)
+
+            return ObserveResult(
+                url=page.url,
+                title=title,
+                screenshot_path=str(shot_path),
+                viewport_width=int(dims["vw"]),
+                viewport_height=int(dims["vh"]),
+                page_width=int(dims["pw"]),
+                page_height=int(dims["ph"]),
+                scroll_x=int(dims["sx"]),
+                scroll_y=int(dims["sy"]),
+                device_pixel_ratio=float(dims["dpr"]),
+                visible_text=visible_text,
+                aria_snapshot=aria_snapshot,
+                tab_id=used_tab_id,
+                session_id=session_id,
+                correlation_id=cid,
+            )
+        finally:
+            # Persistent session tabs outlive observe() -- only close
+            # ephemeral contexts we opened ourselves.
+            if owner_mode == "ephemeral" and ctx_mgr_local is not None:
+                with contextlib.suppress(Exception):
+                    await ctx_mgr_local.__aexit__(None, None, None)
+
+    # ------------------------------------------------------------------
+    # v1.6.6 Feature 4: top-level execute_single_on_session helper
+    # ------------------------------------------------------------------
+
+    async def execute_single_on_session(
+        self,
+        action: Action,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Execute a single action against a session's tab without
+        navigating first. Used by top-level Agent.click_xy / type_text /
+        press_key which target a live page, not a URL.
+
+        Raises KeyError if session_id is unknown or the session has no tab.
+        """
+        if self._sessions is None:
+            raise RuntimeError(
+                "Agent has no SessionManager wired up; cannot run "
+                "session-targeted single actions."
+            )
+        tab_mgr = self._sessions.get_tab_manager(session_id)
+        page = tab_mgr.get_or_current(tab_id)
+        if page is None:
+            raise ValueError(
+                f"Session {session_id!r} has no current tab. "
+                f"Open one with agent.new_tab(...)."
+            )
+        self._sessions.touch(session_id)
+        return await self.execute_action(page, action)
+
+    # ------------------------------------------------------------------
     # Dispatch table
     # ------------------------------------------------------------------
 
@@ -944,4 +1228,8 @@ class BrowserActions:
         ActionType.KEYBOARD: _do_keyboard,
         ActionType.WAIT: _do_wait,
         ActionType.EVALUATE: _do_evaluate,
+        # v1.6.6 coordinate-level fallbacks (Feature 4)
+        ActionType.CLICK_XY: _do_click_xy,
+        ActionType.TYPE_TEXT: _do_type_text,
+        ActionType.PRESS_KEY: _do_press_key,
     }

@@ -20,7 +20,7 @@ Supports three configuration methods (in priority order):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import yaml
 from pydantic import Field, field_validator, model_validator
@@ -59,7 +59,22 @@ def _normalize_domain_patterns(value: Any) -> Any:
 
 
 class BrowserConfig(BaseSettings):
-    """Chromium browser launch and context settings."""
+    """Chromium browser launch and context settings.
+
+    v1.6.6 additions:
+
+    * **Isolation profile** -- ``isolation_mode`` + ``profile_mode`` +
+      ``profile_dir`` + ``cleanup_on_exit`` let webTool launch Chromium
+      against its own dedicated user-data-dir, isolating cookies /
+      localStorage / cache / downloads from the user's real Chrome.
+      Defaults: ``isolation_mode=False`` (preserves v1.6.5 launch path).
+    * **CDP attach** -- ``cdp_enabled`` + ``cdp_host`` + ``cdp_port`` +
+      ``backend`` let external tools observe a webTool-launched browser
+      over the Chrome DevTools Protocol. CDP requires isolation
+      (DevToolsActivePort lives under the user-data-dir). Defaults:
+      ``cdp_enabled=False``. ``attach_existing_browser=True`` is
+      explicitly rejected -- webTool only controls browsers it launched.
+    """
 
     headless: bool = True
     slow_mo: int = 0
@@ -69,9 +84,152 @@ class BrowserConfig(BaseSettings):
     block_resources: list[str] = Field(
         default_factory=lambda: ["image", "font", "stylesheet", "media"]
     )
-    user_data_dir: Optional[str] = None
+    user_data_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "DEPRECATED in v1.6.6 -- use ``profile_dir`` + "
+            "``isolation_mode=True`` instead. Retained for backward "
+            "compatibility; if both ``user_data_dir`` and ``profile_dir`` "
+            "are set, ``profile_dir`` wins."
+        ),
+    )
     viewport_width: int = 1920
     viewport_height: int = 1080
+
+    # --- v1.6.6: Isolation profile launcher -----------------------------
+    isolation_mode: bool = Field(
+        default=False,
+        description=(
+            "Launch Chromium with a dedicated user-data-dir so cookies / "
+            "localStorage / cache / downloads are isolated from the "
+            "user's real Chrome. Required when ``cdp_enabled=True``."
+        ),
+    )
+    profile_mode: Literal["ephemeral", "named"] = Field(
+        default="ephemeral",
+        description=(
+            "Ephemeral profiles are auto-generated tempdirs deleted on "
+            "Agent exit (when ``cleanup_on_exit=True``). Named profiles "
+            "persist across runs at ``profile_dir`` for logged-in "
+            "workflows. Only consulted when ``isolation_mode=True``."
+        ),
+    )
+    profile_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Profile directory path. Resolved against ``AppConfig.base_dir`` "
+            "when relative. Required when ``profile_mode='named'``; ignored "
+            "when ``profile_mode='ephemeral'`` (tempdir is auto-generated "
+            "under ``base_dir/.webtool/browser-profiles/``)."
+        ),
+    )
+    cleanup_on_exit: bool = Field(
+        default=True,
+        description=(
+            "If True and ``profile_mode='ephemeral'``, the auto-generated "
+            "profile dir is removed on Agent exit. No-op for named profiles."
+        ),
+    )
+
+    # --- v1.6.6: CDP attach to webTool-launched browser -----------------
+    backend: Literal["playwright", "cdp_owned"] = Field(
+        default="playwright",
+        description=(
+            "Browser control backend. ``playwright`` (default) drives "
+            "Chromium directly via Playwright's CDP. ``cdp_owned`` is a "
+            "forward-compat label indicating CDP must be enabled; today "
+            "it's identical to ``playwright`` with ``cdp_enabled=True``."
+        ),
+    )
+    cdp_enabled: bool = Field(
+        default=False,
+        description=(
+            "Launch Chromium with ``--remote-debugging-port`` so external "
+            "tools can observe via CDP. Requires ``isolation_mode=True``. "
+            "Never attaches to existing/personal browsers -- webTool only "
+            "exposes CDP on browsers it launched itself."
+        ),
+    )
+    cdp_host: str = Field(
+        default="127.0.0.1",
+        description=(
+            "Bind address for the remote debugging endpoint. Must be a "
+            "loopback address; non-loopback bindings are rejected as a "
+            "security foot-gun."
+        ),
+    )
+    cdp_port: int = Field(
+        default=0,
+        ge=0,
+        le=65535,
+        description=(
+            "Remote debugging port. ``0`` means OS-assigned (recommended); "
+            "the actual port is discovered from ``DevToolsActivePort`` "
+            "written into the user-data-dir after launch."
+        ),
+    )
+    launch_owned_cdp_browser: bool = Field(
+        default=True,
+        description=(
+            "When ``cdp_enabled=True``, controls whether webTool launches "
+            "its own browser. Always True today -- attaching to existing "
+            "browsers is explicitly disallowed (see ``attach_existing_browser``)."
+        ),
+    )
+    attach_existing_browser: bool = Field(
+        default=False,
+        description=(
+            "ALWAYS REJECTED if True. webTool never attaches to a "
+            "user's existing/personal Chrome -- that would expose real "
+            "cookies, history, and logged-in accounts. CDP control is "
+            "only available against webTool-launched browsers."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_isolation_and_cdp(self) -> BrowserConfig:
+        """Enforce safety rules around isolation and CDP."""
+        from .exceptions import ConfigError
+
+        if self.attach_existing_browser:
+            raise ConfigError(
+                "BrowserConfig.attach_existing_browser=True is not "
+                "supported. webTool only controls browsers it launched "
+                "itself; attaching to an existing/personal Chrome would "
+                "expose the user's cookies, history, and logged-in "
+                "accounts. Use cdp_enabled=True with isolation_mode=True "
+                "for CDP control of a webTool-launched browser."
+            )
+
+        if self.backend == "cdp_owned" and not self.cdp_enabled:
+            raise ConfigError(
+                "BrowserConfig.backend='cdp_owned' implies cdp_enabled=True. "
+                "Either set cdp_enabled=True or switch backend to 'playwright'."
+            )
+
+        if self.cdp_enabled and self.cdp_host not in {"127.0.0.1", "localhost"}:
+            raise ConfigError(
+                f"BrowserConfig.cdp_host={self.cdp_host!r} is not a loopback "
+                "address. Binding the Chrome DevTools Protocol port to a "
+                "non-loopback interface would expose browser control to the "
+                "network. Use '127.0.0.1' or 'localhost'."
+            )
+
+        if self.cdp_enabled and not self.isolation_mode:
+            raise ConfigError(
+                "BrowserConfig.cdp_enabled=True requires isolation_mode=True. "
+                "CDP discovery reads DevToolsActivePort from the user-data-dir, "
+                "which only exists when isolation_mode is enabled."
+            )
+
+        if self.profile_mode == "named" and not self.profile_dir:
+            raise ConfigError(
+                "BrowserConfig.profile_mode='named' requires profile_dir to be "
+                "set. Either set profile_dir to a directory path or switch to "
+                "profile_mode='ephemeral'."
+            )
+
+        return self
 
 
 class SearchConfig(BaseSettings):
@@ -226,6 +384,12 @@ class AutomationConfig(BaseSettings):
     screenshot_quality: int = 80
     stop_on_error: bool = True
     slow_mo_actions: int = 0
+    # v1.6.6: when False (default), session-owned ``execute_sequence`` calls
+    # reuse the session's current tab (preserving scroll / viewport / cookies
+    # across calls). Set True to restore v1.6.5 behavior where each
+    # ``interact(url, ...)`` call against the same session_id opens a fresh
+    # page within the session's BrowserContext.
+    fresh_tab_per_call: bool = False
 
 
 class SafetyConfig(BaseSettings):

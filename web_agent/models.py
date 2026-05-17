@@ -274,6 +274,11 @@ class ActionType(str, Enum):
     KEYBOARD = "keyboard"
     WAIT = "wait"
     EVALUATE = "evaluate"
+    # v1.6.6: coordinate-level fallbacks for when selectors fail
+    # (canvas apps, shadow DOM, cross-origin iframes, visual-only controls)
+    CLICK_XY = "click_xy"
+    TYPE_TEXT = "type_text"
+    PRESS_KEY = "press_key"
 
 
 class ActionStatus(str, Enum):
@@ -386,7 +391,31 @@ SelectorLike = Union[str, LocatorSpec]
 # ---------------------------------------------------------------------------
 
 
-class ClickInput(BaseModel):
+class BaseAction(BaseModel):
+    """Common ancestor for every action input.
+
+    v1.6.6 introduces ``tab_id`` -- an optional pointer used by the
+    BrowserActions layer to route an action at a specific tab within a
+    session. ``tab_id=None`` (default) preserves v1.6.5 behavior: the
+    action runs against the session's current tab (or an ephemeral page
+    when no session is set).
+
+    The Pydantic v2 discriminated union (``Field(discriminator="action")``)
+    dispatches on the ``action: Literal[...]`` field, not on class
+    identity -- so adding this parent is transparent to existing JSON
+    callers and to ``TypeAdapter[Action]`` parsing.
+    """
+
+    tab_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Target tab for this action within the session. None = use "
+            "the session's current tab. Ignored when no session_id is set."
+        ),
+    )
+
+
+class ClickInput(BaseAction):
     """Click an element by CSS selector or semantic locator."""
 
     action: Literal["click"] = "click"
@@ -399,7 +428,7 @@ class ClickInput(BaseModel):
     )
 
 
-class TypeInput(BaseModel):
+class TypeInput(BaseAction):
     """Type text into an element keystroke-by-keystroke."""
 
     action: Literal["type"] = "type"
@@ -410,7 +439,7 @@ class TypeInput(BaseModel):
     clear_first: bool = Field(default=False, description="Clear field before typing")
 
 
-class FillInput(BaseModel):
+class FillInput(BaseAction):
     """Fill an input element with a value (instant, no keystrokes)."""
 
     action: Literal["fill"] = "fill"
@@ -419,7 +448,7 @@ class FillInput(BaseModel):
     value: str = Field(description="Value to fill")
 
 
-class ScrollInput(BaseModel):
+class ScrollInput(BaseAction):
     """Scroll the page or an element."""
 
     action: Literal["scroll"] = "scroll"
@@ -434,7 +463,7 @@ class ScrollInput(BaseModel):
     infinite_scroll_delay_ms: int = Field(default=1000)
 
 
-class ScreenshotInput(BaseModel):
+class ScreenshotInput(BaseAction):
     """Take a screenshot of the page or a specific element."""
 
     action: Literal["screenshot"] = "screenshot"
@@ -451,7 +480,7 @@ class ScreenshotInput(BaseModel):
     quality: Optional[int] = Field(default=None, description="JPEG quality 0-100")
 
 
-class NavigateInput(BaseModel):
+class NavigateInput(BaseAction):
     """Navigate to a URL or go back/forward/reload."""
 
     action: Literal["navigate"] = "navigate"
@@ -462,7 +491,7 @@ class NavigateInput(BaseModel):
     wait_until: str = Field(default="networkidle")
 
 
-class DialogInput(BaseModel):
+class DialogInput(BaseAction):
     """Configure how to handle the next browser dialog (alert/confirm/prompt)."""
 
     action: Literal["dialog"] = "dialog"
@@ -472,7 +501,7 @@ class DialogInput(BaseModel):
     prompt_text: Optional[str] = Field(default=None, description="Text for prompt dialogs")
 
 
-class HoverInput(BaseModel):
+class HoverInput(BaseAction):
     """Hover over an element."""
 
     action: Literal["hover"] = "hover"
@@ -480,7 +509,7 @@ class HoverInput(BaseModel):
     timeout: Optional[int] = Field(default=None)
 
 
-class SelectInput(BaseModel):
+class SelectInput(BaseAction):
     """Select an option from a dropdown."""
 
     action: Literal["select"] = "select"
@@ -493,7 +522,7 @@ class SelectInput(BaseModel):
     index: Optional[int] = Field(default=None, description="Option index (0-based)")
 
 
-class KeyboardInput(BaseModel):
+class KeyboardInput(BaseAction):
     """Press a key or key combination."""
 
     action: Literal["keyboard"] = "keyboard"
@@ -503,7 +532,7 @@ class KeyboardInput(BaseModel):
     repeat: int = Field(default=1, description="Number of times to press")
 
 
-class WaitInput(BaseModel):
+class WaitInput(BaseAction):
     """Wait for a condition to be met."""
 
     action: Literal["wait"] = "wait"
@@ -519,13 +548,62 @@ class WaitInput(BaseModel):
     )
 
 
-class EvaluateInput(BaseModel):
+class EvaluateInput(BaseAction):
     """Evaluate a JavaScript expression in the page context."""
 
     action: Literal["evaluate"] = "evaluate"
     selector: Optional[str] = Field(default=None)
     timeout: Optional[int] = Field(default=None)
     expression: str = Field(description="JavaScript expression to evaluate")
+
+
+# v1.6.6: Coordinate-level fallback actions (Feature 4)
+# Useful when selectors fail: canvas apps, shadow DOM, cross-origin iframes,
+# custom dropdowns, visual-only controls. Coord clicks bypass the
+# _looks_like_submit heuristic -- there is no selector to inspect.
+
+
+class ClickXYInput(BaseAction):
+    """Click at viewport coordinates (CSS pixels, not device pixels).
+
+    Used after :meth:`Agent.observe` returns ``device_pixel_ratio`` so
+    callers can map screenshot pixels to click coordinates safely.
+    """
+
+    action: Literal["click_xy"] = "click_xy"
+    x: float = Field(description="Viewport X coordinate (CSS pixels)")
+    y: float = Field(description="Viewport Y coordinate (CSS pixels)")
+    button: MouseButton = Field(default=MouseButton.LEFT)
+    clicks: int = Field(default=1, ge=1, le=3, description="1=single, 2=double, 3=triple")
+    delay: int = Field(default=0, description="ms between mousedown and mouseup")
+    timeout: Optional[int] = Field(default=None)
+
+
+class TypeTextInput(BaseAction):
+    """Type text into whatever currently has keyboard focus.
+
+    No selector resolution -- the page's current focus owns the keystrokes.
+    Pair with a preceding click or focus action to direct the input.
+    """
+
+    action: Literal["type_text"] = "type_text"
+    text: str = Field(description="Text to type into the current focus target")
+    delay: int = Field(default=0, description="ms between key presses")
+
+
+class PressKeyInput(BaseAction):
+    """Press a single key (or key+modifiers combo) at page level.
+
+    Like ``KeyboardInput`` but never resolves a selector -- the keypress
+    is sent to whatever currently has keyboard focus.
+    """
+
+    action: Literal["press_key"] = "press_key"
+    key: str = Field(description="Key name: 'Enter', 'Tab', 'ArrowDown', 'a', etc.")
+    modifiers: list[str] = Field(
+        default_factory=list,
+        description="Modifier keys: 'Shift', 'Control', 'Alt', 'Meta'",
+    )
 
 
 # Discriminated union of all action types
@@ -543,6 +621,9 @@ Action = Annotated[
         KeyboardInput,
         WaitInput,
         EvaluateInput,
+        ClickXYInput,
+        TypeTextInput,
+        PressKeyInput,
     ],
     Field(discriminator="action"),
 ]
@@ -718,3 +799,114 @@ class FormFilterSpec(BaseModel):
         default=15000,
         description="Maximum time (ms) to wait for wait_for to appear.",
     )
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6: Tab management (Feature 3)
+# ---------------------------------------------------------------------------
+
+
+class TabInfo(BaseModel):
+    """Snapshot of one tab within a browser session.
+
+    A tab is a single Playwright Page hosted inside the session's
+    BrowserContext. The ``tab_id`` is opaque and stable for the lifetime
+    of the page; popups opened by the page itself are auto-registered
+    with a generated tab_id but do NOT become the session's current tab
+    until an explicit ``switch_tab`` call.
+    """
+
+    tab_id: str = Field(description="Opaque per-session tab identifier")
+    url: str = Field(default="", description="Current URL of the tab")
+    title: Optional[str] = Field(
+        default=None, description="Document title (may lag the URL during navigation)"
+    )
+    active: bool = Field(
+        default=False,
+        description="True iff this tab is the session's current target for new actions",
+    )
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6: Observe mode (Feature 5)
+# ---------------------------------------------------------------------------
+
+
+class ObserveResult(BaseModel):
+    """Snapshot of a page's visual + structural state for observe -> act -> verify loops.
+
+    Coordinate-click callers MUST honor ``device_pixel_ratio`` when
+    translating screenshot pixels to click coordinates. The viewport
+    dimensions are CSS pixels (what Playwright's mouse API expects);
+    multiply by DPR to map from a hi-DPI screenshot.
+    """
+
+    url: str = Field(description="URL captured (post-redirect)")
+    title: Optional[str] = Field(default=None)
+    screenshot_path: str = Field(description="Absolute path to the captured PNG")
+    viewport_width: int = Field(description="CSS pixels")
+    viewport_height: int = Field(description="CSS pixels")
+    page_width: int = Field(description="Full document width in CSS pixels")
+    page_height: int = Field(description="Full document height in CSS pixels")
+    scroll_x: int = Field(description="Current horizontal scroll offset (CSS pixels)")
+    scroll_y: int = Field(description="Current vertical scroll offset (CSS pixels)")
+    device_pixel_ratio: float = Field(
+        description=(
+            "window.devicePixelRatio. Multiply CSS pixels by DPR to get "
+            "screenshot pixels."
+        )
+    )
+    visible_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Truncated document.body.innerText. None when include_text=False."
+        ),
+    )
+    aria_snapshot: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Accessibility tree. None by default (snapshots can be megabytes "
+            "on complex pages); enable with include_aria=True."
+        ),
+    )
+    tab_id: Optional[str] = Field(default=None)
+    session_id: Optional[str] = Field(default=None)
+    correlation_id: Optional[str] = Field(default=None)
+    captured_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# v1.6.6: Doctor command (Feature 6)
+# ---------------------------------------------------------------------------
+
+
+class DoctorCheck(BaseModel):
+    """Result of one diagnostic probe."""
+
+    name: str = Field(description="Probe identifier, e.g. 'chromium_installed'")
+    status: Literal["ok", "warn", "fail", "skip"] = Field(
+        description=(
+            "ok = working; warn = soft missing (optional feature); "
+            "fail = required component broken; skip = probe not applicable."
+        )
+    )
+    message: str = Field(default="", description="Human-readable diagnostic message")
+    duration_ms: float = Field(default=0.0)
+
+
+class DoctorReport(BaseModel):
+    """Aggregated diagnostic report from ``Agent.doctor()``."""
+
+    summary: Literal["healthy", "usable_with_warnings", "unusable"] = Field(
+        description=(
+            "healthy = all checks ok; usable_with_warnings = some warns but no "
+            "fails; unusable = at least one fail."
+        )
+    )
+    web_agent_version: str
+    python_version: str
+    platform: str
+    checks: list[DoctorCheck] = Field(default_factory=list)
+    total_duration_ms: float = Field(default=0.0)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
