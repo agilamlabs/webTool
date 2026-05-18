@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~739 tests on Windows / ~713 + 5 platform-conditional skips on Linux
+python -m pytest -v          # ~740 tests on Windows / ~714 + 5 platform-conditional skips on Linux
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -205,18 +205,20 @@ real functional bug fix plus seven consistency / UX improvements.
   behaviour.
 - `WebFetcher.classify_url` returns one of `'pdf' | 'xlsx' | 'docx'
   | 'csv' | 'zip' | 'binary_other' | 'html' | 'unknown'` instead of
-  collapsing every binary to `"binary"`. New `_is_binary_kind(s)`
-  helper is the routing predicate. `find_and_download_file(
-  file_types=["pdf"])` now rejects extensionless XLSX/ZIP that
-  HEAD-probed as binary. **Breaking** for direct callers comparing to
-  `"binary"`; migration: use `_is_binary_kind(c)`.
+  collapsing every binary to `"binary"`. New `is_binary_kind(s)`
+  helper (`from web_agent import is_binary_kind`) is the routing
+  predicate. `find_and_download_file(file_types=["pdf"])` now
+  rejects extensionless XLSX/ZIP that HEAD-probed as binary.
+  **Breaking** for direct callers comparing to `"binary"`; migration:
+  use `is_binary_kind(c)`.
 
 **Consistency / UX (Items 4-6, should-fix)**
 - `SafetyConfig.coordinate_click_unknown_policy: Literal["allow",
   "block"] = "allow"`. When `"block"`, click_xy rejects clicks where
   `elementFromPoint` returns no element. Forced `"block"` in
-  safe_mode. Only fires when `allow_coordinate_clicks=True` AND
-  `allow_form_submit=False`.
+  safe_mode. Independent of `allow_form_submit` (review C-1 fix) --
+  fires whenever `allow_coordinate_clicks=True`, so strict callers
+  can opt into block-on-unknown without disabling submits.
 - `BrowserConfig.cdp_host` validation now uses `_is_loopback_host`
   (accepts `127.0.0.0/8`, `::1`, `localhost`) matching the
   `remote_cdp_url` semantics widened in v1.6.8 (review C-3).
@@ -233,13 +235,33 @@ real functional bug fix plus seven consistency / UX improvements.
   **single shared `BrowserContext`** for all `session_id`s
   (Playwright limitation). Use `profile_mode="ephemeral"` for
   per-session isolation.
-- 5 new integration tests in
+- 6 new integration tests in
   `tests/test_agent.py::TestV1610Integration`: connection-bundle
   return, cookie persistence across Agent lifetimes, unknown-policy
-  click blocking, fetch_smart routing of `"pdf"` classification,
-  documented shared-context regression test. Plus 2 new unit tests
-  in `tests/test_v169_smart_binary_routing.py` for the post-v1.6.10
-  enum values.
+  click blocking under `allow_form_submit=False`, fetch_smart
+  routing of `"pdf"` classification, documented shared-context
+  regression test, and a C-1 regression test for unknown-policy
+  blocking under `allow_form_submit=True`. Plus 2 new unit tests in
+  `tests/test_v169_smart_binary_routing.py` for the post-v1.6.10
+  enum values, and 4 stub updates in
+  `tests/test_v162_routing.py` / `test_v163_routing.py` /
+  `test_v165_medium.py` for the `classify_url` enum change.
+
+**Review pass (3 fixes: 2 Critical + 1 Important)**
+- **C-1**: `coordinate_click_unknown_policy="block"` was unreachable
+  when `allow_form_submit=True` -- the unknown-policy check was
+  nested inside the destructive-check guard. Fix: hoisted
+  `_inspect_element_at_point`; destructive check and unknown-policy
+  check now fire independently. Regression test added.
+- **C-2**: `_is_binary_kind` (leading underscore) wasn't exported
+  from the `web_agent.*` public namespace, breaking the CHANGELOG
+  migration story. Fix: renamed to `is_binary_kind` and added to
+  `web_agent.__all__`. `from web_agent import is_binary_kind` works.
+- **I-1**: `web_research(extract_files=True)` silently appended
+  contentless `Citation`s for unrecognized binaries (PPTX, ZIP,
+  octet-stream) where the extractor returned
+  `extraction_method="none"`. Fix: emit a `binary_not_extracted`
+  warning + diagnostic and skip the result.
 
 ## What v1.6.9 added
 

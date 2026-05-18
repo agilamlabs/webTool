@@ -157,10 +157,10 @@ attack surface around browser process control:
   adds `SafetyConfig.coordinate_click_unknown_policy` (`"allow"` |
   `"block"`, default `"allow"`, **forced `"block"`** in `safe_mode`):
   when `"block"`, an empty / failed `elementFromPoint` inspection
-  rejects the click instead of allowing it. Strict callers running
-  with `allow_coordinate_clicks=True` AND `allow_form_submit=False`
-  can opt into "unknown == hostile" semantics without the broader
-  `safe_mode` clamp.
+  rejects the click instead of allowing it. The unknown-policy gate
+  is **independent of `allow_form_submit`** (review C-1 fix) -- strict
+  callers can opt into "unknown == hostile" semantics without
+  disabling submits and without the broader `safe_mode` clamp.
 
 ### Workspace + diagnostic data (v1.6.7 / v1.6.8)
 
