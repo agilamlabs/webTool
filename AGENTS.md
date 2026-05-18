@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.9**
+- Latest version: **1.6.10**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~734 tests on Windows / ~708 + 5 platform-conditional skips on Linux
+python -m pytest -v          # ~739 tests on Windows / ~713 + 5 platform-conditional skips on Linux
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -187,6 +187,60 @@ These rules constrain every change:
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
 
+## What v1.6.10 added
+
+Follow-up hardening on v1.6.9. No new features -- 8 items spanning one
+real functional bug fix plus seven consistency / UX improvements.
+
+**Functional correctness (Items 1-3, must-fix)**
+- `Recipes.web_research` now accepts successful binary `FetchResult`s
+  from `fetch_smart`. The v1.6.9 gate (`not fr.html`) dropped them as
+  `fetch_failed`; the v1.6.10 gate is `not (fr.html or fr.binary)`.
+  Extensionless PDFs / regulator dashboards are no longer silently
+  lost.
+- New `web_research(extract_files=False)` param mirroring
+  `search_and_extract(extract_files=False)`. When True, download-URL
+  search results are extracted inline via `fetch_smart` instead of
+  routed to `download_candidates`. Default False preserves v1.6.9
+  behaviour.
+- `WebFetcher.classify_url` returns one of `'pdf' | 'xlsx' | 'docx'
+  | 'csv' | 'zip' | 'binary_other' | 'html' | 'unknown'` instead of
+  collapsing every binary to `"binary"`. New `_is_binary_kind(s)`
+  helper is the routing predicate. `find_and_download_file(
+  file_types=["pdf"])` now rejects extensionless XLSX/ZIP that
+  HEAD-probed as binary. **Breaking** for direct callers comparing to
+  `"binary"`; migration: use `_is_binary_kind(c)`.
+
+**Consistency / UX (Items 4-6, should-fix)**
+- `SafetyConfig.coordinate_click_unknown_policy: Literal["allow",
+  "block"] = "allow"`. When `"block"`, click_xy rejects clicks where
+  `elementFromPoint` returns no element. Forced `"block"` in
+  safe_mode. Only fires when `allow_coordinate_clicks=True` AND
+  `allow_form_submit=False`.
+- `BrowserConfig.cdp_host` validation now uses `_is_loopback_host`
+  (accepts `127.0.0.0/8`, `::1`, `localhost`) matching the
+  `remote_cdp_url` semantics widened in v1.6.8 (review C-3).
+- `Agent.get_owned_cdp_connection_info()` returns a structured
+  `CdpConnectionInfo` (`cdp_url`, `profile_dir`, `ownership_token`)
+  or `None`. Bundles the three values a sibling `remote_cdp` Agent
+  needs, so callers don't have to discover three separate
+  `BrowserManager` getters. New MCP tool
+  `web_get_owned_cdp_connection_info`. `CdpConnectionInfo` exported
+  from `web_agent`.
+
+**Docs + tests (Items 7-8)**
+- README + AGENTS now prominently warn that named profiles expose a
+  **single shared `BrowserContext`** for all `session_id`s
+  (Playwright limitation). Use `profile_mode="ephemeral"` for
+  per-session isolation.
+- 5 new integration tests in
+  `tests/test_agent.py::TestV1610Integration`: connection-bundle
+  return, cookie persistence across Agent lifetimes, unknown-policy
+  click blocking, fetch_smart routing of `"pdf"` classification,
+  documented shared-context regression test. Plus 2 new unit tests
+  in `tests/test_v169_smart_binary_routing.py` for the post-v1.6.10
+  enum values.
+
 ## What v1.6.9 added
 
 Hardening patch -- no new features, ten safety + consistency fixes.
@@ -216,6 +270,11 @@ Hardening patch -- no new features, ten safety + consistency fixes.
   context is closed once from `BrowserManager.stop()`.
 - Cookies / localStorage now actually persist across `Agent`
   lifetimes (integration test in `tests/test_agent.py::TestV169NamedProfilePersistence`).
+- **Caveat (Playwright limitation): named profiles are NOT
+  session-isolated.** Every `session_id` on a named-profile Agent shares
+  the single persistent `BrowserContext` -- cookies, localStorage,
+  IndexedDB, and cache are visible across sessions. Use
+  `profile_mode="ephemeral"` when per-session isolation is required.
 
 **Other**
 - `BrowserConfig.disable_chromium_sandbox: Optional[bool] = None`

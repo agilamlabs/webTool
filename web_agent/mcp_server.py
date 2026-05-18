@@ -399,6 +399,7 @@ async def web_research(
     session_id: Optional[str] = None,
     prefer_domains: Optional[list[str]] = None,
     domain_profile: Optional[str] = None,
+    extract_files: bool = False,
 ) -> ResearchResult:
     """Multi-page research recipe: search + parallel fetch+extract top N pages, build citations.
 
@@ -415,6 +416,10 @@ async def web_research(
             get a strong ranking bonus.
         domain_profile: Optional named ranking profile -- one of
             ``"official_sources" | "docs" | "research" | "news" | "files"``.
+        extract_files: v1.6.10. When True, file URLs (PDF/XLSX/...) are
+            extracted inline via fetch_smart instead of routed to
+            ``download_candidates``. Default False preserves the v1.6.9
+            read-pages-only behaviour.
 
     Returns:
         ResearchResult with citations, summary_pages, budget telemetry,
@@ -429,6 +434,7 @@ async def web_research(
         session_id=session_id,
         prefer_domains=prefer_domains,
         domain_profile=domain_profile,
+        extract_files=extract_files,
     )
 
 
@@ -750,6 +756,26 @@ async def web_get_cdp_endpoint(ctx: Context) -> dict:
         "host": cfg.cdp_host,
         "port": cfg.cdp_port,
     }
+
+
+@mcp.tool()
+async def web_get_owned_cdp_connection_info(ctx: Context) -> dict:
+    """v1.6.10: full CDP attach bundle for a sibling ``remote_cdp`` Agent.
+
+    Returns ``{"available": true, "cdp_url": "...", "profile_dir": "...",
+    "ownership_token": "..."}`` when the Agent is a started, isolated,
+    ``cdp_owned`` launch. Returns ``{"available": false}`` otherwise.
+
+    Use the three values verbatim as ``BrowserConfig.remote_cdp_url``,
+    ``BrowserConfig.remote_cdp_profile_dir``, and
+    ``BrowserConfig.remote_cdp_ownership_token`` when configuring the
+    sibling Agent. Mirrors :meth:`Agent.get_owned_cdp_connection_info`.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    info = agent.get_owned_cdp_connection_info()
+    if info is None:
+        return {"available": False}
+    return {"available": True, **info.model_dump(mode="json")}
 
 
 # ---------------------------------------------------------------------------

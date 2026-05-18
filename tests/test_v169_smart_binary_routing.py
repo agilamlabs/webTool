@@ -55,9 +55,15 @@ async def test_extensionless_html_routes_to_fetch_html() -> None:
 @pytest.mark.asyncio
 async def test_extensionless_binary_routes_to_fetch_binary_via_probe() -> None:
     """Regulator-dashboard pattern: /api/report has no .pdf extension
-    but the server returns Content-Type: application/pdf."""
+    but the server returns Content-Type: application/pdf.
+
+    v1.6.10: classify_url now returns granular kinds ('pdf', 'xlsx',
+    'binary_other', ...) instead of the literal 'binary'. The stub
+    returns 'pdf' here; ``_is_binary_kind('pdf')`` is True so routing
+    still hits fetch_binary.
+    """
     wf = _wf()
-    wf.classify_url = AsyncMock(return_value="binary")  # type: ignore[method-assign]
+    wf.classify_url = AsyncMock(return_value="pdf")  # type: ignore[method-assign]
     await wf.fetch_smart("https://example.com/api/report")
     wf.fetch_binary.assert_awaited_once()
     wf.fetch.assert_not_awaited()
@@ -67,7 +73,7 @@ async def test_extensionless_binary_routes_to_fetch_binary_via_probe() -> None:
 async def test_binary_probe_disabled_routes_extensionless_to_html() -> None:
     """When binary_probe=False, skip the HEAD probe and default to HTML."""
     wf = _wf()
-    wf.classify_url = AsyncMock(return_value="binary")  # type: ignore[method-assign]
+    wf.classify_url = AsyncMock(return_value="pdf")  # type: ignore[method-assign]
     await wf.fetch_smart("https://example.com/api/report", binary_probe=False)
     wf.fetch.assert_awaited_once()
     wf.fetch_binary.assert_not_awaited()
@@ -78,10 +84,30 @@ async def test_binary_probe_disabled_routes_extensionless_to_html() -> None:
 async def test_safety_probe_binary_urls_false_skips_probe() -> None:
     """SafetyConfig.probe_binary_urls=False also bypasses the HEAD probe."""
     wf = _wf(probe_binary_urls=False)
-    wf.classify_url = AsyncMock(return_value="binary")  # type: ignore[method-assign]
+    wf.classify_url = AsyncMock(return_value="pdf")  # type: ignore[method-assign]
     await wf.fetch_smart("https://example.com/api/report")
     wf.fetch.assert_awaited_once()
     wf.classify_url.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extensionless_binary_other_routes_to_fetch_binary() -> None:
+    """v1.6.10: 'binary_other' (opaque attachment) routes through fetch_binary."""
+    wf = _wf()
+    wf.classify_url = AsyncMock(return_value="binary_other")  # type: ignore[method-assign]
+    await wf.fetch_smart("https://example.com/api/blob")
+    wf.fetch_binary.assert_awaited_once()
+    wf.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_extensionless_html_classification_routes_to_fetch_html() -> None:
+    """v1.6.10: 'html' classification correctly routes through fetch (not fetch_binary)."""
+    wf = _wf()
+    wf.classify_url = AsyncMock(return_value="html")  # type: ignore[method-assign]
+    await wf.fetch_smart("https://example.com/api/page")
+    wf.fetch.assert_awaited_once()
+    wf.fetch_binary.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,156 @@
 # Changelog
 
+## [1.6.10] - 2026-05-18
+
+### Follow-up Hardening (8 items, no new features)
+
+v1.6.10 is another **discipline slice** -- the v1.6.9 release surfaced
+one real functional bug plus seven consistency/UX gaps in a follow-up
+review. All eight items are correctness, consistency, or UX hardening;
+no new features. Test count grows ~734 -> ~739 (5 new integration tests
+in `tests/test_agent.py::TestV1610Integration` plus 2 unit-level
+additions in `tests/test_v169_smart_binary_routing.py`).
+
+### Breaking change (direct callers of `WebFetcher.classify_url`)
+
+`WebFetcher.classify_url` and the underlying `_url_ext_classification`
+helper no longer return the string `"binary"`. They now return one of:
+
+- `"pdf" | "xlsx" | "docx" | "csv" | "zip" | "binary_other" | "html" | "unknown"`
+
+**Migration:** replace `classification == "binary"` with the new
+`_is_binary_kind(classification)` helper exported from
+`web_agent.web_fetcher`. Callers that only consume `fetch_smart` or
+public `Agent` methods are unaffected -- the routing decision is
+already centralized inside `fetch_smart` and uses the helper.
+
+### Must-fix (functional correctness)
+
+1. **`web_research` no longer drops successful binary results.** The
+   v1.6.9 `web_research` recipe routed search-result URLs through
+   `fetch_smart` (good) but then gated on `not fr.html` (bad) -- so a
+   successful binary `FetchResult` from `fetch_smart` (extensionless
+   PDF, regulator dashboard, etc.) was logged as `fetch_failed` and
+   silently dropped. v1.6.10 fixes the gate to
+   `not (fr.html or fr.binary)`, aligning with the equivalent gate in
+   `Agent.search_and_extract`. The `ContentExtractor.extract` callsite
+   already dispatches on `fr.binary` vs `fr.html`, so no other change
+   was needed in the loop.
+
+2. **`web_research(extract_files=False)` parameter.** Mirrors the
+   existing `search_and_extract(extract_files=False)` knob. Default
+   `False` preserves the v1.6.9 read-pages-only behaviour (file URLs
+   land in `download_candidates`). When `True`, file URLs are routed
+   through `fetch_smart` + the binary extractor inline so PDF/XLSX/DOCX/
+   CSV results join the `summary_pages` list with citations. Propagated
+   through `Agent.web_research` and the `web_research` MCP tool.
+
+3. **Richer file classification.** `_url_ext_classification` and
+   `WebFetcher.classify_url` now distinguish PDF / XLSX / DOCX / CSV /
+   ZIP / `binary_other` instead of collapsing every binary to
+   `"binary"`. `find_and_download_file(file_types=["pdf"])` now
+   rejects an extensionless XLSX or ZIP matched via HEAD probe -- the
+   v1.6.9 behaviour accepted any binary content type regardless of the
+   requested kinds. New module-level helper `_is_binary_kind(s)` is the
+   canonical migration target for any code that compared to the old
+   `"binary"` string.
+
+### Should-fix (consistency / UX)
+
+4. **`SafetyConfig.coordinate_click_unknown_policy: Literal["allow", "block"] = "allow"`.**
+   When `"block"`, `click_xy` rejects clicks where
+   `document.elementFromPoint(x, y)` returns no element (point outside
+   any element, or the JS evaluation raised). Only fires when
+   `allow_coordinate_clicks=True` AND `allow_form_submit=False` --
+   `safe_mode` already blocks all coordinate clicks at the
+   `allow_coordinate_clicks=False` short-circuit. `_apply_safe_mode`
+   still forces this knob to `"block"` defensively, so callers
+   toggling `allow_coordinate_clicks` back on at runtime don't silently
+   revert to `"allow"`. Default `"allow"` preserves v1.6.9 behaviour.
+
+5. **`BrowserConfig.cdp_host` uses `_is_loopback_host`.** The v1.6.8
+   review (C-3) widened the `remote_cdp_url` loopback check to accept
+   the full 127.0.0.0/8 block plus `::1`; the parallel `cdp_host`
+   validator at `config.py:344` still used the literal set
+   `{"127.0.0.1", "localhost"}`. v1.6.10 unifies the two checks so
+   `cdp_host` accepts the same hosts as `remote_cdp_url`. The error
+   message was updated to mention the loopback block.
+
+6. **`Agent.get_owned_cdp_connection_info()`.** Returns a structured
+   `CdpConnectionInfo` (`cdp_url`, `profile_dir`, `ownership_token`)
+   or `None`. Bundles the three values a co-resident `remote_cdp`
+   Agent needs to attach to a webTool-launched browser, so callers
+   don't have to discover `BrowserManager.get_cdp_endpoint`,
+   `get_effective_profile_dir`, and `get_ownership_token` separately.
+   New MCP tool `web_get_owned_cdp_connection_info` is the MCP
+   counterpart. `CdpConnectionInfo` is exported from
+   `web_agent.__init__`.
+
+7. **README + AGENTS named-profile caveat.** Both files now prominently
+   note that `profile_mode="named"` exposes a **single shared
+   `BrowserContext`** for all sessions on that profile (Playwright's
+   `launch_persistent_context` limitation -- one persistent context per
+   user-data-dir). Sessions on a named profile share cookies,
+   localStorage, IndexedDB, and cache. Use `profile_mode="ephemeral"`
+   for per-session isolation.
+
+8. **Five new integration tests** in
+   `tests/test_agent.py::TestV1610Integration` covering:
+   - `get_owned_cdp_connection_info` returns the full bundle after an
+     isolated `cdp_owned` launch
+   - `document.cookie` persistence across two `Agent` lifetimes on a
+     named profile (companion to the v1.6.9 localStorage test)
+   - `click_xy` with `coordinate_click_unknown_policy="block"` rejects
+     clicks on an empty page
+   - `fetch_smart` routes a `"pdf"` classification (the extensionless-
+     PDF case post-v1.6.10 enum change) through `fetch_binary`
+   - Two `session_id`s on a named profile observably share the
+     persistent `BrowserContext` (regression test for the
+     documented limitation)
+
+### Behaviour preserved (no migration needed)
+
+- `web_research` callers that don't pass `extract_files` see the
+  v1.6.9 behaviour exactly (file URLs continue to land in
+  `download_candidates`); only the gate fix in Item 1 changes the
+  outcome, and only for callers who were already getting
+  silently-dropped binaries (a bug fix, not a behaviour change).
+- `coordinate_click_unknown_policy` defaults to `"allow"`, matching
+  the v1.6.9 permissive default.
+- `cdp_host="127.0.0.1"` and `cdp_host="localhost"` -- the only two
+  values previously accepted -- continue to validate. v1.6.10 only
+  widens what is accepted.
+- The MCP server adds one new tool and one new optional parameter;
+  existing tool schemas and signatures are unchanged.
+
+### Files changed
+
+- `web_agent/web_fetcher.py` -- `_BINARY_KINDS`, `_is_binary_kind`,
+  `_EXT_TO_KIND`, `_CT_TO_KIND`, rewritten `_url_ext_classification`
+  and the `classify_url` HEAD-result mapping, `fetch_smart` routing
+  check.
+- `web_agent/agent.py` -- imports, `_is_binary_kind` callsites at
+  lines 542 and 566, `web_research` `extract_files` propagation, new
+  `Agent.get_owned_cdp_connection_info`.
+- `web_agent/recipes.py` -- imports, `web_research` `extract_files`
+  param + filter-loop branch, gate fix at the binary-result check,
+  `find_and_download_file` HEAD-probe classification refinement.
+- `web_agent/config.py` -- `SafetyConfig.coordinate_click_unknown_policy`
+  field + `_apply_safe_mode` forcing, `cdp_host` validator using
+  `_is_loopback_host`.
+- `web_agent/browser_actions.py` -- `_do_click_xy` unknown-policy
+  block path.
+- `web_agent/models.py` -- new `CdpConnectionInfo` Pydantic model.
+- `web_agent/mcp_server.py` -- `web_research` `extract_files` param,
+  new `web_get_owned_cdp_connection_info` tool.
+- `web_agent/__init__.py` -- version bump to `1.6.10`, export
+  `CdpConnectionInfo`.
+- `tests/test_agent.py` -- new `TestV1610Integration` class.
+- `tests/test_v169_smart_binary_routing.py` -- stub return values
+  updated to the new granular kinds (`"pdf"`, `"binary_other"`, ...)
+  plus 2 new tests verifying the new routing branches.
+- `README.md`, `AGENTS.md`, `SECURITY.md` -- documentation updates.
+
 ## [1.6.9] - 2026-05-18
 
 ### Hardening Patch (10 items, no new features)

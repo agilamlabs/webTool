@@ -198,6 +198,28 @@ class ExtractionResult(BaseModel):
     correlation_id: Optional[str] = Field(default=None)
 
 
+class CdpConnectionInfo(BaseModel):
+    """v1.6.10: structured CDP connection bundle for ``remote_cdp`` siblings.
+
+    Returned by :meth:`Agent.get_owned_cdp_connection_info`. Lets a
+    launching Agent hand a single object to a co-resident ``remote_cdp``
+    Agent so the latter can attach to the same browser without having
+    to call three separate ``BrowserManager`` getters.
+
+    Use the values verbatim:
+
+    - ``cdp_url`` -> :attr:`BrowserConfig.remote_cdp_url`
+    - ``profile_dir`` -> :attr:`BrowserConfig.remote_cdp_profile_dir`
+    - ``ownership_token`` -> :attr:`BrowserConfig.remote_cdp_ownership_token`
+    """
+
+    cdp_url: str = Field(description="ws:// CDP endpoint of the launched browser")
+    profile_dir: str = Field(description="Absolute user-data-dir path of the launched browser")
+    ownership_token: str = Field(
+        description="64-char hex ownership token at <profile_dir>/.webtool-ownership"
+    )
+
+
 class DownloadResult(BaseModel):
     """Result of a file download."""
 

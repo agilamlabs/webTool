@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.9"
+__version__ = "1.6.10"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -85,6 +85,7 @@ from .models import (
     ActionType,
     AgentResult,
     BaseAction,
+    CdpConnectionInfo,
     Citation,
     ClickXYInput,
     DoctorCheck,
@@ -196,6 +197,7 @@ __all__ = [
     "ActionType",
     "AgentResult",
     "BaseAction",
+    "CdpConnectionInfo",
     "Citation",
     "ClickXYInput",
     "DoctorCheck",

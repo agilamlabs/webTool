@@ -314,6 +314,14 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `browser` | `cdp_port` | `0` | `0` = OS-assigned, discovered via `DevToolsActivePort` |
 | `browser` | `remote_cdp_url` | `None` | Required when `backend="remote_cdp"`. Must be a loopback `ws://` / `wss://` URL (v1.6.8) |
 
+> **Warning — Named profiles are not session-isolated (v1.6.9 / v1.6.10).**
+> `profile_mode="named"` uses Playwright's `chromium.launch_persistent_context`,
+> which exposes a **single shared `BrowserContext`** for every session on
+> that profile (Playwright limitation: one persistent context per
+> user-data-dir). All `session_id`s on a named-profile Agent share
+> cookies, localStorage, IndexedDB, and cache. Use `profile_mode="ephemeral"`
+> when per-session isolation matters.
+
 **Skills + workspace** (v1.6.7):
 
 | Section | Key | Default | Description |

@@ -40,7 +40,7 @@ from .models import (
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
-from .web_fetcher import WebFetcher, _is_download_url
+from .web_fetcher import WebFetcher, _is_binary_kind, _is_download_url
 
 # Domains that get a small relevance bonus in the default ranker
 _WELL_KNOWN_DOMAINS = (
@@ -407,24 +407,40 @@ class Recipes:
             ]
 
         if not candidates and self._config.safety.probe_binary_urls:
-            # Fallback 2 (NEW in v1.6.5): HEAD-probe extensionless URLs.
-            # Recovers regulator dashboards / asset-portal URLs whose
-            # path lacks an extension but whose Content-Type indicates
-            # a binary document. Only one HEAD per result; we stop on
-            # the first 'binary' classification.
+            # Fallback 2 (v1.6.5, refined v1.6.10): HEAD-probe extensionless
+            # URLs. Recovers regulator dashboards / asset-portal URLs whose
+            # path lacks an extension but whose Content-Type indicates a
+            # binary document. Only one HEAD per result; we stop on the
+            # first acceptable match.
+            #
+            # v1.6.10: ``classify_url`` now returns a granular kind. Reject
+            # binary URLs whose detected kind does not match the caller's
+            # ``file_types`` -- a v1.6.9 caller asking for ['pdf'] would
+            # previously accept an extensionless XLSX/ZIP because the
+            # classifier collapsed everything to ``"binary"``.
             for r in search_resp.results:
                 if not check_domain_allowed(r.url, self._config.safety):
                     continue
                 if self._url_extension(r.url):
                     continue  # already considered in Tier 1/2
                 classification = await self._fetcher.classify_url(r.url, session_id=session_id)
-                if classification == "binary":
-                    logger.info(
-                        "Extensionless URL routed to download via HEAD probe: {url}",
-                        url=r.url,
-                    )
-                    candidates.append(r.url)
-                    break
+                if not _is_binary_kind(classification):
+                    continue
+                # Match the detected kind against requested ``file_types``.
+                # ``binary_other`` is opaque (HEAD said attachment but we
+                # can't pin the kind); skip when the caller pinned types.
+                if classification == "binary_other":
+                    if normalized:
+                        continue
+                elif f".{classification}" not in normalized:
+                    continue
+                logger.info(
+                    "Extensionless URL routed to download via HEAD probe: {url} (kind={kind})",
+                    url=r.url,
+                    kind=classification,
+                )
+                candidates.append(r.url)
+                break
 
         if not candidates:
             return DownloadResult(
@@ -465,6 +481,7 @@ class Recipes:
         session_id: Optional[str] = None,
         prefer_domains: Optional[list[str]] = None,
         domain_profile: Optional[str] = None,
+        extract_files: bool = False,
     ) -> ResearchResult:
         """Search and extract content from the top N pages, returning structured citations.
 
@@ -477,6 +494,12 @@ class Recipes:
                 results get a strong ranking bonus.
             domain_profile: Optional named ranking profile -- one of
                 ``"official_sources" | "docs" | "research" | "news" | "files"``.
+            extract_files: v1.6.10. When True, route URLs whose extension
+                points to a downloadable file (PDF/XLSX/DOCX/CSV/...)
+                through :meth:`WebFetcher.fetch_smart` + the binary
+                extractor instead of routing them to ``download_candidates``.
+                Default False preserves the v1.6.9 read-pages-only behaviour.
+                Mirrors :meth:`Agent.search_and_extract` ``extract_files``.
 
         Returns:
             ResearchResult with citations, summary pages, budget telemetry,
@@ -516,15 +539,22 @@ class Recipes:
                 )
                 continue
             if _is_download_url(r.url):
-                download_candidates.append(r)
-                diagnostics.append(
-                    FetchDiagnostic(
-                        url=r.url,
-                        status=FetchStatus.SUCCESS,
-                        provider=r.provider,
-                        block_reason="download_skipped",
+                if extract_files:
+                    # v1.6.10: route through fetch_smart + extractor like
+                    # the page-fetch path. The Item 2 gate fix
+                    # (``not (fr.html or fr.binary)``) makes the binary
+                    # FetchResult flow through to the extractor.
+                    allowed.append(r)
+                else:
+                    download_candidates.append(r)
+                    diagnostics.append(
+                        FetchDiagnostic(
+                            url=r.url,
+                            status=FetchStatus.SUCCESS,
+                            provider=r.provider,
+                            block_reason="download_skipped",
+                        )
                     )
-                )
                 continue
             allowed.append(r)
 
@@ -583,7 +613,11 @@ class Recipes:
                 bag.err("budget_exceeded", str(exc))
                 break
 
-            if fr.status != FetchStatus.SUCCESS or not fr.html:
+            # v1.6.10: ``fetch_smart`` can return a successful binary
+            # FetchResult (extensionless PDF, regulator dashboard, ...);
+            # gating on ``fr.html`` alone dropped those silently as
+            # fetch_failed. Accept either an HTML or binary payload.
+            if fr.status != FetchStatus.SUCCESS or not (fr.html or fr.binary):
                 bag.warn(
                     "fetch_failed",
                     f"Failed to fetch {item.url}: {fr.error_message}",

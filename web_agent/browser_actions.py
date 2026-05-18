@@ -1181,10 +1181,15 @@ class BrowserActions:
           * When ``allow_form_submit=False``, runs
             ``document.elementFromPoint`` to inspect the target stack and
             blocks the click if it looks like a submit/login/destructive
-            control. Empty / failed inspection allows the click (cannot
-            tell -> default permissive, matches the selector path which
-            also defaults permissive when ``_looks_like_submit`` returns
-            False).
+            control.
+
+        v1.6.10 addition:
+          * Honors ``safety.coordinate_click_unknown_policy``. When the
+            policy is "block" AND elementFromPoint returned an empty list
+            (point outside any element / inspection raised), the click is
+            rejected. The v1.6.9 default ("allow") keeps the permissive
+            behaviour so existing callers are unaffected. ``safe_mode``
+            forces "block" via ``_apply_safe_mode``.
         """
         safety = self._config.safety
         if not safety.allow_coordinate_clicks:
@@ -1211,6 +1216,27 @@ class BrowserActions:
                     error_message=(
                         "Coordinate click blocked: target looks like a submit/destructive "
                         f"control (allow_form_submit=False). Inspected top element: {top!r}"
+                    ),
+                )
+            # v1.6.10: unknown-policy gate. ``_inspect_element_at_point``
+            # already swallows exceptions and returns [], so this single
+            # check covers both "point outside any element" and
+            # "JS evaluate raised". Default "allow" preserves v1.6.9
+            # behaviour.
+            if not elements and safety.coordinate_click_unknown_policy == "block":
+                logger.info(
+                    "click_xy blocked: elementFromPoint at ({x}, {y}) returned "
+                    "no target (coordinate_click_unknown_policy='block')",
+                    x=action.x,
+                    y=action.y,
+                )
+                return ActionResult(
+                    action=ActionType.CLICK_XY,
+                    status=ActionStatus.FAILED,
+                    error_message=(
+                        "Coordinate click blocked: target unknown "
+                        "(empty elementFromPoint result; "
+                        "coordinate_click_unknown_policy='block')."
                     ),
                 )
         await page.mouse.click(

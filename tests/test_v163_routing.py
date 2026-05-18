@@ -16,10 +16,13 @@ from web_agent.web_fetcher import _url_ext_classification
 
 
 def test_known_binary_extension():
-    assert _url_ext_classification("https://x.com/report.pdf") == "binary"
-    assert _url_ext_classification("https://x.com/sheet.xlsx") == "binary"
-    assert _url_ext_classification("https://x.com/letter.docx") == "binary"
-    assert _url_ext_classification("https://x.com/data.csv") == "binary"
+    # v1.6.10: _url_ext_classification returns granular kinds. The old
+    # single "binary" string was replaced by pdf/xlsx/docx/csv/zip/
+    # binary_other. _is_binary_kind() is the routing predicate.
+    assert _url_ext_classification("https://x.com/report.pdf") == "pdf"
+    assert _url_ext_classification("https://x.com/sheet.xlsx") == "xlsx"
+    assert _url_ext_classification("https://x.com/letter.docx") == "docx"
+    assert _url_ext_classification("https://x.com/data.csv") == "csv"
 
 
 def test_known_html_extension():
@@ -84,9 +87,9 @@ async def test_classify_url_extension_short_circuits_no_session_lookup():
     sessions = MagicMock()
     sessions.get = MagicMock(side_effect=AssertionError("should not be called"))
     fetcher = WebFetcher(MagicMock(), AppConfig(), sessions=sessions)
-    # .pdf -> 'binary' without consulting sessions
+    # v1.6.10: .pdf -> "pdf" (granular kind) without consulting sessions
     result = await fetcher.classify_url("https://x.com/a.pdf", session_id="anything")
-    assert result == "binary"
+    assert result == "pdf"
 
 
 # ----------------------------------------------------------------------
@@ -130,7 +133,9 @@ async def test_search_and_extract_direct_extensionless_pdf_routes_to_fetch_binar
     from web_agent.models import FetchResult, FetchStatus
 
     agent = Agent(AppConfig())
-    agent._fetcher.classify_url = AsyncMock(return_value="binary")
+    # v1.6.10: classify_url returns granular kinds; "pdf" still routes
+    # through fetch_binary via _is_binary_kind().
+    agent._fetcher.classify_url = AsyncMock(return_value="pdf")
     agent._fetcher.fetch_binary = AsyncMock(
         return_value=FetchResult(
             url="https://x.com/download/42",
@@ -252,7 +257,8 @@ async def test_search_results_extensionless_pdf_promoted_to_download_candidate()
             ],
         )
     )
-    agent._fetcher.classify_url = AsyncMock(return_value="binary")
+    # v1.6.10: granular kind; "pdf" still routes through binary path
+    agent._fetcher.classify_url = AsyncMock(return_value="pdf")
     agent._fetcher.fetch_many = AsyncMock(return_value=[])
 
     result = await agent.search_and_extract("x")
