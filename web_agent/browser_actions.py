@@ -1146,7 +1146,7 @@ class BrowserActions:
           * ``button[type=submit]``
           * ``input[type=submit|image]``
           * ``role=button`` whose accessible text matches the destructive verb pattern
-          * Any ``button``/``a`` whose text+aria matches the pattern
+          * Any ``button``/``a``/``input`` whose text+aria+value matches the pattern
         Empty input -> False (cannot tell -> allow).
         """
         if not elements:
@@ -1155,6 +1155,11 @@ class BrowserActions:
             tag = (el.get("tag") or "").lower()
             typ = (el.get("type") or "").lower()
             role = (el.get("role") or "").lower()
+            # v1.6.9 review (I-1): elementFromPoint JS collects `n.value`
+            # into the `text` field for input/textarea, so destructive text
+            # in `<input type="button" value="Delete">` is already part of
+            # text_blob -- we just need to extend the tag check below to
+            # include ``input``.
             text_blob = f"{el.get('text') or ''} {el.get('aria') or ''}"
             if tag == "button" and typ == "submit":
                 return True
@@ -1162,7 +1167,7 @@ class BrowserActions:
                 return True
             if role == "button" and _DESTRUCTIVE_TEXT_PATTERN.search(text_blob):
                 return True
-            if tag in {"button", "a"} and _DESTRUCTIVE_TEXT_PATTERN.search(text_blob):
+            if tag in {"button", "a", "input"} and _DESTRUCTIVE_TEXT_PATTERN.search(text_blob):
                 return True
         return False
 

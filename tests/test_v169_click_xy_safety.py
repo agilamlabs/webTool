@@ -147,6 +147,24 @@ def test_destructive_anchor_with_login_text() -> None:
     assert _ba()._looks_like_destructive_at_point(elements) is True
 
 
+def test_destructive_input_type_button_with_value_text() -> None:
+    """v1.6.9 review I-1: <input type='button' value='Delete account'>
+    must be classified destructive. The elementFromPoint JS captures
+    n.value into the text field for input/textarea; the classifier
+    extends the tag check to include 'input'."""
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "input",
+            "type": "button",
+            "role": None,
+            "text": "Delete account",  # came from value=
+            "aria": None,
+            "in_form": False,
+        },
+    ]
+    assert _ba()._looks_like_destructive_at_point(elements) is True
+
+
 def test_destructive_button_with_innocuous_text_is_false() -> None:
     elements: list[dict[str, Any]] = [
         {

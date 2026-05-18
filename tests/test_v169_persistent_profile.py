@@ -210,6 +210,39 @@ async def test_stop_closes_persistent_context_first(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_proxy_supports_async_context_manager_protocol(tmp_path: Path) -> None:
+    """v1.6.9 review C-2: __aenter__ / __aexit__ must be defined on the
+    proxy because Python looks up dunders on the class, not via
+    __getattr__. ``async with proxy:`` must work without crashing.
+    """
+    cfg = AppConfig(
+        base_dir=str(tmp_path),
+        browser=BrowserConfig(
+            isolation_mode=True,
+            profile_mode="named",
+            profile_dir="p",
+            cleanup_on_exit=False,
+            headless=True,
+        ),
+    )
+    bm = BrowserManager(cfg)
+
+    fake_ctx, _, fake_pw = _persistent_pw_mocks()
+    fake_cm = MagicMock()
+    fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
+    fake_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+        await bm.start()
+
+    proxy = await bm._build_context()
+    async with proxy:
+        pass  # __aenter__ + __aexit__ must not raise
+    # Underlying context still alive (no close call from __aexit__)
+    fake_ctx.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_proxy_forwards_attribute_access(tmp_path: Path) -> None:
     cfg = AppConfig(
         base_dir=str(tmp_path),

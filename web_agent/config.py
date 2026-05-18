@@ -830,6 +830,13 @@ class SkillsConfig(BaseSettings):
         ),
     )
 
+    # v1.6.9 review (I-2): without an explicit env_prefix, a standalone
+    # ``SkillsConfig()`` would pick up a bare ``ENABLED`` env var and
+    # spuriously trigger the v1.6.9 deprecation warning. Scope env-var
+    # lookup to the same WEB_AGENT_SKILLS__ namespace AppConfig already
+    # uses for nesting.
+    model_config = {"env_prefix": "WEB_AGENT_SKILLS__"}
+
 
 class WorkspaceConfig(BaseSettings):
     """v1.6.7: Agent-editable workspace with safety modes.

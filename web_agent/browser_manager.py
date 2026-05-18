@@ -117,6 +117,25 @@ class _NoCloseContextProxy:
         """No-op: the persistent context is closed once, from BrowserManager.stop()."""
         logger.debug("_NoCloseContextProxy.close() no-op (persistent profile)")
 
+    # v1.6.9 review (C-2): Python looks up dunders on the class, not the
+    # instance, so __getattr__ does NOT forward __aenter__ / __aexit__.
+    # A caller doing ``async with ctx:`` against this proxy would get an
+    # ``AttributeError: object does not support the asynchronous context
+    # manager protocol``. Define them explicitly so the proxy honors the
+    # BrowserContext async-CM protocol -- __aexit__ stays no-op (mirrors
+    # close()) since the persistent context is owned by BrowserManager.
+    async def __aenter__(self) -> _NoCloseContextProxy:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Any = None,
+        exc: Any = None,
+        tb: Any = None,
+    ) -> None:
+        # Mirrors close(): no-op. Closing happens once from BrowserManager.stop().
+        return None
+
     def __eq__(self, other: object) -> bool:
         if isinstance(other, _NoCloseContextProxy):
             return self._ctx is other._ctx
@@ -432,13 +451,28 @@ class BrowserManager:
                     # so remote_cdp callers can prove this browser was
                     # launched by webTool. Issued for both ephemeral and
                     # named profiles -- named profiles overwrite per launch.
+                    # v1.6.9 review (C-1): we previously suppress(OSError)'d
+                    # silently here, which left `_issued_token=None` with no
+                    # operator-visible signal. A token-issuance failure
+                    # breaks the remote_cdp ownership chain -- callers calling
+                    # `get_ownership_token()` get None and can't attach.
+                    # Surface the failure as a WARNING so the operator can
+                    # diagnose (read-only fs / permission / disk full).
                     if self._effective_profile_dir is not None:
-                        with suppress(OSError):
+                        try:
                             self._issued_token = OwnershipToken.issue(self._effective_profile_dir)
                             logger.debug(
                                 "Ownership token issued at {p}/{f}",
                                 p=self._effective_profile_dir,
                                 f=OwnershipToken.FILENAME,
+                            )
+                        except OSError as exc:
+                            logger.warning(
+                                "Failed to write ownership token at {p}/{f}: {e}. "
+                                "remote_cdp siblings cannot attach to this browser.",
+                                p=self._effective_profile_dir,
+                                f=OwnershipToken.FILENAME,
+                                e=exc,
                             )
                 if bcfg.cdp_enabled and self._effective_profile_dir is not None:
                     await self._discover_cdp_endpoint(self._effective_profile_dir)
