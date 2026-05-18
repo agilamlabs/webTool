@@ -433,3 +433,304 @@ class TestV1610Integration:
             "broke persistence. Cookie blob from session B: "
             f"{cookie_blob!r}"
         )
+
+
+class TestV1611Integration:
+    """v1.6.11 follow-up polish integration tests.
+
+    Covers Item 2 (``web_research(extract_files=True)`` non-extractable
+    filter) and Item 3 (``find_and_download_file`` Fallback 1 removal).
+    Uses unit-level mocks on :class:`Recipes` -- no Playwright launch --
+    because the changes are pure routing logic in the search-result
+    filter loop and the fallback chain. Live browser launches in this
+    class would be slower and flakier without exercising any extra
+    code path.
+    """
+
+    @staticmethod
+    def _result(position: int, url: str) -> SearchResultItem:  # type: ignore[name-defined] # noqa: F821
+        from web_agent.models import SearchResultItem
+
+        return SearchResultItem(position=position, title=url, url=url, provider="ddgs")
+
+    @pytest.mark.asyncio
+    async def test_web_research_extract_files_skips_non_extractable(self) -> None:
+        """v1.6.11 Item 2: ``extract_files=True`` must skip ``.mp4`` /
+        ``.exe`` / ``.iso`` / ``.zip`` BEFORE fetching, routing them
+        into ``download_candidates`` with
+        ``block_reason='not_extractable_kind'``. Pre-v1.6.11 these were
+        fetched as binary and only the v1.6.10 I-1 guard caught them
+        post-fetch -- wasted bandwidth on bytes that were never going
+        to extract."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.config import SafetyConfig
+        from web_agent.models import (
+            ExtractionResult,
+            FetchResult,
+            SearchResponse,
+        )
+        from web_agent.recipes import Recipes
+
+        urls = [
+            "https://example.com/report.pdf",
+            "https://example.com/clip.mp4",
+            "https://example.com/installer.exe",
+            "https://example.com/image.iso",
+            "https://example.com/archive.zip",
+        ]
+        search_mock = MagicMock()
+        search_mock.search = AsyncMock(
+            return_value=SearchResponse(
+                query="test",
+                total_results=len(urls),
+                results=[self._result(i + 1, u) for i, u in enumerate(urls)],
+            )
+        )
+
+        fetcher_mock = MagicMock()
+        fetcher_mock.fetch_smart = AsyncMock(
+            return_value=FetchResult(
+                url=urls[0],
+                final_url=urls[0],
+                status=FetchStatus.SUCCESS,
+                binary=b"%PDF",
+            )
+        )
+
+        extractor_mock = MagicMock()
+        extractor_mock.extract = MagicMock(
+            return_value=ExtractionResult(
+                url=urls[0],
+                title="Doc",
+                content="Hello",
+                extraction_method="binary_pdf",
+                content_length=5,
+            )
+        )
+
+        config = AppConfig(
+            log_level="WARNING",
+            safety=SafetyConfig(probe_binary_urls=False, max_pages_per_call=10),
+        )
+        recipes = Recipes(
+            search=search_mock,
+            fetcher=fetcher_mock,
+            extractor=extractor_mock,
+            downloader=MagicMock(),
+            config=config,
+        )
+
+        result = await recipes.web_research("test", max_pages=5, extract_files=True)
+
+        assert fetcher_mock.fetch_smart.await_count == 1, (
+            "expected exactly one fetch_smart call (only the .pdf is extractable); "
+            f"got {fetcher_mock.fetch_smart.await_count}"
+        )
+        fetched_url = fetcher_mock.fetch_smart.call_args.args[0]
+        assert fetched_url == urls[0]
+
+        skipped = {c.url for c in result.download_candidates}
+        assert skipped == set(urls[1:]), f"unexpected download_candidates: {skipped}"
+
+        not_extractable = [
+            d for d in result.diagnostics if d.block_reason == "not_extractable_kind"
+        ]
+        assert len(not_extractable) == 4, (
+            f"expected 4 not_extractable_kind diagnostics, got {len(not_extractable)}: "
+            f"{[(d.url, d.block_reason) for d in result.diagnostics]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_web_research_extract_files_allows_pdf_xlsx_docx_csv(self) -> None:
+        """v1.6.11 Item 1: ``extract_files=True`` must allow all four
+        extractable binary kinds (PDF / XLSX / DOCX / CSV) through to
+        ``fetch_smart`` + extractor. Regression test for
+        :data:`EXTRACTABLE_BINARY_KINDS` -- if someone tightens it,
+        this test fails immediately."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.config import SafetyConfig
+        from web_agent.models import (
+            ExtractionResult,
+            FetchResult,
+            SearchResponse,
+        )
+        from web_agent.recipes import Recipes
+
+        urls = [
+            "https://example.com/report.pdf",
+            "https://example.com/data.xlsx",
+            "https://example.com/memo.docx",
+            "https://example.com/table.csv",
+        ]
+
+        search_mock = MagicMock()
+        search_mock.search = AsyncMock(
+            return_value=SearchResponse(
+                query="test",
+                total_results=len(urls),
+                results=[self._result(i + 1, u) for i, u in enumerate(urls)],
+            )
+        )
+
+        async def fake_fetch(url: str, *, session_id=None, **_):
+            return FetchResult(url=url, final_url=url, status=FetchStatus.SUCCESS, binary=b"BIN")
+
+        fetcher_mock = MagicMock()
+        fetcher_mock.fetch_smart = AsyncMock(side_effect=fake_fetch)
+
+        def fake_extract(fr):
+            return ExtractionResult(
+                url=fr.final_url,
+                title="Doc",
+                content="content",
+                extraction_method="binary_pdf",
+                content_length=7,
+            )
+
+        extractor_mock = MagicMock()
+        extractor_mock.extract = MagicMock(side_effect=fake_extract)
+
+        config = AppConfig(
+            log_level="WARNING",
+            safety=SafetyConfig(probe_binary_urls=False, max_pages_per_call=10),
+        )
+        recipes = Recipes(
+            search=search_mock,
+            fetcher=fetcher_mock,
+            extractor=extractor_mock,
+            downloader=MagicMock(),
+            config=config,
+        )
+
+        result = await recipes.web_research("test", max_pages=4, extract_files=True)
+
+        assert fetcher_mock.fetch_smart.await_count == 4, (
+            "expected 4 fetch_smart calls (all four extractable kinds); "
+            f"got {fetcher_mock.fetch_smart.await_count}"
+        )
+        cited = {p.url for p in result.summary_pages}
+        assert cited == set(urls), f"missing kinds in summary_pages: {set(urls) - cited}"
+        assert not result.download_candidates, (
+            f"no URL should land in download_candidates when all are extractable; "
+            f"got {[c.url for c in result.download_candidates]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_find_and_download_file_rejects_non_matching_extension_fallback(
+        self,
+    ) -> None:
+        """v1.6.11 Item 3: with Fallback 1 ('any download URL') removed,
+        a caller asking for ``file_types=['pdf']`` over a result set
+        containing only ``.xlsx`` / ``.zip`` / ``.exe`` URLs must get
+        ``NETWORK_ERROR`` instead of the wrong file. Pre-v1.6.11 this
+        returned the first ``.xlsx`` URL silently."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.config import SafetyConfig
+        from web_agent.models import SearchResponse
+        from web_agent.recipes import Recipes
+
+        urls = [
+            "https://example.com/data.xlsx",
+            "https://example.com/archive.zip",
+            "https://example.com/installer.exe",
+        ]
+        search_mock = MagicMock()
+        search_mock.search = AsyncMock(
+            return_value=SearchResponse(
+                query="test",
+                total_results=len(urls),
+                results=[self._result(i + 1, u) for i, u in enumerate(urls)],
+            )
+        )
+
+        downloader_mock = MagicMock()
+        downloader_mock.download = AsyncMock()  # should not be called
+
+        # ``probe_binary_urls=False`` short-circuits the (now sole) HEAD-
+        # probe fallback so the test isolates Fallback 1's removal: no
+        # extension match + no HEAD probe -> NETWORK_ERROR.
+        config = AppConfig(
+            log_level="WARNING",
+            safety=SafetyConfig(probe_binary_urls=False),
+        )
+        recipes = Recipes(
+            search=search_mock,
+            fetcher=MagicMock(),
+            extractor=MagicMock(),
+            downloader=downloader_mock,
+            config=config,
+        )
+
+        result = await recipes.find_and_download_file("test", file_types=["pdf"])
+
+        assert result.status == FetchStatus.NETWORK_ERROR, (
+            "expected NETWORK_ERROR (no pdf in results, no Fallback 1); "
+            f"got status={result.status} url={result.url!r}"
+        )
+        assert ".pdf" in (result.error_message or ""), (
+            f"expected '.pdf' in error message, got {result.error_message!r}"
+        )
+        downloader_mock.download.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_find_and_download_file_pdf_still_works_with_pdf_in_results(
+        self,
+    ) -> None:
+        """v1.6.11 Item 3 regression: Fallback 1 removal must NOT break
+        the happy path. When a ``.pdf`` URL exists in search results,
+        Tier 1 (exact extension match) still picks it up and the
+        downloader is invoked with it."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.config import SafetyConfig
+        from web_agent.models import DownloadResult, SearchResponse
+        from web_agent.recipes import Recipes
+
+        urls = [
+            "https://example.com/index.html",
+            "https://example.com/report.pdf",
+            "https://example.com/data.xlsx",
+        ]
+        search_mock = MagicMock()
+        search_mock.search = AsyncMock(
+            return_value=SearchResponse(
+                query="test",
+                total_results=len(urls),
+                results=[self._result(i + 1, u) for i, u in enumerate(urls)],
+            )
+        )
+
+        downloader_mock = MagicMock()
+        downloader_mock.download = AsyncMock(
+            return_value=DownloadResult(
+                url="https://example.com/report.pdf",
+                filepath="/tmp/report.pdf",
+                filename="report.pdf",
+                size_bytes=4,
+                status=FetchStatus.SUCCESS,
+            )
+        )
+
+        config = AppConfig(
+            log_level="WARNING",
+            safety=SafetyConfig(probe_binary_urls=False),
+        )
+        recipes = Recipes(
+            search=search_mock,
+            fetcher=MagicMock(),
+            extractor=MagicMock(),
+            downloader=downloader_mock,
+            config=config,
+        )
+
+        result = await recipes.find_and_download_file("test", file_types=["pdf"])
+
+        downloader_mock.download.assert_awaited_once()
+        called_url = downloader_mock.download.call_args.args[0]
+        assert called_url == "https://example.com/report.pdf", (
+            f"expected .pdf to be downloaded (Tier 1 match), got {called_url}"
+        )
+        assert result.status == FetchStatus.SUCCESS

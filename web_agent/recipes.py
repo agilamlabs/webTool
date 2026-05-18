@@ -40,7 +40,13 @@ from .models import (
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
-from .web_fetcher import WebFetcher, _is_download_url, is_binary_kind
+from .web_fetcher import (
+    WebFetcher,
+    _is_download_url,
+    _url_ext_classification,
+    is_binary_kind,
+    is_extractable_binary_kind,
+)
 
 # Domains that get a small relevance bonus in the default ranker
 _WELL_KNOWN_DOMAINS = (
@@ -362,9 +368,15 @@ class Recipes:
     ) -> DownloadResult:
         """Search for ``query``, find first matching file URL, download it.
 
-        Looks for direct file URLs in the search results whose extension
-        matches one of ``file_types``. Falls through to the first download-
-        looking URL if no exact match is found.
+        Tier 1: direct extension match against ``file_types``.
+        Fallback (v1.6.5, refined v1.6.10): HEAD-probe extensionless URLs
+        and accept the first whose detected binary kind matches
+        ``file_types``.
+
+        v1.6.11: the prior "any download-looking URL" fallback is removed.
+        A caller asking for ``file_types=["pdf"]`` over results containing
+        only ``.xlsx`` URLs now gets ``NETWORK_ERROR``, not an XLSX. To
+        accept multiple kinds, widen ``file_types`` explicitly.
 
         Args:
             query: The search query.
@@ -398,26 +410,22 @@ class Recipes:
             if ext in normalized:
                 candidates.append(url)
 
-        if not candidates:
-            # Fallback 1: any download-looking URL (any known download extension)
-            candidates = [
-                r.url
-                for r in search_resp.results
-                if _is_download_url(r.url) and check_domain_allowed(r.url, self._config.safety)
-            ]
-
         if not candidates and self._config.safety.probe_binary_urls:
-            # Fallback 2 (v1.6.5, refined v1.6.10): HEAD-probe extensionless
-            # URLs. Recovers regulator dashboards / asset-portal URLs whose
-            # path lacks an extension but whose Content-Type indicates a
-            # binary document. Only one HEAD per result; we stop on the
-            # first acceptable match.
+            # Fallback (v1.6.5, refined v1.6.10, sole fallback v1.6.11):
+            # HEAD-probe extensionless URLs. Recovers regulator dashboards
+            # / asset-portal URLs whose path lacks an extension but whose
+            # Content-Type indicates a binary document. Only one HEAD per
+            # result; we stop on the first acceptable match.
             #
-            # v1.6.10: ``classify_url`` now returns a granular kind. Reject
+            # v1.6.10: ``classify_url`` returns a granular kind. Reject
             # binary URLs whose detected kind does not match the caller's
             # ``file_types`` -- a v1.6.9 caller asking for ['pdf'] would
             # previously accept an extensionless XLSX/ZIP because the
             # classifier collapsed everything to ``"binary"``.
+            #
+            # v1.6.11: the prior "Fallback 1" (any download-looking URL
+            # regardless of extension match) is removed; this HEAD-probe
+            # path is the sole fallback.
             for r in search_resp.results:
                 if not check_domain_allowed(r.url, self._config.safety):
                     continue
@@ -540,11 +548,23 @@ class Recipes:
                 continue
             if _is_download_url(r.url):
                 if extract_files:
-                    # v1.6.10: route through fetch_smart + extractor like
-                    # the page-fetch path. The Item 2 gate fix
-                    # (``not (fr.html or fr.binary)``) makes the binary
-                    # FetchResult flow through to the extractor.
-                    allowed.append(r)
+                    # v1.6.11: only route extractable kinds (PDF/XLSX/DOCX/CSV)
+                    # through fetch_smart + extractor. Skip videos / installers /
+                    # ISOs / archives before the fetch -- the v1.6.10 I-1 guard
+                    # still catches HEAD-probed extensionless binaries downstream.
+                    kind = _url_ext_classification(r.url)
+                    if is_extractable_binary_kind(kind):
+                        allowed.append(r)
+                    else:
+                        download_candidates.append(r)
+                        diagnostics.append(
+                            FetchDiagnostic(
+                                url=r.url,
+                                status=FetchStatus.SUCCESS,
+                                provider=r.provider,
+                                block_reason="not_extractable_kind",
+                            )
+                        )
                 else:
                     download_candidates.append(r)
                     diagnostics.append(

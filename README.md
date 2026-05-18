@@ -10,46 +10,67 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.10** — *Follow-up hardening patch.* No new
-> features; eight items addressing one functional bug plus seven
-> consistency / UX gaps. Headlines:
+> **What's new in 1.6.11** — *Follow-up polish patch.* No new
+> features; seven items addressing one behavioural issue, one
+> correctness gap, one stale-migration-wording bug, plus four polish
+> items. Headlines:
 >
-> * **`web_research` no longer drops binary results.** The v1.6.9
+> * **`web_research(extract_files=True)` skips non-extractable kinds
+>   before fetching.** Pre-v1.6.11, `.mp4` / `.exe` / `.iso` / `.zip`
+>   results were fetched as binary then caught post-fetch by the
+>   v1.6.10 I-1 guard (wasted bandwidth). v1.6.11 filters against the
+>   new `EXTRACTABLE_BINARY_KINDS = {"pdf", "xlsx", "docx", "csv"}`
+>   set BEFORE `fetch_smart` runs; rejected URLs land in
+>   `download_candidates` with `block_reason="not_extractable_kind"`.
+> * **`find_and_download_file` no longer returns the wrong file
+>   type.** Pre-v1.6.11, a caller asking for `file_types=["pdf"]`
+>   over a result set containing only `.xlsx` URLs silently got an
+>   `.xlsx`. v1.6.11 removes the "any download URL" Fallback 1
+>   entirely; Tier 1 (extension match) and the HEAD-probe fallback
+>   are now sufficient. **Migration**: widen `file_types` (e.g.
+>   `["pdf", "xlsx", "docx", "csv"]`) to opt into multi-kind search.
+> * **`EXTRACTABLE_BINARY_KINDS` + `is_extractable_binary_kind()`**
+>   are public-stable helpers exported from `web_agent` for callers
+>   who want to filter URLs identically before calling `fetch_smart`
+>   themselves.
+> * **Docs cleanup**: CHANGELOG migration sentence (`_is_binary_kind`
+>   -> `is_binary_kind`), `fetch_smart` / `_inspect_element_at_point`
+>   docstrings refreshed to v1.6.10 semantics, README MCP-tool count
+>   replaced with category wording (no more "37 tools" drift),
+>   SECURITY.md `cdp_host` wording aligned with `remote_cdp_url`
+>   (`127.0.0.0/8 / ::1 / localhost`).
+>
+> See [CHANGELOG.md](CHANGELOG.md#1611---2026-05-18) for the full
+> list including the two behaviour-change migration notes.
+>
+> **v1.6.10** — *Follow-up hardening patch.* No new features; eight
+> items addressing one functional bug plus seven consistency / UX
+> gaps. Headlines:
+>
+> * **`web_research` no longer drops binary results** -- the v1.6.9
 >   gate (`not fr.html`) silently logged successful binary
->   `FetchResult`s from `fetch_smart` (extensionless PDFs, regulator
->   dashboards, …) as `fetch_failed`. Fixed: now `not (fr.html or
->   fr.binary)`.
-> * **`web_research(extract_files=False)`** mirrors the existing
->   `search_and_extract(extract_files=…)` knob. When True, file URLs
->   are extracted inline via `fetch_smart` instead of routed to
->   `download_candidates`. Default False preserves v1.6.9 behaviour.
+>   `FetchResult`s from `fetch_smart` as `fetch_failed`; v1.6.10
+>   gates on `not (fr.html or fr.binary)`.
+> * **`web_research(extract_files=False)`** mirrors
+>   `search_and_extract(extract_files=…)`. When True, file URLs are
+>   extracted inline via `fetch_smart`.
 > * **Richer file classification.** `WebFetcher.classify_url` returns
 >   one of `'pdf' | 'xlsx' | 'docx' | 'csv' | 'zip' | 'binary_other'
 >   | 'html' | 'unknown'` instead of collapsing every binary to
->   `'binary'`. `find_and_download_file(file_types=["pdf"])` now
->   rejects extensionless XLSX/ZIP that HEAD-probed as binary. New
->   `is_binary_kind(c)` helper (`from web_agent import is_binary_kind`)
->   is the migration target. **Breaking** for direct callers
->   comparing to the old `"binary"` string.
+>   `'binary'`. New `is_binary_kind(c)` helper
+>   (`from web_agent import is_binary_kind`) is the migration target.
+>   **Breaking** for direct callers comparing to `"binary"`.
 > * **`Agent.get_owned_cdp_connection_info()`** returns a structured
 >   `CdpConnectionInfo` (cdp_url, profile_dir, ownership_token) or
->   `None`. Bundles the three getters a sibling `remote_cdp` Agent
->   needs. New MCP tool `web_get_owned_cdp_connection_info`.
+>   `None`. New MCP tool `web_get_owned_cdp_connection_info`.
 > * **`SafetyConfig.coordinate_click_unknown_policy`** (`"allow"` |
 >   `"block"`, default `"allow"`, forced `"block"` in `safe_mode`).
 >   When `"block"`, `click_xy` rejects clicks where `elementFromPoint`
->   returns no element. Independent of `allow_form_submit` — strict
->   callers can opt into block-on-unknown without disabling submits.
-> * **`BrowserConfig.cdp_host` uses `_is_loopback_host`** —
->   accepts `127.0.0.0/8` + `::1` + `localhost`, matching the
->   `remote_cdp_url` semantics from v1.6.8.
+>   returns no element. Independent of `allow_form_submit`.
+> * **`BrowserConfig.cdp_host` uses `_is_loopback_host`** — accepts
+>   `127.0.0.0/8` + `::1` + `localhost`.
 > * **Named profiles share one `BrowserContext`** (Playwright
->   limitation, surfaced in README + AGENTS): all `session_id`s on a
->   named profile share cookies / localStorage. Use
->   `profile_mode="ephemeral"` for per-session isolation.
->
-> See [CHANGELOG.md](CHANGELOG.md#1610---2026-05-18) for the full
-> list and the migration note for the `classify_url` enum change.
+>   limitation, surfaced in README + AGENTS).
 >
 > **v1.6.9** — *Hardening patch.* No new features; ten safety +
 > consistency fixes. Headlines:
@@ -169,7 +190,7 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 - **Structured Output** — All results are Pydantic v2 models serializable to JSON.
 
 ### Integration
-- **MCP Server** — **37 tools** exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client.
+- **MCP Server** — search, fetch, download, browser automation, sessions, tabs, CDP, diagnostics, skills, and recipes exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client.
 - **CLI** — `web-agent search / fetch / download / interact / screenshot / observe / skills / doctor / replay`.
 
 ## Installation

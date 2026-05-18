@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.10"
+__version__ = "1.6.11"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -133,7 +133,7 @@ from .search_providers import (
 )
 from .trace_recorder import SessionTraceRecorder
 from .utils import BudgetTracker, RetryPolicy, get_retry_policy
-from .web_fetcher import is_binary_kind
+from .web_fetcher import EXTRACTABLE_BINARY_KINDS, is_binary_kind, is_extractable_binary_kind
 
 __all__ = [
     # Version
@@ -171,8 +171,10 @@ __all__ = [
     # Cache
     "Cache",
     "DiskCache",
-    # Classification helper (v1.6.10)
+    # Classification helpers (v1.6.10 / v1.6.11)
     "is_binary_kind",
+    "is_extractable_binary_kind",
+    "EXTRACTABLE_BINARY_KINDS",
     # Search providers
     "DDGSProvider",
     "PlaywrightProvider",

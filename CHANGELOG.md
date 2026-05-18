@@ -1,5 +1,126 @@
 # Changelog
 
+## [1.6.11] - 2026-05-18
+
+### Follow-up Polish (7 items, no new features)
+
+v1.6.11 is another **discipline slice** -- post-merge review of v1.6.10
+surfaced one real behavioural issue, one correctness gap in
+`find_and_download_file`, one stale-migration-wording bug, plus four
+polish items. All 7 items are correctness, consistency, or UX
+hardening; no new features. Test count grows ~740 -> ~744 (4 new
+unit-level integration tests in
+`tests/test_agent.py::TestV1611Integration`).
+
+### Behaviour changes (callers please read)
+
+1. **`web_research(extract_files=True)` skips non-extractable binaries
+   before fetching.** Pre-v1.6.11, `.mp4`, `.exe`, `.iso`, `.zip`, and
+   anything else `_url_ext_classification` returns as
+   `binary_other`/`zip` was fetched as binary and only caught
+   post-fetch by the v1.6.10 I-1 `binary_not_extracted` guard -- wasted
+   bandwidth. v1.6.11 filters the search-result loop in
+   [`recipes.py:541`](web_agent/recipes.py:541) against the new
+   `EXTRACTABLE_BINARY_KINDS = {"pdf", "xlsx", "docx", "csv"}` set
+   BEFORE `fetch_smart` is called. Non-extractable kinds land in
+   `download_candidates` with the new
+   `FetchDiagnostic.block_reason="not_extractable_kind"`. The
+   `binary_not_extracted` post-fetch guard remains as the safety net
+   for HEAD-probed extensionless URLs (where the kind is unknown
+   pre-fetch).
+
+2. **`find_and_download_file` no longer returns the wrong file type
+   when `file_types` is explicit.** Pre-v1.6.11, the "Fallback 1"
+   branch at [`recipes.py:401`](web_agent/recipes.py:401) returned the
+   first `_is_download_url(r.url)` result regardless of whether its
+   extension matched the caller's `file_types`. So
+   `file_types=["pdf"]` over a result set containing only `.xlsx` URLs
+   silently returned an `.xlsx`. v1.6.11 removes Fallback 1 entirely.
+   Tier 1 (exact extension match) and the HEAD-probe fallback (now
+   the sole fallback, refined with v1.6.10's kind filter) are
+   sufficient. **Migration**: callers who relied on the lax behaviour
+   should widen `file_types` explicitly (e.g.
+   `["pdf", "xlsx", "docx", "csv"]`) -- they will now get
+   `NETWORK_ERROR` instead of the wrong file.
+
+### Must-fix (functional correctness)
+
+3. **`is_binary_kind` is the migration target, not `_is_binary_kind`.**
+   The v1.6.10 C-2 review pass renamed the helper to remove the
+   leading underscore and exported it from `web_agent.*`, but the
+   v1.6.10 CHANGELOG migration sentence still told callers to use the
+   old underscored name. Migration sentence at the top of the
+   v1.6.10 entry is fixed; historical mentions describing the rename
+   itself are preserved (so the C-2 narrative still reads correctly).
+
+### Should-fix (consistency / UX)
+
+4. **New `EXTRACTABLE_BINARY_KINDS` + `is_extractable_binary_kind()`.**
+   Public-stable helpers in
+   [`web_agent/web_fetcher.py`](web_agent/web_fetcher.py), re-exported
+   from `web_agent.*`. Subset of `_BINARY_KINDS`:
+   `{"pdf", "xlsx", "docx", "csv"}`. Use to filter URLs before passing
+   to `fetch_smart` when the downstream consumer is the binary
+   extractor.
+
+5. **Stale docstrings refreshed.** `fetch_smart()` resolution-order
+   bullet (web_fetcher.py:294) and `_inspect_element_at_point()` note
+   (browser_actions.py:1120) both referenced v1.6.9 semantics
+   contradicted by v1.6.10 (granular kinds and the
+   `coordinate_click_unknown_policy="block"` behaviour respectively).
+
+6. **README + SECURITY consistency.**
+   - `README.md` MCP-tool count switched from a hardcoded `"37 tools"`
+     (already stale, drifts with every new tool) to category wording.
+   - `SECURITY.md` `cdp_host` bullet now mentions `127.0.0.0/8 / ::1 /
+     localhost` to align with the `remote_cdp_url` bullet immediately
+     below (v1.6.10 widened the `cdp_host` validator to use
+     `_is_loopback_host` -- the SECURITY doc still showed the old
+     literal-set examples).
+
+7. **Four new integration tests** in
+   `tests/test_agent.py::TestV1611Integration` covering:
+   - `extract_files=True` skips `.mp4` / `.exe` / `.iso` / `.zip` with
+     `block_reason="not_extractable_kind"` (Item 1 / behaviour change 1)
+   - `extract_files=True` allows `.pdf` / `.xlsx` / `.docx` / `.csv`
+     (`EXTRACTABLE_BINARY_KINDS` regression test)
+   - `find_and_download_file(file_types=["pdf"])` rejects an
+     `.xlsx`-only result set with `NETWORK_ERROR` (Item 2 /
+     behaviour change 2)
+   - `find_and_download_file(file_types=["pdf"])` still downloads the
+     `.pdf` when one exists in results (Tier 1 happy-path regression)
+
+### Behaviour preserved (no migration needed beyond items 1-2)
+
+- `web_research` callers that do NOT pass `extract_files` (or pass
+  `extract_files=False`) see the v1.6.10 behaviour exactly: file URLs
+  continue to land in `download_candidates` with
+  `block_reason="download_skipped"`.
+- `is_binary_kind`, `EXTRACTABLE_BINARY_KINDS`, and
+  `is_extractable_binary_kind` are all additive; existing imports
+  and `__all__` entries continue to work.
+- All MCP tool schemas and signatures are unchanged.
+
+### Files changed
+
+- `web_agent/web_fetcher.py` -- new `EXTRACTABLE_BINARY_KINDS` +
+  `is_extractable_binary_kind()`; `fetch_smart` docstring refresh.
+- `web_agent/recipes.py` -- imports
+  (`_url_ext_classification, is_extractable_binary_kind`);
+  `web_research` extract_files kind filter
+  ([line 541](web_agent/recipes.py:541)); `find_and_download_file`
+  Fallback 1 deletion + docstring rewrite.
+- `web_agent/browser_actions.py` -- `_inspect_element_at_point`
+  docstring v1.6.10 note.
+- `web_agent/__init__.py` -- bump `__version__`, export
+  `EXTRACTABLE_BINARY_KINDS` + `is_extractable_binary_kind`.
+- `tests/test_agent.py` -- `TestV1611Integration` (4 tests).
+- `CHANGELOG.md` -- this entry; v1.6.10 migration wording fix
+  (`_is_binary_kind` -> `is_binary_kind`).
+- `README.md` -- MCP-tool count wording; v1.6.11 banner.
+- `AGENTS.md` -- version banner; test count; "What v1.6.11 added".
+- `SECURITY.md` -- `cdp_host` loopback wording.
+
 ## [1.6.10] - 2026-05-18
 
 ### Review pass (3 fixes: 2 Critical + 1 Important)
@@ -45,11 +166,12 @@ helper no longer return the string `"binary"`. They now return one of:
 
 - `"pdf" | "xlsx" | "docx" | "csv" | "zip" | "binary_other" | "html" | "unknown"`
 
-**Migration:** replace `classification == "binary"` with the new
-`_is_binary_kind(classification)` helper exported from
-`web_agent.web_fetcher`. Callers that only consume `fetch_smart` or
-public `Agent` methods are unaffected -- the routing decision is
-already centralized inside `fetch_smart` and uses the helper.
+**Migration:** replace `classification == "binary"` with
+`is_binary_kind(classification)`, imported from `web_agent`
+(`from web_agent import is_binary_kind`). Callers that only consume
+`fetch_smart` or public `Agent` methods are unaffected -- the routing
+decision is already centralized inside `fetch_smart` and uses the
+helper.
 
 ### Must-fix (functional correctness)
 
@@ -78,9 +200,9 @@ already centralized inside `fetch_smart` and uses the helper.
    `"binary"`. `find_and_download_file(file_types=["pdf"])` now
    rejects an extensionless XLSX or ZIP matched via HEAD probe -- the
    v1.6.9 behaviour accepted any binary content type regardless of the
-   requested kinds. New module-level helper `_is_binary_kind(s)` is the
-   canonical migration target for any code that compared to the old
-   `"binary"` string.
+   requested kinds. Public helper `is_binary_kind(s)` (re-exported from
+   `web_agent.*`) is the canonical migration target for any code that
+   compared to the old `"binary"` string.
 
 ### Should-fix (consistency / UX)
 
