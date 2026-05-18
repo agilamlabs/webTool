@@ -346,7 +346,7 @@ class SkillRegistry:
         # Load if ANY of the three sources is enabled. Each source's own
         # gate inside _load_all decides whether it actually loads anything.
         any_source = (
-            config.skills.enabled
+            config.skills.project_skills_enabled
             or config.skills.builtin_skills_enabled
             or config.workspace.enabled
         )
@@ -366,7 +366,7 @@ class SkillRegistry:
             self._load_builtin()
         if self._config.workspace.enabled:
             self._load_workspace()
-        if self._config.skills.enabled:
+        if self._config.skills.project_skills_enabled:  # v1.6.9: was .enabled
             self._load_project()
         logger.info("SkillRegistry loaded {n} skill(s)", n=len(self._skills))
 

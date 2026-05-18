@@ -55,7 +55,9 @@ async def test_isolation_off_no_user_data_dir_in_launch_args(tmp_path: Path) -> 
 
     fake_chromium.launch.assert_called_once()
     args = fake_chromium.launch.call_args.kwargs["args"]
-    assert "--no-sandbox" in args
+    # v1.6.9: --no-sandbox is now CI/container-conditional (opt-in
+    # locally). The hardening check is in
+    # tests/test_v169_no_sandbox_autodetect.py.
     assert all(not a.startswith("--user-data-dir") for a in args), args
     assert bm._effective_profile_dir is None
 
@@ -150,7 +152,10 @@ async def test_isolation_ephemeral_cleanup_on_exit_removes_dir(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_isolation_named_persists_after_stop(tmp_path: Path) -> None:
     """Named mode points at a stable directory that persists across
-    runs. stop() must NOT remove it -- the user owns it."""
+    runs. stop() must NOT remove it -- the user owns it.
+
+    v1.6.9: named profiles now use chromium.launch_persistent_context
+    (returns BrowserContext, not Browser) so the test mocks that path."""
     profile_path = "my-named-profile"
     config = _make_config(
         tmp_path,
@@ -163,8 +168,17 @@ async def test_isolation_named_persists_after_stop(tmp_path: Path) -> None:
     bm = BrowserManager(config)
     fake_browser = MagicMock()
     fake_browser.close = AsyncMock()
+    fake_ctx = MagicMock(name="PersistentContext")
+    fake_ctx.browser = fake_browser
+    fake_ctx.close = AsyncMock()
+    fake_ctx.route = AsyncMock()
+    fake_ctx.set_default_timeout = MagicMock()
+    fake_ctx.set_default_navigation_timeout = MagicMock()
     fake_chromium = MagicMock()
-    fake_chromium.launch = AsyncMock(return_value=fake_browser)
+    fake_chromium.launch_persistent_context = AsyncMock(return_value=fake_ctx)
+    fake_chromium.launch = AsyncMock(
+        side_effect=AssertionError("launch must NOT be called for named profile")
+    )
     fake_pw = MagicMock(chromium=fake_chromium)
     fake_pw_cm = MagicMock()
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)

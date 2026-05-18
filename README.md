@@ -10,8 +10,38 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.8** — *Diagnostics and Advanced Browser Intelligence.*
-> Six new features, all off by default, make webTool explainable and
+> **What's new in 1.6.9** — *Hardening patch.* No new features; ten
+> safety + consistency fixes. Headlines:
+>
+> * **`click_xy` no longer bypasses safety.** New
+>   `SafetyConfig.allow_coordinate_clicks` (default True, forced False
+>   in `safe_mode`) plus a `document.elementFromPoint(x, y)` inspector
+>   that blocks submit / login / delete / pay controls when
+>   `allow_form_submit=False`.
+> * **`remote_cdp` ownership tokens.** v1.6.8 attached to any loopback
+>   `ws://` URL — including a user's personal Chrome. v1.6.9 requires
+>   `BrowserConfig.remote_cdp_ownership_token` matching a file webTool
+>   writes into the launcher's profile dir (`OwnershipToken`).
+> * **Named profiles now use `chromium.launch_persistent_context`** so
+>   cookies / localStorage actually survive across `Agent` lifetimes.
+> * **`--no-sandbox` auto-detected** — opt-in or CI/container only;
+>   local dev keeps the sandbox enabled.
+> * **Shared smart-binary routing** via new `WebFetcher.fetch_smart`
+>   used by every recipe (no more extensionless PDFs slipping into the
+>   HTML extractor).
+> * **`mcp` is now an optional extra** — `pip install
+>   "web-agent-toolkit[mcp]"` to run the MCP server.
+> * Configurable `BrowserConfig.locale` / `timezone_id` /
+>   `user_agent_mode` / `user_agent`.
+> * `SkillsConfig.enabled` → `project_skills_enabled` (deprecated alias
+>   retained for one release).
+>
+> See [CHANGELOG.md](CHANGELOG.md#169) for the full list and the
+> backward-compatibility notes (one intentional break for
+> `remote_cdp` configs without a token).
+>
+> **v1.6.8** — *Diagnostics and Advanced Browser Intelligence.*
+> Six features, all off by default, make webTool explainable and
 > debuggable: **network event capture** (`page.on(request|response|requestfailed)`
 > hooks via `WeakKeyDictionary`-backed `NetworkCollector`); **API endpoint
 > candidate discovery** derived from captured events; **download event
@@ -21,8 +51,8 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 > **session replay / audit traces** with new `Agent.replay_trace(file)` +
 > CLI `web-agent replay <trace_file>`; **remote CDP backend** —
 > `backend="remote_cdp"` + `remote_cdp_url` dispatches to
-> `chromium.connect_over_cdp()` with a loopback-only validator. See
-> [CHANGELOG.md](CHANGELOG.md#168) for the full list.
+> `chromium.connect_over_cdp()` (v1.6.9 adds ownership tokens, see above).
+> See [CHANGELOG.md](CHANGELOG.md#168) for the full list.
 >
 > **v1.6.7** added: *Skills and Playbooks.* Domain skill registry
 > (`Agent.list_domain_skills / get_domain_skills(url) / apply_domain_skill`),
@@ -127,6 +157,14 @@ playwright install --with-deps chromium
 
 ```bash
 pip install -e ".[dev,binary]"
+```
+
+**Optional MCP server** (v1.6.9+). The Python API works without
+`mcp[cli]`; install the `[mcp]` extra to run the MCP server:
+
+```bash
+pip install -e ".[mcp]"            # MCP server only
+pip install -e ".[dev,mcp,binary]" # everything
 ```
 
 **Requirements:** Python 3.10+ (3.10, 3.11, 3.12, 3.13 tested in CI)

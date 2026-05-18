@@ -29,7 +29,6 @@ dependencies = [
     "lxml>=5.0.0",
     "PyYAML>=6.0",
     "httpx>=0.28.0",
-    "mcp[cli]>=1.0.0",
     "ddgs>=9.0.0",
     # v1.6.7: parses ".webtool-skills/<domain>/<skill>.md" frontmatter for
     # the domain-skills registry. Pulls in PyYAML which is already a dep.
@@ -37,6 +36,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# v1.6.9: the MCP server runtime is now an extras install. Users of the
+# Python API only (Agent + Recipes) do not need the mcp[cli] package.
+# Install with: pip install "web-agent-toolkit[mcp]"
+mcp = ["mcp[cli]>=1.0.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
@@ -44,6 +47,9 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.10.0",
     "types-PyYAML>=6.0.0",
+    # v1.6.9: mcp is now an optional extra, but tests + CI lint exercise
+    # the mcp_server module so we install it for dev.
+    "mcp[cli]>=1.0.0",
 ]
 # Binary document extractors (PDF + XLSX + DOCX). Install with:
 #   pip install "web-agent-toolkit[binary]"

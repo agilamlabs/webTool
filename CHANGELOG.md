@@ -1,5 +1,240 @@
 # Changelog
 
+## [1.6.9] - 2026-05-18
+
+### Hardening Patch (10 items, no new features)
+
+v1.6.9 is a **discipline slice**: no new big features, just safety
+hardening and consistency cleanup based on the post-v1.6.8 review. The
+test count grows from ~574 to ~734 (160 new tests across 8 new
+`tests/test_v169_*.py` files; pre-existing v1.6.6/v1.6.7/v1.6.8 tests
+that asserted now-changed defaults were also updated).
+
+Two **P0 ship-blockers** are fixed:
+
+1. **`click_xy` no longer bypasses form-submit safety.** Prior versions
+   logged a warning under `safe_mode` and clicked anyway; coordinate
+   clicks could hit submit/login/delete/pay buttons without any
+   heuristic check. v1.6.9 adds `safety.allow_coordinate_clicks`
+   (default `True`, forced `False` in `safe_mode`) and, when
+   `allow_form_submit=False`, runs `document.elementFromPoint(x, y)` to
+   inspect the target element + 5 ancestors and block submit/destructive
+   controls.
+2. **`remote_cdp` now requires an ownership token.** v1.6.8 accepted any
+   loopback `ws://` URL via `chromium.connect_over_cdp`, which violated
+   the "webTool only controls browsers it launched" design rule -- a
+   user's personal Chrome on `127.0.0.1:9222` would attach fine. v1.6.9
+   adds filesystem-anchored ownership tokens
+   (`web_agent/ownership.py:OwnershipToken`): webTool writes a random
+   64-char hex token into `<profile_dir>/.webtool-ownership` on every
+   isolated launch, and `remote_cdp` callers must present a matching
+   token via `BrowserConfig.remote_cdp_ownership_token` +
+   `remote_cdp_profile_dir`.
+
+Plus **8 should-fix items**: launch_persistent_context refactor for
+named profiles, `--no-sandbox` auto-detect, shared smart-binary routing,
+MCP as optional dep, configurable locale/timezone/user-agent,
+`SkillsConfig.enabled` rename with deprecation alias, MCP docstring
+polish, and integration test expansion.
+
+### click_xy safety inspection (P0)
+
+* `web_agent/browser_actions.py:_do_click_xy` rewritten:
+  * Honors `safety.allow_coordinate_clicks` (default `True`; forced
+    `False` by `safe_mode=True` -- master kill-switch behavior
+    matching the v1.6.5 `allow_form_submit` / `allow_js_evaluation`
+    pattern).
+  * When `allow_form_submit=False`, runs `_inspect_element_at_point`
+    (returns up to 5 ancestors via `document.elementFromPoint`) and
+    feeds the result through new `_looks_like_destructive_at_point`.
+  * Blocks the click when the inspection identifies submit/login/
+    delete/pay controls; allows on empty/failed inspection (cannot
+    tell -> default permissive, matching selector-path behavior).
+* New `_DESTRUCTIVE_TEXT_PATTERN` regex covers submit/send/save/
+  login/register/continue/delete/remove/pay/buy/purchase/checkout/
+  order/accept/agree/consent/allow/enable.
+* New `SafetyConfig.allow_coordinate_clicks: bool = True`.
+* 37 new tests in `tests/test_v169_click_xy_safety.py`.
+
+### remote_cdp ownership token (P0)
+
+* New `web_agent/ownership.py:OwnershipToken` with three classmethods:
+  * `issue(profile_dir)` -- generates a 64-char hex token, writes it
+    to `<profile_dir>/.webtool-ownership`, chmods 0o600 best-effort.
+  * `read(profile_dir)` -- returns the token string or `None`.
+  * `verify(profile_dir, candidate)` -- constant-time compare via
+    `secrets.compare_digest`.
+* New `BrowserConfig.remote_cdp_ownership_token: Optional[str]` and
+  `BrowserConfig.remote_cdp_profile_dir: Optional[str]`. Both **required**
+  when `backend='remote_cdp'`.
+* `BrowserManager.start()` now:
+  * Writes a fresh token under the active profile dir after every
+    successful isolated launch (ephemeral + named).
+  * Verifies the configured token against the on-disk file BEFORE
+    opening a CDP connection; mismatched tokens raise `BrowserError`.
+* New public exports: `OwnershipToken`, `BrowserManager.get_ownership_token()`,
+  `BrowserManager.get_effective_profile_dir()`.
+* 16 new tests in `tests/test_v169_remote_cdp_ownership.py`.
+
+**Breaking** (intentional): v1.6.8 configs that set
+`backend='remote_cdp'` without a token will fail at config-validation
+time. Documented as a deliberate fix; v1.6.8's behavior was unsafe.
+
+### Named profile -> launch_persistent_context
+
+* `BrowserManager.start()` dispatches `isolation_mode=True` +
+  `profile_mode='named'` through `chromium.launch_persistent_context`
+  (returns a `BrowserContext`, not a `Browser`). Prior versions used
+  `chromium.launch(--user-data-dir=...)` + `browser.new_context(...)`,
+  which created incognito-flavoured contexts that did **not** share
+  state with the persistent profile -- cookies / localStorage often
+  did not survive across `Agent` lifetimes as users expected.
+* New `_NoCloseContextProxy` forwards every attribute to the underlying
+  persistent context but turns `close()` into a no-op; all callers
+  (sessions, ephemeral fetches) share the single persistent context
+  without accidentally closing it.
+* Persistent context closed once, from `BrowserManager.stop()`.
+* Integration test in `tests/test_agent.py::TestV169NamedProfilePersistence`
+  performs the cookie/localStorage round-trip across two `Agent`
+  lifetimes.
+* 6 new unit tests in `tests/test_v169_persistent_profile.py`.
+
+### --no-sandbox auto-detect
+
+* New `BrowserConfig.disable_chromium_sandbox: Optional[bool] = None`:
+  * `True` -> always pass `--no-sandbox`.
+  * `False` -> never pass it.
+  * `None` (default) -> auto-detect: enabled in CI (`CI=true`,
+    `GITHUB_ACTIONS=true`) or container (`/.dockerenv` exists).
+* New `_should_disable_chromium_sandbox` helper in `browser_manager.py`.
+* 16 new tests in `tests/test_v169_no_sandbox_autodetect.py`.
+
+**Behavior change**: local dev no longer passes `--no-sandbox` by
+default. This is a deliberate hardening since the sandbox provides
+per-tab isolation against renderer exploits. Operators relying on
+`--no-sandbox` locally set `disable_chromium_sandbox=True`. CI keeps
+working (auto-detect).
+
+### Shared smart-binary routing
+
+* New `WebFetcher.fetch_smart(url, *, session_id, binary_probe=True)`
+  consolidates the binary-vs-HTML routing rules previously duplicated
+  across `Agent.fetch_and_extract`, `Agent.search_and_extract`,
+  `Recipes.search_and_open_best_result`, and `Recipes.web_research`.
+* Recipes now route their top-result fetches through `fetch_smart` so
+  extensionless binary URLs (regulator dashboards etc.) get
+  `fetch_binary`'d instead of dumped into the HTML extractor.
+* 6 new tests in `tests/test_v169_smart_binary_routing.py`.
+
+### MCP as optional dependency
+
+* `mcp[cli]>=1.0.0` moved from `dependencies` to
+  `[project.optional-dependencies] mcp`.
+* New import-time guard in `web_agent/mcp_server.py` raises an
+  `ImportError` with the install hint
+  `pip install "web-agent-toolkit[mcp]"` when the package is missing.
+* 3 new tests in `tests/test_v169_mcp_optional.py`.
+
+**One-time install action**: existing users who installed via
+`pip install web-agent-toolkit` AND use the MCP server need to reinstall
+with `pip install "web-agent-toolkit[mcp]"`.
+
+### Configurable locale / timezone / user-agent
+
+Previously hardcoded in `BrowserManager._build_context`:
+
+* `BrowserConfig.locale: str = "en-US"`
+* `BrowserConfig.timezone_id: str = "America/New_York"`
+* `BrowserConfig.user_agent_mode: Literal["random", "explicit", "playwright_default"] = "random"`
+* `BrowserConfig.user_agent: Optional[str] = None` (required when mode is `explicit`)
+* Defaults preserve v1.6.8 behavior.
+* 11 new tests in `tests/test_v169_browser_locale_ua.py`.
+
+### SkillsConfig.enabled rename
+
+* New canonical field: `SkillsConfig.project_skills_enabled` (the old
+  name `enabled` only ever governed the project-tier load -- not
+  workspace or builtin -- which was confusing).
+* Old name `enabled` kept as a `validation_alias` for one release;
+  using it emits a `DeprecationWarning`. Will be removed in v1.7.0.
+* 5 new tests in `tests/test_v169_skills_alias.py`.
+
+### MCP server docstring
+
+Replaced the hardcoded "Exposes 12 tools" introduction with a category
+list (search, fetch, download, browser automation, sessions, tabs,
+network/trace diagnostics, domain skills, recipes). The decorated-tool
+count grows with each release; categories don't.
+
+### Files added
+
+| Path | Purpose |
+|------|---------|
+| `web_agent/ownership.py` | `OwnershipToken` writer/reader/verifier |
+| `tests/test_v169_click_xy_safety.py` | 37 tests for elementFromPoint inspection |
+| `tests/test_v169_remote_cdp_ownership.py` | 16 tests for token round-trip + verification |
+| `tests/test_v169_persistent_profile.py` | 6 unit tests for launch_persistent_context dispatch |
+| `tests/test_v169_no_sandbox_autodetect.py` | 16 tests for CI/container detection |
+| `tests/test_v169_smart_binary_routing.py` | 6 tests for `fetch_smart` |
+| `tests/test_v169_mcp_optional.py` | 3 tests for MCP import-guard |
+| `tests/test_v169_browser_locale_ua.py` | 11 tests for locale/tz/UA config |
+| `tests/test_v169_skills_alias.py` | 5 tests for `SkillsConfig.enabled` -> `project_skills_enabled` |
+
+### Files modified
+
+| Path | Change |
+|------|--------|
+| `web_agent/__init__.py` | Bump `__version__` to `1.6.9`; export `OwnershipToken` |
+| `web_agent/config.py` | `SafetyConfig.allow_coordinate_clicks` + `_apply_safe_mode` override; `BrowserConfig.{remote_cdp_ownership_token, remote_cdp_profile_dir, disable_chromium_sandbox, locale, timezone_id, user_agent_mode, user_agent}`; `_validate_user_agent_mode`; remote_cdp validator extended with token + profile_dir requirements; `SkillsConfig.project_skills_enabled` (alias `enabled`) + deprecation warning |
+| `web_agent/browser_actions.py` | Rewrite `_do_click_xy` with safety gate + elementFromPoint inspection; new `_inspect_element_at_point` + `_looks_like_destructive_at_point` helpers; new `_DESTRUCTIVE_TEXT_PATTERN` |
+| `web_agent/browser_manager.py` | Three-way dispatch in `start()` (playwright launch / `launch_persistent_context` / `connect_over_cdp` with token verify); `_NoCloseContextProxy` for shared persistent context; `_resolve_user_agent` + `_should_disable_chromium_sandbox` helpers; locale/tz/UA from config |
+| `web_agent/web_fetcher.py` | New `fetch_smart` consolidating binary-vs-HTML routing |
+| `web_agent/agent.py` | `fetch_and_extract` and `search_and_extract` (URL branch) call `fetch_smart` instead of duplicating routing |
+| `web_agent/recipes.py` | `search_and_open_best_result` and `web_research` call `fetch_smart` |
+| `web_agent/mcp_server.py` | Import-time guard on `mcp` package; docstring categories instead of hardcoded count |
+| `web_agent/domain_skills.py` | Reads `config.skills.project_skills_enabled` (was `.enabled`) |
+| `pyproject.toml` | `mcp[cli]` moved to `[project.optional-dependencies] mcp`; kept in `dev` for tests |
+| `tests/test_v166_coord_click.py`, `tests/test_v166_isolation.py`, `tests/test_v167_domain_skills.py`, `tests/test_v168_remote_cdp.py`, `tests/test_v168_diagnostics_config.py` | Updated to match v1.6.9 behavior (token + profile_dir on positive remote_cdp paths; persistent_context dispatch for named profiles; `--no-sandbox` no longer asserted unconditionally; `project_skills_enabled` instead of `enabled`) |
+| `tests/test_agent.py` | New integration test class `TestV169NamedProfilePersistence` for cookie/localStorage round-trip |
+| `CHANGELOG.md`, `README.md`, `AGENTS.md`, `SECURITY.md` | v1.6.9 documentation refresh |
+
+### Backward-compatibility summary
+
+* **Behavior-preserving defaults**: locale / timezone_id / user_agent
+  defaults match v1.6.8 exactly. `allow_coordinate_clicks=True`
+  preserves existing `click_xy` callers UNLESS they also have
+  `allow_form_submit=False` (in which case they get the new inspection
+  check, which is the intent).
+* **Deprecated**: `SkillsConfig.enabled` still works via alias but
+  emits `DeprecationWarning`. Will be removed in v1.7.0.
+* **Intentional break**: v1.6.8 `remote_cdp` configs without a token
+  will now fail validation -- the v1.6.8 behavior was unsafe.
+* **Behavior change**: `--no-sandbox` is no longer passed locally by
+  default. CI keeps working (auto-detect). Local users wanting it set
+  `disable_chromium_sandbox=True`.
+* **One-time install action**: MCP server users must reinstall with
+  `pip install "web-agent-toolkit[mcp]"`.
+
+### Foot-gun callouts
+
+* **Named-profile shared context**: under v1.6.9, all sessions on a
+  named profile share the *single* persistent `BrowserContext`. This
+  is a Playwright limitation: `launch_persistent_context` returns one
+  context that owns the profile, and additional `new_context()` calls
+  produce incognito contexts that do not see the profile. The new
+  `_NoCloseContextProxy` makes this transparent at the API surface
+  but means popups / dialogs from one session are observable by all
+  sessions sharing the profile. Use ephemeral profiles for
+  isolation-per-session.
+* **`--no-sandbox` flip**: containers without `/.dockerenv` (e.g. some
+  Kubernetes runtimes) and CI providers other than GHA need to set
+  `disable_chromium_sandbox=True` explicitly. Otherwise Chromium may
+  fail to start with a `Failed to move to new namespace` error.
+* **Ownership token + named profiles**: each `Agent.start()` overwrites
+  the token under a named profile. Spinning up two sibling
+  `remote_cdp` agents against the same named profile requires reading
+  the token AFTER the launcher starts (not before).
+
 ## [1.6.8] - 2026-05-17
 
 ### Diagnostics and Advanced Browser Intelligence (6 features)

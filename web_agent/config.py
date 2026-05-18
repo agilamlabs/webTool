@@ -25,7 +25,7 @@ from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -156,6 +156,60 @@ class BrowserConfig(BaseSettings):
             "profile dir is removed on Agent exit. No-op for named profiles."
         ),
     )
+    # --- v1.6.9: deterministic browser identity ---
+    # Prior to v1.6.9 these were hardcoded in BrowserManager._build_context.
+    # Defaults preserve the v1.6.8 behaviour (en-US / America/New_York /
+    # random UA per context). Override for reproducible agents, locale-
+    # specific testing, or to pin a stable User-Agent across runs.
+    locale: str = Field(
+        default="en-US",
+        description=(
+            "v1.6.9: browser locale string passed to "
+            "``browser.new_context(locale=...)``. Default matches v1.6.8 "
+            "(``en-US``)."
+        ),
+    )
+    timezone_id: str = Field(
+        default="America/New_York",
+        description=(
+            "v1.6.9: IANA timezone id passed to "
+            "``browser.new_context(timezone_id=...)``. Default matches "
+            "v1.6.8 (``America/New_York``). Set to ``UTC`` for "
+            "reproducible agents."
+        ),
+    )
+    user_agent_mode: Literal["random", "explicit", "playwright_default"] = Field(
+        default="random",
+        description=(
+            "v1.6.9: how to populate ``new_context(user_agent=...)``. "
+            "``random`` (default) picks one per context via the v1.6.x "
+            "rotation pool. ``explicit`` uses ``user_agent`` (required). "
+            "``playwright_default`` passes ``None`` so Playwright uses "
+            "its bundled UA."
+        ),
+    )
+    user_agent: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.6.9: explicit User-Agent string. Required when "
+            "``user_agent_mode='explicit'``; ignored otherwise."
+        ),
+    )
+    # --- v1.6.9: sandbox auto-detect ---
+    disable_chromium_sandbox: Optional[bool] = Field(
+        default=None,
+        description=(
+            "v1.6.9: pass ``--no-sandbox`` to Chromium. ``None`` (default) "
+            "auto-detects: enabled when running in CI (``CI=true`` or "
+            "``GITHUB_ACTIONS=true``) or inside a container "
+            "(``/.dockerenv`` exists). ``True`` always passes it. "
+            "``False`` never passes it. Local dev keeps the sandbox "
+            "enabled by default -- a deliberate hardening since the "
+            "sandbox provides per-tab isolation against renderer "
+            "exploits. Set ``True`` explicitly when running without "
+            "kernel namespaces (Docker without --privileged, WSL, etc.)."
+        ),
+    )
 
     # --- v1.6.6: CDP attach to webTool-launched browser -----------------
     # v1.6.8 widened the Literal to include ``"remote_cdp"`` -- existing
@@ -180,6 +234,32 @@ class BrowserConfig(BaseSettings):
             "``ws://127.0.0.1:9222/devtools/browser/<uuid>``. Must be a "
             "loopback address -- non-loopback URLs are rejected as a "
             "security foot-gun (same rule as ``cdp_host``)."
+        ),
+    )
+    # --- v1.6.9: remote_cdp ownership proof -----------------------------
+    # Loopback alone does not prove the target browser was launched by
+    # webTool -- a user's personal Chrome can run on loopback too.
+    # ``remote_cdp`` now requires the caller to present a token that
+    # matches a file webTool wrote into the launcher's profile_dir.
+    remote_cdp_ownership_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.6.9: hex token matching ``<remote_cdp_profile_dir>/.webtool-ownership``. "
+            "Required when ``backend='remote_cdp'``. webTool writes this "
+            "file when it launches a browser with ``isolation_mode=True``; "
+            "remote callers read it back via "
+            "``OwnershipToken.read(profile_dir)`` and pass it here. "
+            "Loopback alone is insufficient -- a user's personal Chrome "
+            "can run on loopback too."
+        ),
+    )
+    remote_cdp_profile_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.6.9: profile directory where the ownership token file "
+            "lives. For loopback ``remote_cdp`` (the common case) this "
+            "is the same path the launching Agent used. Required when "
+            "``backend='remote_cdp'``."
         ),
     )
     cdp_enabled: bool = Field(
@@ -226,6 +306,19 @@ class BrowserConfig(BaseSettings):
             "only available against webTool-launched browsers."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_user_agent_mode(self) -> BrowserConfig:
+        """v1.6.9: ``user_agent_mode='explicit'`` requires ``user_agent``."""
+        from .exceptions import ConfigError
+
+        if self.user_agent_mode == "explicit" and not self.user_agent:
+            raise ConfigError(
+                "BrowserConfig.user_agent_mode='explicit' requires user_agent "
+                "to be set to a non-empty string. Use 'random' or "
+                "'playwright_default' to avoid pinning a specific UA."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_isolation_and_cdp(self) -> BrowserConfig:
@@ -312,6 +405,26 @@ class BrowserConfig(BaseSettings):
                     "cdp_enabled=True. cdp_enabled triggers a launch flow with "
                     "DevToolsActivePort discovery; remote_cdp connects to an "
                     "already-running browser instead."
+                )
+            # v1.6.9: loopback alone does not prove ownership -- a user's
+            # personal Chrome on 127.0.0.1:9222 looks identical to a
+            # webTool-launched browser. Require the caller to present a
+            # token matching a file webTool wrote into the launcher's
+            # profile dir. Checked AFTER URL/scheme/loopback/isolation
+            # checks so structural issues surface first.
+            if not self.remote_cdp_ownership_token:
+                raise ConfigError(
+                    "BrowserConfig.backend='remote_cdp' requires "
+                    "remote_cdp_ownership_token (v1.6.9). Read it from "
+                    "<profile_dir>/.webtool-ownership of the webTool-launched "
+                    "browser you want to attach to. See "
+                    "web_agent.ownership.OwnershipToken.read."
+                )
+            if not self.remote_cdp_profile_dir:
+                raise ConfigError(
+                    "BrowserConfig.backend='remote_cdp' requires "
+                    "remote_cdp_profile_dir (v1.6.9) so the ownership "
+                    "token can be verified against the on-disk file."
                 )
         elif self.remote_cdp_url is not None:
             # User set remote_cdp_url without flipping backend -- surface
@@ -523,6 +636,12 @@ class SafetyConfig(BaseSettings):
     allow_downloads: bool = True
     allow_form_submit: bool = True
     block_private_ips: bool = True
+    # v1.6.9: coordinate-click safety. Default True (CLICK_XY allowed).
+    # When safe_mode=True or this is explicitly False, click_xy is
+    # rejected outright. When True with allow_form_submit=False,
+    # click_xy runs document.elementFromPoint(x, y) to inspect the
+    # target and blocks clicks on submit/login/delete/pay controls.
+    allow_coordinate_clicks: bool = True
     # v1.6.7: upload-file safety. By default, ``UploadFileInput`` / the
     # top-level ``Agent.upload_file`` accepts only paths under
     # ``download.download_dir``. Without this fence, a prompt-injection
@@ -585,6 +704,7 @@ class SafetyConfig(BaseSettings):
             self.allow_js_evaluation = False
             self.allow_downloads = False
             self.allow_form_submit = False
+            self.allow_coordinate_clicks = False
         return self
 
 
@@ -653,19 +773,44 @@ class SkillsConfig(BaseSettings):
     ``Agent.apply_domain_skill``. User markdown skills are
     informational only unless the workspace mode allows adjacent
     Python helpers.
+
+    v1.6.9: ``enabled`` is **deprecated**. It only ever governed the
+    project-tier load (not workspace or builtin), so the new canonical
+    name is ``project_skills_enabled``. The old ``enabled`` alias keeps
+    working via ``AliasChoices`` for one release and will be removed in
+    v1.7.0; using it now emits a ``DeprecationWarning``.
     """
 
-    enabled: bool = Field(
+    project_skills_enabled: bool = Field(
         default=False,
+        validation_alias=AliasChoices("project_skills_enabled", "enabled"),
         description=(
-            "Master switch for the *project-tier* skill load -- when "
-            "False, ``skill_dirs`` are not scanned. Workspace and bundled "
-            "skills are governed by ``workspace.enabled`` and "
+            "v1.6.9: master switch for the *project-tier* skill load -- "
+            "when False, ``skill_dirs`` are not scanned. Workspace and "
+            "bundled skills are governed by ``workspace.enabled`` and "
             "``builtin_skills_enabled`` respectively, so "
             "``Agent.get_domain_skills`` can still return entries from "
-            "those tiers when this flag is False."
+            "those tiers when this flag is False. Old name ``enabled`` "
+            "is accepted as a deprecated alias for one release."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _warn_deprecated_enabled(cls, data: Any) -> Any:
+        """v1.6.9: emit DeprecationWarning when the old name is used."""
+        if isinstance(data, dict) and "enabled" in data and "project_skills_enabled" not in data:
+            import warnings
+
+            warnings.warn(
+                "SkillsConfig.enabled is deprecated in v1.6.9; use "
+                "project_skills_enabled instead. The alias will be "
+                "removed in v1.7.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return data
+
     skill_dirs: list[str] = Field(
         default_factory=lambda: ["./.webtool-skills"],
         description=(
@@ -684,6 +829,13 @@ class SkillsConfig(BaseSettings):
             "audit-only mode where only user-authored skills appear."
         ),
     )
+
+    # v1.6.9 review (I-2): without an explicit env_prefix, a standalone
+    # ``SkillsConfig()`` would pick up a bare ``ENABLED`` env var and
+    # spuriously trigger the v1.6.9 deprecation warning. Scope env-var
+    # lookup to the same WEB_AGENT_SKILLS__ namespace AppConfig already
+    # uses for nesting.
+    model_config = {"env_prefix": "WEB_AGENT_SKILLS__"}
 
 
 class WorkspaceConfig(BaseSettings):

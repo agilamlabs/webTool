@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.8"
+__version__ = "1.6.9"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -120,6 +120,7 @@ from .models import (
     UploadFileInput,
 )
 from .network_collector import NetworkCollector
+from .ownership import OwnershipToken
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
 from .robots import RobotsChecker
@@ -212,6 +213,7 @@ __all__ = [
     "NetworkCollector",
     "NetworkEvent",
     "ObserveResult",
+    "OwnershipToken",
     "PressKeyInput",
     "ResearchResult",
     "ScreenshotResult",

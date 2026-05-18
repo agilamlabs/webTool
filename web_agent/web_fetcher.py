@@ -201,6 +201,46 @@ class WebFetcher:
         # didn't provide one (older test scaffolding).
         self._network_collector = network_collector
 
+    async def fetch_smart(
+        self,
+        url: str,
+        *,
+        session_id: Optional[str] = None,
+        binary_probe: bool = True,
+    ) -> FetchResult:
+        """v1.6.9: single source of truth for binary-vs-HTML routing.
+
+        Resolution order:
+          1. Known download extension (.pdf/.xlsx/.docx/.csv/...) -> :meth:`fetch_binary`.
+          2. ``binary_probe=True`` AND :attr:`SafetyConfig.probe_binary_urls`
+             AND ``classify_url`` reports 'binary' -> :meth:`fetch_binary`.
+          3. Otherwise -> :meth:`fetch` (HTML path).
+
+        Used by :class:`Agent` and :class:`Recipes` so the rules are
+        defined once. Prior to v1.6.9, recipes like
+        ``search_and_open_best_result`` called ``fetch()`` directly,
+        which sent extensionless binary URLs (Content-Type: application/pdf)
+        into the HTML extractor and produced garbage.
+
+        Args:
+            url: The URL to route.
+            session_id: Optional persistent browser session.
+            binary_probe: When True (default), HEAD-probe extensionless
+                URLs to detect binary documents via Content-Type /
+                Content-Disposition. Disable to skip the probe.
+
+        Returns:
+            FetchResult from whichever underlying method handled the URL.
+        """
+        classification = "html"
+        if _is_download_url(url):
+            classification = "binary"
+        elif binary_probe and self._config.safety.probe_binary_urls:
+            classification = await self.classify_url(url, session_id=session_id)
+        if classification == "binary":
+            return await self.fetch_binary(url, session_id=session_id)
+        return await self.fetch(url, session_id=session_id)
+
     async def fetch(
         self,
         url: str,

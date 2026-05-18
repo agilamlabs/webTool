@@ -81,10 +81,14 @@ def test_remote_cdp_url_field_exposed_under_browser_config() -> None:
     assert bc.remote_cdp_url is None
 
 
-def test_backend_literal_widened_to_remote_cdp() -> None:
+def test_backend_literal_widened_to_remote_cdp(tmp_path) -> None:
     # accepted by Pydantic Literal -- no validation error
+    # v1.6.9: also needs ownership_token + profile_dir for backend='remote_cdp'.
     bc = BrowserConfig(
-        backend="remote_cdp", remote_cdp_url="ws://127.0.0.1:9222/devtools/browser/x"
+        backend="remote_cdp",
+        remote_cdp_url="ws://127.0.0.1:9222/devtools/browser/x",
+        remote_cdp_ownership_token="a" * 64,
+        remote_cdp_profile_dir=str(tmp_path),
     )
     assert bc.backend == "remote_cdp"
 

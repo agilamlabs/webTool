@@ -202,7 +202,7 @@ def test_validate_inputs_bool_string_coercion() -> None:
 def test_registry_disabled_when_all_flags_off(tmp_path: Path) -> None:
     cfg = AppConfig(
         base_dir=str(tmp_path),
-        skills=SkillsConfig(enabled=False, builtin_skills_enabled=False),
+        skills=SkillsConfig(project_skills_enabled=False, builtin_skills_enabled=False),
     )
     reg = SkillRegistry(cfg)
     assert reg.list_all() == []
@@ -232,7 +232,7 @@ def test_registry_project_overrides_builtin(tmp_path: Path) -> None:
 
     cfg = AppConfig(
         base_dir=str(tmp_path),
-        skills=SkillsConfig(enabled=True, builtin_skills_enabled=True),
+        skills=SkillsConfig(project_skills_enabled=True, builtin_skills_enabled=True),
     )
     reg = SkillRegistry(cfg)
     s = reg.get("sec.gov", "filing_search")
@@ -312,7 +312,7 @@ async def test_apply_user_markdown_skill_not_runnable_raises(tmp_path: Path) -> 
 
     cfg = AppConfig(
         base_dir=str(tmp_path),
-        skills=SkillsConfig(enabled=True, builtin_skills_enabled=False),
+        skills=SkillsConfig(project_skills_enabled=True, builtin_skills_enabled=False),
     )
     reg = SkillRegistry(cfg)
     fake_agent = MagicMock()
@@ -437,7 +437,7 @@ def test_load_project_with_windows_absolute_skipped_safely(tmp_path: Path) -> No
     cfg = AppConfig(
         base_dir=str(tmp_path),
         skills=SkillsConfig(
-            enabled=True,
+            project_skills_enabled=True,
             builtin_skills_enabled=False,
             skill_dirs=[r"C:\not\a\real\directory\anywhere"],
         ),
