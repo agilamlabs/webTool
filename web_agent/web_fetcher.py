@@ -113,6 +113,28 @@ def is_binary_kind(kind: str) -> bool:
     return kind in _BINARY_KINDS
 
 
+# v1.6.11: subset of :data:`_BINARY_KINDS` that the ContentExtractor can
+# extract text from. ``zip`` and ``binary_other`` are classified binary but
+# yield no text -- the v1.6.10 I-1 guard catches
+# ``extraction_method == "none" AND content_length == 0`` AFTER a fetch;
+# this set lets callers filter BEFORE the fetch (e.g.
+# ``web_research(extract_files=True)`` skips ``.mp4`` / ``.exe`` / ``.iso``
+# / ``.zip`` without ever fetching them).
+EXTRACTABLE_BINARY_KINDS: frozenset[str] = frozenset({"pdf", "xlsx", "docx", "csv"})
+
+
+def is_extractable_binary_kind(kind: str) -> bool:
+    """True iff *kind* is a binary the ContentExtractor handles.
+
+    Use to filter URLs before passing to :meth:`WebFetcher.fetch_smart`
+    when the downstream consumer is the binary extractor (e.g.
+    :meth:`Recipes.web_research` with ``extract_files=True``). Returns
+    False for ``"zip"``, ``"binary_other"``, ``"html"``, and ``"unknown"``.
+    Public-stable as of v1.6.11.
+    """
+    return kind in EXTRACTABLE_BINARY_KINDS
+
+
 # Content-Type prefixes / fragments that mean "this is a binary document".
 # trafilatura/bs4 cannot do anything useful with these — they belong to
 # the binary extraction branch (PDF/XLSX/DOCX/CSV).
@@ -272,7 +294,10 @@ class WebFetcher:
         Resolution order:
           1. Known download extension (.pdf/.xlsx/.docx/.csv/...) -> :meth:`fetch_binary`.
           2. ``binary_probe=True`` AND :attr:`SafetyConfig.probe_binary_urls`
-             AND ``classify_url`` reports 'binary' -> :meth:`fetch_binary`.
+             AND :func:`is_binary_kind` returns True for the ``classify_url``
+             result -> :meth:`fetch_binary`. (v1.6.10: ``classify_url`` returns
+             granular kinds -- ``pdf | xlsx | docx | csv | zip | binary_other``
+             -- and :func:`is_binary_kind` is the public migration helper.)
           3. Otherwise -> :meth:`fetch` (HTML path).
 
         Used by :class:`Agent` and :class:`Recipes` so the rules are

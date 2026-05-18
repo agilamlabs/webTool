@@ -1126,8 +1126,13 @@ class BrowserActions:
         ancestors, returning structural attributes used by
         ``_looks_like_destructive_at_point``. Returns an empty list when
         nothing is hit (point outside the document / over a closed
-        shadow root) or when the evaluation fails -- callers must treat
-        an empty list as 'cannot tell, allow the click'.
+        shadow root) or when the evaluation fails.
+
+        v1.6.10: an empty list is no longer universally "allow" -- when
+        :attr:`SafetyConfig.coordinate_click_unknown_policy` is ``"block"``,
+        the ``_do_click_xy`` caller rejects the click on empty inspection.
+        The fallback "allow" semantics still apply under the default
+        ``"allow"`` policy.
         """
         try:
             result = await page.evaluate(_ELEMENT_FROM_POINT_JS, {"x": x, "y": y})

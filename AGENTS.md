@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.10**
+- Latest version: **1.6.11**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~740 tests on Windows / ~714 + 5 platform-conditional skips on Linux
+python -m pytest -v          # ~744 tests on Windows / ~718 + 5 platform-conditional skips on Linux
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -186,6 +186,54 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.11 added
+
+Follow-up polish on v1.6.10. No new features -- 7 items addressing one
+behavioural issue, one correctness gap, one stale-migration-wording
+bug, plus four polish items.
+
+**Behaviour changes (Items 1-2)**
+- `web_research(extract_files=True)` now filters search results
+  against `EXTRACTABLE_BINARY_KINDS = {"pdf", "xlsx", "docx", "csv"}`
+  BEFORE calling `fetch_smart`. `.mp4` / `.exe` / `.iso` / `.zip` are
+  routed to `download_candidates` with the new
+  `block_reason="not_extractable_kind"`. Pre-v1.6.11 these were
+  fetched as binary and the v1.6.10 I-1 guard caught them post-fetch
+  (wasted bandwidth). The I-1 guard remains as the safety net for
+  HEAD-probed extensionless binaries.
+- `Recipes.find_and_download_file` no longer falls back to "any
+  download-looking URL" when no extension match exists -- v1.6.11
+  removes the prior Fallback 1. A caller asking for
+  `file_types=["pdf"]` over results containing only `.xlsx` URLs now
+  gets `NETWORK_ERROR` instead of the wrong file. **Migration**:
+  widen `file_types` explicitly (e.g. `["pdf", "xlsx", "docx",
+  "csv"]`) to opt back into a multi-kind search.
+
+**New public API**
+- `EXTRACTABLE_BINARY_KINDS: frozenset[str]` -- subset of
+  `_BINARY_KINDS` that the `ContentExtractor` can extract text from.
+- `is_extractable_binary_kind(kind: str) -> bool` -- public-stable
+  predicate for the set above. Re-exported from `web_agent`.
+
+**Docs cleanup**
+- CHANGELOG v1.6.10 migration sentence: `_is_binary_kind` ->
+  `is_binary_kind` (C-2 fix renamed the helper but the migration
+  instruction still referenced the underscore name).
+- `fetch_smart()` and `_inspect_element_at_point()` docstrings
+  refreshed to v1.6.10 semantics (granular kinds and
+  `coordinate_click_unknown_policy="block"` respectively).
+- README replaces the hardcoded "37 tools" MCP count with category
+  wording (drift-proof).
+- SECURITY.md `cdp_host` bullet now aligns with the `remote_cdp_url`
+  bullet's loopback wording (`127.0.0.0/8 / ::1 / localhost`).
+
+**Tests**
+- 4 new unit-level integration tests in
+  `tests/test_agent.py::TestV1611Integration`:
+  `extract_files=True` filter (skip + allow paths), and
+  `find_and_download_file` Fallback 1 removal (rejection + happy
+  path). Mocked `Recipes` -- no Playwright launch.
 
 ## What v1.6.10 added
 

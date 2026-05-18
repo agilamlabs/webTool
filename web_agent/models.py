@@ -291,13 +291,18 @@ class FetchDiagnostic(BaseModel):
         default="unknown",
         description="Search provider that surfaced the URL, or 'direct' for caller-supplied",
     )
+    # NOTE: keep the description value-set in sync with the strings actually
+    # emitted by recipes.py / agent.py / web_fetcher.py. Pydantic does not
+    # enforce a Literal here on purpose -- new sentinels land via review
+    # passes, not a schema migration.
     block_reason: Optional[str] = Field(
         default=None,
         description=(
             "Reason the URL was not extracted, when applicable: "
             "'domain_blocked' | 'robots_disallowed' | 'rate_limited' | "
             "'timeout' | 'http_error' | 'network_error' | "
-            "'download_skipped' | None"
+            "'download_skipped' | 'binary_not_extracted' (v1.6.10) | "
+            "'not_extractable_kind' (v1.6.11) | None"
         ),
     )
     content_length: int = Field(

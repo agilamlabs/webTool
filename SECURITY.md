@@ -115,9 +115,11 @@ attack surface around browser process control:
   launched itself. The rationale: attaching to a user's personal
   Chrome would expose real cookies, history, and logged-in accounts.
 - **CDP bind is loopback-only.** `BrowserConfig.cdp_host` must be a
-  loopback address (`127.0.0.1` / `localhost`); non-loopback values
-  are rejected at validation. The `--remote-debugging-port` is bound
-  to `127.0.0.1` so external network observers can't attach.
+  loopback address. v1.6.10 widened the validator to accept the full
+  `127.0.0.0/8` block plus `::1` and `localhost` via `_is_loopback_host`
+  (aligning with the `remote_cdp_url` check below); non-loopback values
+  are rejected at validation. The `--remote-debugging-port` is bound to
+  the configured host so external network observers can't attach.
 - **CDP requires isolation.** `cdp_enabled=True` requires
   `isolation_mode=True`. The remote-debugging-port discovery reads
   `DevToolsActivePort` from the webTool-owned user-data-dir; without
