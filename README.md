@@ -10,8 +10,49 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.9** — *Hardening patch.* No new features; ten
-> safety + consistency fixes. Headlines:
+> **What's new in 1.6.10** — *Follow-up hardening patch.* No new
+> features; eight items addressing one functional bug plus seven
+> consistency / UX gaps. Headlines:
+>
+> * **`web_research` no longer drops binary results.** The v1.6.9
+>   gate (`not fr.html`) silently logged successful binary
+>   `FetchResult`s from `fetch_smart` (extensionless PDFs, regulator
+>   dashboards, …) as `fetch_failed`. Fixed: now `not (fr.html or
+>   fr.binary)`.
+> * **`web_research(extract_files=False)`** mirrors the existing
+>   `search_and_extract(extract_files=…)` knob. When True, file URLs
+>   are extracted inline via `fetch_smart` instead of routed to
+>   `download_candidates`. Default False preserves v1.6.9 behaviour.
+> * **Richer file classification.** `WebFetcher.classify_url` returns
+>   one of `'pdf' | 'xlsx' | 'docx' | 'csv' | 'zip' | 'binary_other'
+>   | 'html' | 'unknown'` instead of collapsing every binary to
+>   `'binary'`. `find_and_download_file(file_types=["pdf"])` now
+>   rejects extensionless XLSX/ZIP that HEAD-probed as binary. New
+>   `is_binary_kind(c)` helper (`from web_agent import is_binary_kind`)
+>   is the migration target. **Breaking** for direct callers
+>   comparing to the old `"binary"` string.
+> * **`Agent.get_owned_cdp_connection_info()`** returns a structured
+>   `CdpConnectionInfo` (cdp_url, profile_dir, ownership_token) or
+>   `None`. Bundles the three getters a sibling `remote_cdp` Agent
+>   needs. New MCP tool `web_get_owned_cdp_connection_info`.
+> * **`SafetyConfig.coordinate_click_unknown_policy`** (`"allow"` |
+>   `"block"`, default `"allow"`, forced `"block"` in `safe_mode`).
+>   When `"block"`, `click_xy` rejects clicks where `elementFromPoint`
+>   returns no element. Independent of `allow_form_submit` — strict
+>   callers can opt into block-on-unknown without disabling submits.
+> * **`BrowserConfig.cdp_host` uses `_is_loopback_host`** —
+>   accepts `127.0.0.0/8` + `::1` + `localhost`, matching the
+>   `remote_cdp_url` semantics from v1.6.8.
+> * **Named profiles share one `BrowserContext`** (Playwright
+>   limitation, surfaced in README + AGENTS): all `session_id`s on a
+>   named profile share cookies / localStorage. Use
+>   `profile_mode="ephemeral"` for per-session isolation.
+>
+> See [CHANGELOG.md](CHANGELOG.md#1610---2026-05-18) for the full
+> list and the migration note for the `classify_url` enum change.
+>
+> **v1.6.9** — *Hardening patch.* No new features; ten safety +
+> consistency fixes. Headlines:
 >
 > * **`click_xy` no longer bypasses safety.** New
 >   `SafetyConfig.allow_coordinate_clicks` (default True, forced False
