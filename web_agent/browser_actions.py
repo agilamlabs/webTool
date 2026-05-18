@@ -1181,10 +1181,15 @@ class BrowserActions:
           * When ``allow_form_submit=False``, runs
             ``document.elementFromPoint`` to inspect the target stack and
             blocks the click if it looks like a submit/login/destructive
-            control. Empty / failed inspection allows the click (cannot
-            tell -> default permissive, matches the selector path which
-            also defaults permissive when ``_looks_like_submit`` returns
-            False).
+            control.
+
+        v1.6.10 addition:
+          * Honors ``safety.coordinate_click_unknown_policy``. When the
+            policy is "block" AND elementFromPoint returned an empty list
+            (point outside any element / inspection raised), the click is
+            rejected. The v1.6.9 default ("allow") keeps the permissive
+            behaviour so existing callers are unaffected. ``safe_mode``
+            forces "block" via ``_apply_safe_mode``.
         """
         safety = self._config.safety
         if not safety.allow_coordinate_clicks:
@@ -1195,9 +1200,17 @@ class BrowserActions:
                 status=ActionStatus.FAILED,
                 error_message=f"Coordinate clicks are disabled by safety config ({reason}).",
             )
-        if not safety.allow_form_submit:
+        # v1.6.10 review C-1 fix: the destructive-check and the
+        # unknown-policy check are independent. Either being active
+        # requires elementFromPoint inspection. Prior to this fix the
+        # whole block was gated by ``not allow_form_submit``, which
+        # made ``coordinate_click_unknown_policy='block'`` unreachable
+        # whenever a caller kept the default ``allow_form_submit=True``.
+        needs_destructive_check = not safety.allow_form_submit
+        needs_unknown_check = safety.coordinate_click_unknown_policy == "block"
+        if needs_destructive_check or needs_unknown_check:
             elements = await self._inspect_element_at_point(page, action.x, action.y)
-            if self._looks_like_destructive_at_point(elements):
+            if needs_destructive_check and self._looks_like_destructive_at_point(elements):
                 top = elements[0] if elements else None
                 logger.info(
                     "click_xy blocked: target at ({x}, {y}) looks destructive: {top}",
@@ -1211,6 +1224,28 @@ class BrowserActions:
                     error_message=(
                         "Coordinate click blocked: target looks like a submit/destructive "
                         f"control (allow_form_submit=False). Inspected top element: {top!r}"
+                    ),
+                )
+            # Unknown-policy gate. ``_inspect_element_at_point`` already
+            # swallows exceptions and returns [], so this single check
+            # covers both "point outside any element" and "JS evaluate
+            # raised". Fires regardless of ``allow_form_submit``:
+            # callers running with form submits ALLOWED can still opt
+            # into "block-on-unknown" by setting the policy to "block".
+            if needs_unknown_check and not elements:
+                logger.info(
+                    "click_xy blocked: elementFromPoint at ({x}, {y}) returned "
+                    "no target (coordinate_click_unknown_policy='block')",
+                    x=action.x,
+                    y=action.y,
+                )
+                return ActionResult(
+                    action=ActionType.CLICK_XY,
+                    status=ActionStatus.FAILED,
+                    error_message=(
+                        "Coordinate click blocked: target unknown "
+                        "(empty elementFromPoint result; "
+                        "coordinate_click_unknown_policy='block')."
                     ),
                 )
         await page.mouse.click(

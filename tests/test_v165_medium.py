@@ -168,8 +168,9 @@ async def test_find_and_download_file_recovers_extensionless_pdf(tmp_path):
             ],
         )
     )
-    # classify_url says "binary" for the extensionless URL
-    agent._fetcher.classify_url = AsyncMock(return_value="binary")
+    # v1.6.10: classify_url returns granular kinds; "pdf" satisfies
+    # find_and_download_file's filter for file_types=["pdf"].
+    agent._fetcher.classify_url = AsyncMock(return_value="pdf")
     # Downloader is mocked to assert that we got the extensionless URL
     agent._downloader.download = AsyncMock(
         return_value=DownloadResult(

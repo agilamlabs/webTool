@@ -65,6 +65,7 @@ from .models import (
     ActionResult,
     ActionSequenceResult,
     AgentResult,
+    CdpConnectionInfo,
     ClickXYInput,
     DoctorReport,
     DomainSkill,
@@ -94,7 +95,7 @@ from .robots import RobotsChecker
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
-from .web_fetcher import WebFetcher, _url_ext_classification
+from .web_fetcher import WebFetcher, _url_ext_classification, is_binary_kind
 
 
 def _query_is_url(query: str) -> bool:
@@ -539,7 +540,7 @@ class Agent:
                     )
                     continue
                 ext_class = _url_ext_classification(r.url)
-                if ext_class == "binary":
+                if is_binary_kind(ext_class):
                     file_items.append(r)
                 elif ext_class == "html":
                     page_items.append(r)
@@ -562,7 +563,7 @@ class Agent:
                     if isinstance(classification, BaseException):
                         # Probe failure -> default to HTML, will be caught downstream
                         page_items.append(item)
-                    elif classification == "binary":
+                    elif is_binary_kind(classification):
                         file_items.append(item)
                     else:
                         # 'html' or 'unknown' -> treat as HTML
@@ -1113,6 +1114,30 @@ class Agent:
         """
         return self._bm.get_cdp_endpoint()
 
+    def get_owned_cdp_connection_info(self) -> CdpConnectionInfo | None:
+        """v1.6.10: return the full CDP attach bundle, or None.
+
+        Bundles the three values a co-resident ``remote_cdp`` Agent
+        needs (cdp_url, profile_dir, ownership_token) so callers don't
+        have to discover the corresponding ``BrowserManager`` getters
+        separately. Returns ``None`` unless all three are available --
+        that is, the Agent is a started, isolated, ``cdp_owned`` launch.
+
+        Use :meth:`get_cdp_endpoint` if you only need the WS URL (for
+        external chrome://inspect tools, which don't require the
+        ownership token).
+        """
+        url = self._bm.get_cdp_endpoint()
+        profile = self._bm.get_effective_profile_dir()
+        token = self._bm.get_ownership_token()
+        if url is None or profile is None or token is None:
+            return None
+        return CdpConnectionInfo(
+            cdp_url=url,
+            profile_dir=str(profile),
+            ownership_token=token,
+        )
+
     # ------------------------------------------------------------------
     # v1.6.6 Doctor (Feature 6)
     # ------------------------------------------------------------------
@@ -1492,6 +1517,7 @@ class Agent:
         session_id: Optional[str] = None,
         prefer_domains: Optional[list[str]] = None,
         domain_profile: Optional[str] = None,
+        extract_files: bool = False,
     ) -> ResearchResult:
         """Recipe: search + parallel fetch + extract top N pages, return citations.
 
@@ -1500,10 +1526,20 @@ class Agent:
                 results receive a strong ranking bonus.
             domain_profile: Optional named ranking profile -- one of
                 ``"official_sources" | "docs" | "research" | "news" | "files"``.
+            extract_files: v1.6.10. When True, file URLs (PDF/XLSX/...)
+                are extracted inline through ``fetch_smart`` instead of
+                being routed to ``download_candidates``. Default False
+                preserves the v1.6.9 read-pages-only behaviour. Mirrors
+                :meth:`search_and_extract` ``extract_files``.
         """
         async with self._call_scope(
             "web_research",
-            {"query": query, "depth": depth, "max_pages": max_pages},
+            {
+                "query": query,
+                "depth": depth,
+                "max_pages": max_pages,
+                "extract_files": extract_files,
+            },
         ) as cid:
             self._debug.reset()
             result = await self._recipes.web_research(
@@ -1513,6 +1549,7 @@ class Agent:
                 session_id,
                 prefer_domains=prefer_domains,
                 domain_profile=domain_profile,
+                extract_files=extract_files,
             )
             result.correlation_id = cid
             return result

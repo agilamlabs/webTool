@@ -144,8 +144,8 @@ attack surface around browser process control:
   check both happen BEFORE any CDP connection is opened. This makes
   it impossible to "stumble into" a foreign loopback browser by
   guessing a port.
-- **Coordinate-click form-submit safety (v1.6.9).** Prior to v1.6.9,
-  `Agent.click_xy(x, y)` logged a warning under `safe_mode` and
+- **Coordinate-click form-submit safety (v1.6.9 + v1.6.10).** Prior to
+  v1.6.9, `Agent.click_xy(x, y)` logged a warning under `safe_mode` and
   clicked anyway -- there was no element to inspect. v1.6.9 adds
   `SafetyConfig.allow_coordinate_clicks` (default True, **forced
   False** in `safe_mode`) plus a `document.elementFromPoint(x, y)`
@@ -153,7 +153,14 @@ attack surface around browser process control:
   submit / login / register / delete / pay / accept / consent
   controls when `allow_form_submit=False`. This closes the
   prompt-injection vector where an attacker tricks the agent into
-  using coord clicks to bypass the selector-path heuristic.
+  using coord clicks to bypass the selector-path heuristic. v1.6.10
+  adds `SafetyConfig.coordinate_click_unknown_policy` (`"allow"` |
+  `"block"`, default `"allow"`, **forced `"block"`** in `safe_mode`):
+  when `"block"`, an empty / failed `elementFromPoint` inspection
+  rejects the click instead of allowing it. Strict callers running
+  with `allow_coordinate_clicks=True` AND `allow_form_submit=False`
+  can opt into "unknown == hostile" semantics without the broader
+  `safe_mode` clamp.
 
 ### Workspace + diagnostic data (v1.6.7 / v1.6.8)
 

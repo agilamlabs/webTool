@@ -95,6 +95,24 @@ def _is_download_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DOWNLOAD_EXTENSIONS)
 
 
+# v1.6.10: the granular classification kinds returned by
+# :func:`_url_ext_classification` and :meth:`WebFetcher.classify_url`.
+# Callers route on these via :func:`is_binary_kind` instead of comparing
+# against the literal string ``"binary"`` (the v1.6.9 return value).
+# Migration: ``c == "binary"`` -> ``is_binary_kind(c)``.
+_BINARY_KINDS: frozenset[str] = frozenset({"pdf", "xlsx", "docx", "csv", "zip", "binary_other"})
+
+
+def is_binary_kind(kind: str) -> bool:
+    """True iff *kind* is any non-HTML binary classification.
+
+    Used by :meth:`WebFetcher.fetch_smart`, :meth:`Recipes.find_and_download_file`,
+    and :meth:`Agent.search_and_extract` to route URLs through
+    :meth:`fetch_binary` vs :meth:`fetch`. Public-stable as of v1.6.10.
+    """
+    return kind in _BINARY_KINDS
+
+
 # Content-Type prefixes / fragments that mean "this is a binary document".
 # trafilatura/bs4 cannot do anything useful with these — they belong to
 # the binary extraction branch (PDF/XLSX/DOCX/CSV).
@@ -151,17 +169,58 @@ _HTML_EXTENSIONS = frozenset(
 )
 
 
+# v1.6.10: map known document extensions to granular kinds. Anything in
+# ``_DOWNLOAD_EXTENSIONS`` that is not in this dict (mp3/mp4/exe/iso/...)
+# falls through to ``"binary_other"`` via the catch-all in
+# :func:`_url_ext_classification`. Keep the keys in sync with
+# ``_OFFICE_AND_ARCHIVE_EXTENSIONS`` above.
+_EXT_TO_KIND: dict[str, str] = {
+    ".pdf": "pdf",
+    ".doc": "docx",
+    ".docx": "docx",
+    ".xls": "xlsx",
+    ".xlsx": "xlsx",
+    ".csv": "csv",
+    ".tsv": "csv",
+    ".zip": "zip",
+    ".tar": "zip",
+    ".gz": "zip",
+    ".rar": "zip",
+    ".7z": "zip",
+}
+
+
+# v1.6.10: map Content-Type prefixes to granular kinds. Content types not
+# in this dict but matching ``_BINARY_CONTENT_TYPE_HINTS`` (PPTX, generic
+# octet-stream, ...) collapse to ``"binary_other"`` so the routing layer
+# still hits :meth:`fetch_binary` while the extractor stays free to do
+# nothing with them.
+_CT_TO_KIND: dict[str, str] = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml": "xlsx",
+    "application/vnd.ms-excel": "xlsx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml": "docx",
+    "application/msword": "docx",
+    "text/csv": "csv",
+    "text/tab-separated-values": "csv",
+}
+
+
 def _url_ext_classification(url: str) -> str:
     """Classify a URL by its extension alone, without any network I/O.
 
-    Returns ``'binary'`` for known download extensions (PDF/XLSX/etc.),
-    ``'html'`` for known HTML extensions (.html/.aspx/etc.), and
-    ``'unknown'`` for everything else (including extensionless URLs).
-    Used as the fast pre-filter before HEAD probing.
+    v1.6.10: returns one of ``'pdf' | 'xlsx' | 'docx' | 'csv' | 'zip' |
+    'binary_other' | 'html' | 'unknown'``. Callers route via
+    :func:`is_binary_kind` rather than comparing to a single ``"binary"``
+    string (the v1.6.9 return). Used as the fast pre-filter before HEAD
+    probing.
     """
     path = urlparse(url).path.lower()
+    for ext, kind in _EXT_TO_KIND.items():
+        if path.endswith(ext):
+            return kind
     if any(path.endswith(ext) for ext in _DOWNLOAD_EXTENSIONS):
-        return "binary"
+        return "binary_other"
     if any(path.endswith(ext) for ext in _HTML_EXTENSIONS):
         return "html"
     return "unknown"
@@ -232,12 +291,16 @@ class WebFetcher:
         Returns:
             FetchResult from whichever underlying method handled the URL.
         """
+        # v1.6.10: classification is now one of the granular kinds
+        # ({pdf, xlsx, docx, csv, zip, binary_other, html, unknown}) so
+        # the routing check goes through ``is_binary_kind`` instead of
+        # comparing to the v1.6.9 single string ``"binary"``.
         classification = "html"
         if _is_download_url(url):
-            classification = "binary"
+            classification = _url_ext_classification(url)
         elif binary_probe and self._config.safety.probe_binary_urls:
             classification = await self.classify_url(url, session_id=session_id)
-        if classification == "binary":
+        if is_binary_kind(classification):
             return await self.fetch_binary(url, session_id=session_id)
         return await self.fetch(url, session_id=session_id)
 
@@ -549,10 +612,14 @@ class WebFetcher:
         *,
         session_id: Optional[str] = None,
     ) -> str:
-        """Return ``'binary' | 'html' | 'unknown'`` for a URL.
+        """Return a granular classification kind for a URL.
 
-        Cheap classification used by :meth:`Agent.fetch_and_extract` to
-        decide whether to route to :meth:`fetch_binary` or :meth:`fetch`.
+        v1.6.10: returns one of ``'pdf' | 'xlsx' | 'docx' | 'csv' | 'zip'
+        | 'binary_other' | 'html' | 'unknown'``. Callers route via
+        :func:`is_binary_kind` instead of comparing to a single
+        ``"binary"`` string (the v1.6.9 return type). Used by
+        :meth:`fetch_smart` and :meth:`Recipes.find_and_download_file`
+        for binary-vs-HTML and file-type filtering.
 
         Resolution order:
           1. URL extension matches a known download/HTML pattern -> direct answer
@@ -613,9 +680,17 @@ class WebFetcher:
                     return "unknown"
                 ct = resp.headers.get("content-type")
                 disp = resp.headers.get("content-disposition")
+                # v1.6.10: map Content-Type to a granular kind first so
+                # callers can filter by file_types. Anything binary that
+                # doesn't match a known mapping collapses to
+                # 'binary_other' (still routed through fetch_binary).
+                ct_norm = (ct or "").lower().split(";", 1)[0].strip()
+                for prefix, kind in _CT_TO_KIND.items():
+                    if ct_norm.startswith(prefix):
+                        return kind
                 if _content_type_is_binary(ct) or _disposition_is_attachment(disp):
-                    return "binary"
-                if ct and ct.lower().startswith(("text/html", "application/xhtml")):
+                    return "binary_other"
+                if ct_norm.startswith(("text/html", "application/xhtml")):
                     return "html"
                 return "unknown"
         except Exception as exc:

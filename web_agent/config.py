@@ -341,12 +341,16 @@ class BrowserConfig(BaseSettings):
                 "Either set cdp_enabled=True or switch backend to 'playwright'."
             )
 
-        if self.cdp_enabled and self.cdp_host not in {"127.0.0.1", "localhost"}:
+        # v1.6.10: use the same loopback predicate as ``remote_cdp_url``
+        # so 127.0.0.0/8 and ::1 are accepted (mirrors the v1.6.8 C-3 fix
+        # that widened the remote_cdp loopback check beyond the literal
+        # {127.0.0.1, localhost} set).
+        if self.cdp_enabled and not _is_loopback_host(self.cdp_host):
             raise ConfigError(
                 f"BrowserConfig.cdp_host={self.cdp_host!r} is not a loopback "
                 "address. Binding the Chrome DevTools Protocol port to a "
                 "non-loopback interface would expose browser control to the "
-                "network. Use '127.0.0.1' or 'localhost'."
+                "network. Accepted: 127.0.0.0/8, ::1, localhost."
             )
 
         if self.cdp_enabled and not self.isolation_mode:
@@ -642,6 +646,25 @@ class SafetyConfig(BaseSettings):
     # click_xy runs document.elementFromPoint(x, y) to inspect the
     # target and blocks clicks on submit/login/delete/pay controls.
     allow_coordinate_clicks: bool = True
+    # v1.6.10: policy when click_xy's elementFromPoint inspection
+    # returns [] (point lies outside any element) OR raises. "allow"
+    # (default) clicks anyway -- matches the v1.6.9 permissive default
+    # so existing callers see no behaviour change. "block" rejects --
+    # right for strict callers who want "unknown == hostile".
+    # Fires independently of ``allow_form_submit`` (review C-1 fix):
+    # a caller running with form submits ALLOWED can still opt into
+    # block-on-unknown by setting this knob to "block". safe_mode
+    # forces "block" via ``_apply_safe_mode``.
+    coordinate_click_unknown_policy: Literal["allow", "block"] = Field(
+        default="allow",
+        description=(
+            "Click_xy policy when elementFromPoint inspection returns "
+            "no element (point outside any element / JS error). 'allow' "
+            "(default) lets the click proceed; 'block' rejects. Forced "
+            "'block' in safe_mode. Independent of allow_form_submit -- "
+            "fires whenever allow_coordinate_clicks=True."
+        ),
+    )
     # v1.6.7: upload-file safety. By default, ``UploadFileInput`` / the
     # top-level ``Agent.upload_file`` accepts only paths under
     # ``download.download_dir``. Without this fence, a prompt-injection
@@ -705,6 +728,11 @@ class SafetyConfig(BaseSettings):
             self.allow_downloads = False
             self.allow_form_submit = False
             self.allow_coordinate_clicks = False
+            # v1.6.10: also pin the unknown-policy. Defensive only --
+            # allow_coordinate_clicks=False already blocks click_xy --
+            # but a caller mutating allow_coordinate_clicks back to True
+            # at runtime should not silently revert to "allow".
+            self.coordinate_click_unknown_policy = "block"
         return self
 
 

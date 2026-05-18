@@ -114,8 +114,8 @@ async def test_extensionless_pdf_routes_to_fetch_binary():
     agent = Agent(config)
 
     # Mock both fetch and fetch_binary on the fetcher; mock classify_url
-    # to return 'binary' (the real probe would do HEAD).
-    agent._fetcher.classify_url = AsyncMock(return_value="binary")
+    # to return a v1.6.10 granular binary kind (the real probe would do HEAD).
+    agent._fetcher.classify_url = AsyncMock(return_value="pdf")
     agent._fetcher.fetch_binary = AsyncMock(
         return_value=FetchResult(
             url="https://x.com/download/123",
