@@ -650,20 +650,19 @@ class SafetyConfig(BaseSettings):
     # returns [] (point lies outside any element) OR raises. "allow"
     # (default) clicks anyway -- matches the v1.6.9 permissive default
     # so existing callers see no behaviour change. "block" rejects --
-    # right for strict callers running with allow_coordinate_clicks=True
-    # AND allow_form_submit=False who want "unknown == hostile". In
-    # safe_mode this knob is moot (allow_coordinate_clicks is already
-    # False so click_xy short-circuits before reaching the policy), but
-    # _apply_safe_mode forces it to "block" defensively in case a
-    # caller toggles allow_coordinate_clicks back on at runtime.
+    # right for strict callers who want "unknown == hostile".
+    # Fires independently of ``allow_form_submit`` (review C-1 fix):
+    # a caller running with form submits ALLOWED can still opt into
+    # block-on-unknown by setting this knob to "block". safe_mode
+    # forces "block" via ``_apply_safe_mode``.
     coordinate_click_unknown_policy: Literal["allow", "block"] = Field(
         default="allow",
         description=(
             "Click_xy policy when elementFromPoint inspection returns "
             "no element (point outside any element / JS error). 'allow' "
             "(default) lets the click proceed; 'block' rejects. Forced "
-            "'block' in safe_mode. Only relevant when "
-            "allow_coordinate_clicks=True AND allow_form_submit=False."
+            "'block' in safe_mode. Independent of allow_form_submit -- "
+            "fires whenever allow_coordinate_clicks=True."
         ),
     )
     # v1.6.7: upload-file safety. By default, ``UploadFileInput`` / the

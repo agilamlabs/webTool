@@ -40,7 +40,7 @@ from .models import (
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
-from .web_fetcher import WebFetcher, _is_binary_kind, _is_download_url
+from .web_fetcher import WebFetcher, _is_download_url, is_binary_kind
 
 # Domains that get a small relevance bonus in the default ranker
 _WELL_KNOWN_DOMAINS = (
@@ -424,7 +424,7 @@ class Recipes:
                 if self._url_extension(r.url):
                     continue  # already considered in Tier 1/2
                 classification = await self._fetcher.classify_url(r.url, session_id=session_id)
-                if not _is_binary_kind(classification):
+                if not is_binary_kind(classification):
                     continue
                 # Match the detected kind against requested ``file_types``.
                 # ``binary_other`` is opaque (HEAD said attachment but we
@@ -642,6 +642,43 @@ class Recipes:
 
             extracted = self._extractor.extract(fr)
             extracted.correlation_id = get_correlation_id()
+
+            # v1.6.10 review I-1 fix: a binary FetchResult of an
+            # unrecognized kind (PPTX, ZIP, octet-stream) makes
+            # ``ContentExtractor.extract`` return
+            # ``extraction_method='none' / content_length=0``. Without
+            # this guard we'd silently append a contentless Citation
+            # and pass the budget check (0 chars). Surface a
+            # diagnostic + skip instead so the caller can see why an
+            # otherwise-successful fetch produced no content.
+            if (
+                fr.binary is not None
+                and extracted.extraction_method == "none"
+                and extracted.content_length == 0
+            ):
+                bag.warn(
+                    "binary_not_extracted",
+                    (
+                        f"Binary fetch succeeded but no extractor recognized "
+                        f"the content ({fr.content_type or 'no content-type'}): "
+                        f"{item.url}"
+                    ),
+                    url=item.url,
+                )
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=item.url,
+                        final_url=fr.final_url,
+                        status=fr.status,
+                        status_code=fr.status_code,
+                        provider=item.provider,
+                        block_reason="binary_not_extracted",
+                        content_length=0,
+                        response_time_ms=fr.response_time_ms,
+                        from_cache=fr.from_cache,
+                    )
+                )
+                continue
 
             try:
                 budget.add_chars(extracted.content_length)

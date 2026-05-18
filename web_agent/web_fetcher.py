@@ -97,13 +97,13 @@ def _is_download_url(url: str) -> bool:
 
 # v1.6.10: the granular classification kinds returned by
 # :func:`_url_ext_classification` and :meth:`WebFetcher.classify_url`.
-# Callers route on these via :func:`_is_binary_kind` instead of comparing
+# Callers route on these via :func:`is_binary_kind` instead of comparing
 # against the literal string ``"binary"`` (the v1.6.9 return value).
-# Migration: ``c == "binary"`` -> ``_is_binary_kind(c)``.
+# Migration: ``c == "binary"`` -> ``is_binary_kind(c)``.
 _BINARY_KINDS: frozenset[str] = frozenset({"pdf", "xlsx", "docx", "csv", "zip", "binary_other"})
 
 
-def _is_binary_kind(kind: str) -> bool:
+def is_binary_kind(kind: str) -> bool:
     """True iff *kind* is any non-HTML binary classification.
 
     Used by :meth:`WebFetcher.fetch_smart`, :meth:`Recipes.find_and_download_file`,
@@ -211,7 +211,7 @@ def _url_ext_classification(url: str) -> str:
 
     v1.6.10: returns one of ``'pdf' | 'xlsx' | 'docx' | 'csv' | 'zip' |
     'binary_other' | 'html' | 'unknown'``. Callers route via
-    :func:`_is_binary_kind` rather than comparing to a single ``"binary"``
+    :func:`is_binary_kind` rather than comparing to a single ``"binary"``
     string (the v1.6.9 return). Used as the fast pre-filter before HEAD
     probing.
     """
@@ -293,14 +293,14 @@ class WebFetcher:
         """
         # v1.6.10: classification is now one of the granular kinds
         # ({pdf, xlsx, docx, csv, zip, binary_other, html, unknown}) so
-        # the routing check goes through ``_is_binary_kind`` instead of
+        # the routing check goes through ``is_binary_kind`` instead of
         # comparing to the v1.6.9 single string ``"binary"``.
         classification = "html"
         if _is_download_url(url):
             classification = _url_ext_classification(url)
         elif binary_probe and self._config.safety.probe_binary_urls:
             classification = await self.classify_url(url, session_id=session_id)
-        if _is_binary_kind(classification):
+        if is_binary_kind(classification):
             return await self.fetch_binary(url, session_id=session_id)
         return await self.fetch(url, session_id=session_id)
 
@@ -616,7 +616,7 @@ class WebFetcher:
 
         v1.6.10: returns one of ``'pdf' | 'xlsx' | 'docx' | 'csv' | 'zip'
         | 'binary_other' | 'html' | 'unknown'``. Callers route via
-        :func:`_is_binary_kind` instead of comparing to a single
+        :func:`is_binary_kind` instead of comparing to a single
         ``"binary"`` string (the v1.6.9 return type). Used by
         :meth:`fetch_smart` and :meth:`Recipes.find_and_download_file`
         for binary-vs-HTML and file-type filtering.

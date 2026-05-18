@@ -18,7 +18,7 @@ from web_agent.web_fetcher import _url_ext_classification
 def test_known_binary_extension():
     # v1.6.10: _url_ext_classification returns granular kinds. The old
     # single "binary" string was replaced by pdf/xlsx/docx/csv/zip/
-    # binary_other. _is_binary_kind() is the routing predicate.
+    # binary_other. is_binary_kind() is the routing predicate.
     assert _url_ext_classification("https://x.com/report.pdf") == "pdf"
     assert _url_ext_classification("https://x.com/sheet.xlsx") == "xlsx"
     assert _url_ext_classification("https://x.com/letter.docx") == "docx"
@@ -134,7 +134,7 @@ async def test_search_and_extract_direct_extensionless_pdf_routes_to_fetch_binar
 
     agent = Agent(AppConfig())
     # v1.6.10: classify_url returns granular kinds; "pdf" still routes
-    # through fetch_binary via _is_binary_kind().
+    # through fetch_binary via is_binary_kind().
     agent._fetcher.classify_url = AsyncMock(return_value="pdf")
     agent._fetcher.fetch_binary = AsyncMock(
         return_value=FetchResult(

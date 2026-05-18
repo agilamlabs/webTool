@@ -338,6 +338,48 @@ class TestV1610Integration:
         wf.fetch.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_click_xy_unknown_policy_block_fires_when_form_submit_allowed(
+        self, tmp_path
+    ) -> None:
+        """v1.6.10 review C-1 regression: ``coordinate_click_unknown_policy
+        ='block'`` must fire even when ``allow_form_submit=True``. Prior
+        to the C-1 fix the unknown-policy check was nested inside the
+        destructive-check guard, so a caller keeping the default
+        ``allow_form_submit=True`` and explicitly opting into
+        block-on-unknown would silently get their setting ignored."""
+        from web_agent import BrowserConfig, SafetyConfig
+        from web_agent.models import ActionStatus
+
+        config = AppConfig(
+            base_dir=str(tmp_path),
+            log_level="WARNING",
+            browser=BrowserConfig(headless=True),
+            safety=SafetyConfig(
+                allow_form_submit=True,  # default — destructive heuristic OFF
+                allow_coordinate_clicks=True,
+                coordinate_click_unknown_policy="block",
+            ),
+        )
+
+        async with Agent(config) as agent:
+            sid = await agent.create_session()
+            result = await agent.interact(
+                "data:text/html,<html><body style='margin:0;padding:0'></body></html>",
+                [{"action": "click_xy", "x": 5, "y": 5}],
+                session_id=sid,
+            )
+
+        last = result.results[-1] if result.results else None
+        assert last is not None, "expected at least one action result"
+        assert last.status == ActionStatus.FAILED, (
+            "expected click_xy to FAIL on empty body with block policy even "
+            f"with allow_form_submit=True, got {last.status}"
+        )
+        assert "unknown" in (last.error_message or "").lower(), (
+            f"expected 'unknown' in error message, got {last.error_message!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_named_profile_multi_session_shares_context(self, tmp_path) -> None:
         """v1.6.10 Item 7: two ``session_id`` values on a named-profile
         Agent share the SAME persistent ``BrowserContext`` (Playwright

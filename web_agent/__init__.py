@@ -133,6 +133,7 @@ from .search_providers import (
 )
 from .trace_recorder import SessionTraceRecorder
 from .utils import BudgetTracker, RetryPolicy, get_retry_policy
+from .web_fetcher import is_binary_kind
 
 __all__ = [
     # Version
@@ -170,6 +171,8 @@ __all__ = [
     # Cache
     "Cache",
     "DiskCache",
+    # Classification helper (v1.6.10)
+    "is_binary_kind",
     # Search providers
     "DDGSProvider",
     "PlaywrightProvider",

@@ -2,6 +2,33 @@
 
 ## [1.6.10] - 2026-05-18
 
+### Review pass (3 fixes: 2 Critical + 1 Important)
+
+- **C-1**: `SafetyConfig.coordinate_click_unknown_policy="block"` had
+  no effect when `allow_form_submit=True` (the default). The
+  unknown-policy gate was nested inside the destructive-check block,
+  so callers keeping the default form-submit policy and explicitly
+  opting into block-on-unknown saw their setting silently ignored.
+  Fix: hoist `_inspect_element_at_point` so the destructive check
+  fires whenever `allow_form_submit=False` AND the unknown-policy
+  check fires whenever `coordinate_click_unknown_policy="block"`
+  (independently). Added a regression test
+  (`TestV1610Integration::test_click_xy_unknown_policy_block_fires_when_form_submit_allowed`).
+- **C-2**: The CHANGELOG migration note for `classify_url` referenced
+  `_is_binary_kind` (leading underscore) but the helper was not
+  exported from the `web_agent.*` public namespace, breaking the
+  migration story. Fix: renamed to `is_binary_kind` (no underscore)
+  and exported from `web_agent`. Now callers can migrate via
+  `from web_agent import is_binary_kind`. The function docstring
+  says "Public-stable as of v1.6.10"; the symbol name now matches.
+- **I-1**: `web_research(extract_files=True)` silently appended a
+  contentless `Citation` and zero-cost `summary_pages` entry when
+  `fetch_smart` returned a successful binary `FetchResult` of an
+  unrecognized kind (PPTX, ZIP, octet-stream). Fix: add a
+  `binary_not_extracted` warning + diagnostic and skip the result
+  when `fr.binary is not None` AND
+  `extraction_method == "none" AND content_length == 0`.
+
 ### Follow-up Hardening (8 items, no new features)
 
 v1.6.10 is another **discipline slice** -- the v1.6.9 release surfaced

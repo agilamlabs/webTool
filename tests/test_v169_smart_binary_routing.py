@@ -59,7 +59,7 @@ async def test_extensionless_binary_routes_to_fetch_binary_via_probe() -> None:
 
     v1.6.10: classify_url now returns granular kinds ('pdf', 'xlsx',
     'binary_other', ...) instead of the literal 'binary'. The stub
-    returns 'pdf' here; ``_is_binary_kind('pdf')`` is True so routing
+    returns 'pdf' here; ``is_binary_kind('pdf')`` is True so routing
     still hits fetch_binary.
     """
     wf = _wf()

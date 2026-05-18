@@ -95,7 +95,7 @@ from .robots import RobotsChecker
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
-from .web_fetcher import WebFetcher, _is_binary_kind, _url_ext_classification
+from .web_fetcher import WebFetcher, _url_ext_classification, is_binary_kind
 
 
 def _query_is_url(query: str) -> bool:
@@ -540,7 +540,7 @@ class Agent:
                     )
                     continue
                 ext_class = _url_ext_classification(r.url)
-                if _is_binary_kind(ext_class):
+                if is_binary_kind(ext_class):
                     file_items.append(r)
                 elif ext_class == "html":
                     page_items.append(r)
@@ -563,7 +563,7 @@ class Agent:
                     if isinstance(classification, BaseException):
                         # Probe failure -> default to HTML, will be caught downstream
                         page_items.append(item)
-                    elif _is_binary_kind(classification):
+                    elif is_binary_kind(classification):
                         file_items.append(item)
                     else:
                         # 'html' or 'unknown' -> treat as HTML
