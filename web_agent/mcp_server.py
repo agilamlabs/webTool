@@ -416,10 +416,16 @@ async def web_research(
             get a strong ranking bonus.
         domain_profile: Optional named ranking profile -- one of
             ``"official_sources" | "docs" | "research" | "news" | "files"``.
-        extract_files: v1.6.10. When True, file URLs (PDF/XLSX/...) are
-            extracted inline via fetch_smart instead of routed to
-            ``download_candidates``. Default False preserves the v1.6.9
-            read-pages-only behaviour.
+        extract_files: v1.6.10 / v1.6.11. When True, URLs classified as
+            extractable binary kinds (``pdf`` / ``xlsx`` / ``docx`` / ``csv``;
+            see :data:`web_agent.EXTRACTABLE_BINARY_KINDS`) are fetched via
+            ``fetch_smart`` and extracted inline. v1.6.11: non-extractable
+            kinds (``.mp4`` / ``.exe`` / ``.iso`` / ``.zip`` / other
+            ``binary_other``) instead land in ``download_candidates`` with
+            ``block_reason="not_extractable_kind"`` -- they are not fetched.
+            Default False preserves the v1.6.9 read-pages-only behaviour
+            (file URLs go straight to ``download_candidates`` with
+            ``block_reason="download_skipped"``).
 
     Returns:
         ResearchResult with citations, summary_pages, budget telemetry,
