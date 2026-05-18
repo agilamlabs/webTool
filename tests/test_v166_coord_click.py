@@ -85,20 +85,22 @@ async def test_do_press_key_with_modifiers_builds_combo() -> None:
 
 
 @pytest.mark.asyncio
-async def test_click_xy_safe_mode_logs_warning_but_does_not_block(caplog) -> None:
-    """In safe_mode, coord click cannot inspect a selector for the submit
-    heuristic. We log a WARNING but the click still runs -- safe_mode
-    was a config-level opt-in, not a per-coord-click block."""
+async def test_click_xy_safe_mode_now_blocks_v169() -> None:
+    """v1.6.9 hardening: previously, safe_mode logged a warning and let
+    the coordinate click through (because there's no selector to inspect
+    for the submit heuristic). v1.6.9 changes this -- safe_mode forces
+    ``safety.allow_coordinate_clicks=False`` so click_xy is rejected
+    outright with a FAILED ActionResult. See
+    ``tests/test_v169_click_xy_safety.py`` for the full surface."""
     config = AppConfig(safety=SafetyConfig(safe_mode=True))
     ba = BrowserActions(MagicMock(), config, sessions=None)
     page = _make_page()
 
-    # Loguru doesn't integrate with caplog by default; instead assert that
-    # the call succeeded and the mouse click was issued.
     result = await ba._do_click_xy(page, ClickXYInput(x=10, y=20))
 
-    page.mouse.click.assert_awaited_once()
-    assert result.status == ActionStatus.SUCCESS
+    page.mouse.click.assert_not_awaited()
+    assert result.status == ActionStatus.FAILED
+    assert "safe_mode" in (result.error_message or "")
 
 
 @pytest.mark.asyncio

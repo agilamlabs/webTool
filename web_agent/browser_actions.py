@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, ClassVar, Optional
@@ -99,6 +100,49 @@ _SUBMIT_TEXT_KEYWORDS = (
     "create account",
     "continue",
 )
+
+
+# v1.6.9: coordinate-click safety. Pattern matches submit/login/destructive
+# verbs in element text or aria-label; used by _looks_like_destructive_at_point
+# to gate click_xy when allow_form_submit=False.
+_DESTRUCTIVE_TEXT_PATTERN = re.compile(
+    r"\b("
+    r"submit|send|save|"
+    r"log\s*in|login|sign\s*in|signin|"
+    r"register|sign\s*up|signup|create\s*account|"
+    r"continue|next|proceed|confirm|"
+    r"delete|remove|"
+    r"pay|buy|purchase|checkout|order|"
+    r"accept|agree|consent|allow|enable"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+# JS snippet: collect up to 5 ancestors (inner -> outer) of the element at
+# (x, y). Returns [] if no element is hit (offscreen / outside viewport).
+# Used by _do_click_xy when allow_form_submit=False to feed the
+# destructive-control heuristic without requiring a selector.
+_ELEMENT_FROM_POINT_JS = """
+({x, y}) => {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return [];
+  const items = [];
+  let n = el;
+  while (n && items.length < 5) {
+    items.push({
+      tag: (n.tagName || '').toLowerCase(),
+      type: n.getAttribute && n.getAttribute('type'),
+      role: n.getAttribute && n.getAttribute('role'),
+      text: ((n.innerText || n.value || '') + '').slice(0, 120),
+      aria: n.getAttribute && n.getAttribute('aria-label'),
+      in_form: !!(n.closest && n.closest('form')),
+    });
+    n = n.parentElement;
+  }
+  return items;
+}
+"""
 
 
 def _looks_like_submit(selector: SelectorLike | None) -> bool:
@@ -1073,21 +1117,97 @@ class BrowserActions:
     # v1.6.6 Feature 4: coordinate-level fallback handlers
     # ------------------------------------------------------------------
 
+    async def _inspect_element_at_point(
+        self, page: Page, x: float, y: float
+    ) -> list[dict[str, Any]]:
+        """v1.6.9: introspect the element stack at viewport (x, y).
+
+        Runs ``document.elementFromPoint(x, y)`` and walks up to 5
+        ancestors, returning structural attributes used by
+        ``_looks_like_destructive_at_point``. Returns an empty list when
+        nothing is hit (point outside the document / over a closed
+        shadow root) or when the evaluation fails -- callers must treat
+        an empty list as 'cannot tell, allow the click'.
+        """
+        try:
+            result = await page.evaluate(_ELEMENT_FROM_POINT_JS, {"x": x, "y": y})
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("elementFromPoint inspection failed: {e}", e=exc)
+            return []
+        if not isinstance(result, list):
+            return []
+        return [el for el in result if isinstance(el, dict)]
+
+    def _looks_like_destructive_at_point(self, elements: list[dict[str, Any]]) -> bool:
+        """v1.6.9: True if the inspected element stack looks like a
+        submit/login/destructive control.
+
+        Decision rules (any match wins, examined inner -> outer):
+          * ``button[type=submit]``
+          * ``input[type=submit|image]``
+          * ``role=button`` whose accessible text matches the destructive verb pattern
+          * Any ``button``/``a`` whose text+aria matches the pattern
+        Empty input -> False (cannot tell -> allow).
+        """
+        if not elements:
+            return False
+        for el in elements:
+            tag = (el.get("tag") or "").lower()
+            typ = (el.get("type") or "").lower()
+            role = (el.get("role") or "").lower()
+            text_blob = f"{el.get('text') or ''} {el.get('aria') or ''}"
+            if tag == "button" and typ == "submit":
+                return True
+            if tag == "input" and typ in {"submit", "image"}:
+                return True
+            if role == "button" and _DESTRUCTIVE_TEXT_PATTERN.search(text_blob):
+                return True
+            if tag in {"button", "a"} and _DESTRUCTIVE_TEXT_PATTERN.search(text_blob):
+                return True
+        return False
+
     async def _do_click_xy(self, page: Page, action: ClickXYInput) -> ActionResult:
         """Click at viewport coordinates (CSS pixels). No selector resolution.
 
-        Safety note: this bypasses ``_looks_like_submit`` -- there is no
-        selector to inspect. Callers in safe_mode get a WARNING but the
-        click still runs (the user opted into safe_mode at config level,
-        not per-coord-click).
+        v1.6.9 safety changes:
+          * Honors ``safety.allow_coordinate_clicks`` (default True; forced
+            False by ``safe_mode=True``). When False, returns a failed
+            ActionResult without clicking.
+          * When ``allow_form_submit=False``, runs
+            ``document.elementFromPoint`` to inspect the target stack and
+            blocks the click if it looks like a submit/login/destructive
+            control. Empty / failed inspection allows the click (cannot
+            tell -> default permissive, matches the selector path which
+            also defaults permissive when ``_looks_like_submit`` returns
+            False).
         """
-        if self._config.safety.safe_mode:
-            logger.warning(
-                "click_xy in safe_mode: no submit-button heuristic available "
-                "(coordinate click at x={x}, y={y})",
-                x=action.x,
-                y=action.y,
+        safety = self._config.safety
+        if not safety.allow_coordinate_clicks:
+            reason = "safe_mode" if safety.safe_mode else "allow_coordinate_clicks=False"
+            logger.info("click_xy rejected: {r}", r=reason)
+            return ActionResult(
+                action=ActionType.CLICK_XY,
+                status=ActionStatus.FAILED,
+                error_message=f"Coordinate clicks are disabled by safety config ({reason}).",
             )
+        if not safety.allow_form_submit:
+            elements = await self._inspect_element_at_point(page, action.x, action.y)
+            if self._looks_like_destructive_at_point(elements):
+                top = elements[0] if elements else None
+                logger.info(
+                    "click_xy blocked: target at ({x}, {y}) looks destructive: {top}",
+                    x=action.x,
+                    y=action.y,
+                    top=top,
+                )
+                return ActionResult(
+                    action=ActionType.CLICK_XY,
+                    status=ActionStatus.FAILED,
+                    error_message=(
+                        "Coordinate click blocked: target looks like a submit/destructive "
+                        f"control (allow_form_submit=False). Inspected top element: {top!r}"
+                    ),
+                )
         await page.mouse.click(
             action.x,
             action.y,

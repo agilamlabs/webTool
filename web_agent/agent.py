@@ -94,7 +94,7 @@ from .robots import RobotsChecker
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed
-from .web_fetcher import WebFetcher, _is_download_url, _url_ext_classification
+from .web_fetcher import WebFetcher, _url_ext_classification
 
 
 def _query_is_url(query: str) -> bool:
@@ -446,20 +446,11 @@ class Agent:
                     # fall through to the regular search path below
                 else:
                     logger.info("Query is a URL, skipping search: {q}", q=query)
-                    # Smart routing: PDF/XLSX/DOCX/CSV URLs go through the
-                    # binary extractor; HEAD probe handles extensionless
-                    # documents (regulator dashboards etc.).
-                    classification = "html"
-                    if _is_download_url(query):
-                        classification = "binary"
-                    elif self._config.safety.probe_binary_urls:
-                        classification = await self._fetcher.classify_url(
-                            query, session_id=session_id
-                        )
-                    if classification == "binary":
-                        fr = await self._fetcher.fetch_binary(query, session_id=session_id)
-                    else:
-                        fr = await self._fetcher.fetch(query, session_id=session_id)
+                    # v1.6.9: route through fetch_smart (single routing
+                    # source of truth). Binary URLs land in fetch_binary;
+                    # everything else uses the HTML path. HEAD probe is
+                    # gated internally by safety.probe_binary_urls.
+                    fr = await self._fetcher.fetch_smart(query, session_id=session_id)
 
                     url_pages: list[ExtractionResult] = []
                     if fr.status == FetchStatus.SUCCESS and (fr.html or fr.binary):
@@ -802,16 +793,13 @@ class Agent:
             self._debug.reset()
             logger.info("Fetching and extracting: {url}", url=url)
 
-            classification = "html"
-            if _is_download_url(url):
-                classification = "binary"
-            elif binary_probe and self._config.safety.probe_binary_urls:
-                classification = await self._fetcher.classify_url(url, session_id=session_id)
-
-            if classification == "binary":
-                fr = await self._fetcher.fetch_binary(url, session_id=session_id)
-            else:
-                fr = await self._fetcher.fetch(url, session_id=session_id)
+            # v1.6.9: single source of truth for binary-vs-HTML routing
+            # is WebFetcher.fetch_smart. Prior versions duplicated the
+            # if/elif/else across fetch_and_extract / search_and_extract /
+            # recipes; v1.6.9 consolidates to keep behavior consistent.
+            fr = await self._fetcher.fetch_smart(
+                url, session_id=session_id, binary_probe=binary_probe
+            )
 
             if strict and fr.status != FetchStatus.SUCCESS:
                 raise NavigationError(

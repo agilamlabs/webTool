@@ -3,17 +3,42 @@
 Validates the config gate (loopback, ws://, no-isolation), the
 ``BrowserManager.start()`` dispatch path (uses ``connect_over_cdp``
 instead of ``launch``), and the ``get_remote_cdp_url`` accessor.
+
+v1.6.9: positive-path tests now supply ``remote_cdp_ownership_token`` +
+``remote_cdp_profile_dir`` and write the token file (the v1.6.9 validator
+requires both, and BrowserManager.start verifies the token before
+``connect_over_cdp``).
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
-from web_agent import AppConfig, BrowserConfig
+from web_agent import AppConfig, BrowserConfig, OwnershipToken
 from web_agent.browser_manager import BrowserManager
 from web_agent.exceptions import BrowserError, ConfigError
+
+
+def _make_owned_remote_cdp_config(
+    profile_dir: Path,
+    url: str = "ws://127.0.0.1:9222/devtools/browser/x",
+) -> AppConfig:
+    """v1.6.9 helper: issue an ownership token and build a valid AppConfig
+    pointing remote_cdp at the same profile dir + token. Used by start()
+    dispatch tests where ownership-token verification must pass."""
+    token = OwnershipToken.issue(profile_dir)
+    return AppConfig(
+        browser=BrowserConfig(
+            backend="remote_cdp",
+            remote_cdp_url=url,
+            remote_cdp_ownership_token=token,
+            remote_cdp_profile_dir=str(profile_dir),
+        )
+    )
+
 
 # ---------------------------------------------------------------------------
 # Validator gate
@@ -64,9 +89,14 @@ def test_backend_remote_cdp_incompatible_with_isolation_mode() -> None:
         "wss://127.10.20.30:9222/devtools/browser/x",
     ],
 )
-def test_backend_remote_cdp_accepts_127_8_range(url: str) -> None:
-    # No raise == accepted
-    bc = BrowserConfig(backend="remote_cdp", remote_cdp_url=url)
+def test_backend_remote_cdp_accepts_127_8_range(url: str, tmp_path: Path) -> None:
+    # No raise == accepted (v1.6.9: token + profile_dir required)
+    bc = BrowserConfig(
+        backend="remote_cdp",
+        remote_cdp_url=url,
+        remote_cdp_ownership_token="a" * 64,
+        remote_cdp_profile_dir=str(tmp_path),
+    )
     assert bc.backend == "remote_cdp"
 
 
@@ -84,16 +114,24 @@ def test_backend_remote_cdp_accepts_127_8_range(url: str) -> None:
         "ws:///devtools/browser/x",
     ],
 )
-def test_backend_remote_cdp_rejects_non_loopback_ip(url: str) -> None:
+def test_backend_remote_cdp_rejects_non_loopback_ip(url: str, tmp_path: Path) -> None:
+    # v1.6.9: even with token + profile_dir, non-loopback host must be rejected.
     with pytest.raises((ConfigError, ValidationError), match="not loopback"):
-        BrowserConfig(backend="remote_cdp", remote_cdp_url=url)
+        BrowserConfig(
+            backend="remote_cdp",
+            remote_cdp_url=url,
+            remote_cdp_ownership_token="a" * 64,
+            remote_cdp_profile_dir=str(tmp_path),
+        )
 
 
-def test_backend_remote_cdp_accepts_ipv6_loopback_bracket_form() -> None:
+def test_backend_remote_cdp_accepts_ipv6_loopback_bracket_form(tmp_path: Path) -> None:
     # urlparse strips the brackets internally; verify ::1 passes.
     bc = BrowserConfig(
         backend="remote_cdp",
         remote_cdp_url="ws://[::1]:9222/devtools/browser/x",
+        remote_cdp_ownership_token="a" * 64,
+        remote_cdp_profile_dir=str(tmp_path),
     )
     assert bc.backend == "remote_cdp"
 
@@ -104,13 +142,10 @@ def test_backend_remote_cdp_accepts_ipv6_loopback_bracket_form() -> None:
 
 
 @pytest.mark.asyncio
-async def test_backend_remote_cdp_dispatch_calls_connect_over_cdp_not_launch() -> None:
-    cfg = AppConfig(
-        browser=BrowserConfig(
-            backend="remote_cdp",
-            remote_cdp_url="ws://127.0.0.1:9222/devtools/browser/x",
-        )
-    )
+async def test_backend_remote_cdp_dispatch_calls_connect_over_cdp_not_launch(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_owned_remote_cdp_config(tmp_path)
     bm = BrowserManager(cfg)
 
     # Mock the stealth-wrapped Playwright entry context.
@@ -136,16 +171,13 @@ async def test_backend_remote_cdp_dispatch_calls_connect_over_cdp_not_launch() -
 
 
 @pytest.mark.asyncio
-async def test_backend_remote_cdp_stop_disconnects_without_killing_process() -> None:
+async def test_backend_remote_cdp_stop_disconnects_without_killing_process(
+    tmp_path: Path,
+) -> None:
     """Per Playwright docs: ``close()`` on a connect_over_cdp browser disconnects,
     not terminates. Our stop() path therefore just calls ``close()`` -- the
     important invariant is that ``stop()`` doesn't raise."""
-    cfg = AppConfig(
-        browser=BrowserConfig(
-            backend="remote_cdp",
-            remote_cdp_url="ws://127.0.0.1:9222/devtools/browser/x",
-        )
-    )
+    cfg = _make_owned_remote_cdp_config(tmp_path)
     bm = BrowserManager(cfg)
     fake_browser = MagicMock(name="Browser")
     fake_browser.close = AsyncMock()
@@ -164,13 +196,10 @@ async def test_backend_remote_cdp_stop_disconnects_without_killing_process() -> 
 
 
 @pytest.mark.asyncio
-async def test_backend_remote_cdp_connection_failure_wraps_as_browser_error() -> None:
-    cfg = AppConfig(
-        browser=BrowserConfig(
-            backend="remote_cdp",
-            remote_cdp_url="ws://127.0.0.1:9999/devtools/browser/x",
-        )
-    )
+async def test_backend_remote_cdp_connection_failure_wraps_as_browser_error(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_owned_remote_cdp_config(tmp_path, url="ws://127.0.0.1:9999/devtools/browser/x")
     bm = BrowserManager(cfg)
     fake_pw = MagicMock(name="Playwright")
     fake_pw.chromium.connect_over_cdp = AsyncMock(side_effect=Exception("connection refused"))
@@ -194,9 +223,11 @@ def test_get_remote_cdp_url_returns_none_for_default_backend() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_remote_cdp_url_returns_configured_url_after_start() -> None:
+async def test_get_remote_cdp_url_returns_configured_url_after_start(
+    tmp_path: Path,
+) -> None:
     url = "ws://127.0.0.1:9222/devtools/browser/x"
-    cfg = AppConfig(browser=BrowserConfig(backend="remote_cdp", remote_cdp_url=url))
+    cfg = _make_owned_remote_cdp_config(tmp_path, url=url)
     bm = BrowserManager(cfg)
     fake_browser = MagicMock(name="Browser")
     fake_browser.close = AsyncMock()

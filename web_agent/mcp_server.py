@@ -1,25 +1,24 @@
 """MCP (Model Context Protocol) server exposing web_agent as tools for AI clients.
 
 Runs as an MCP server that Claude Desktop, Claude Code, Cursor, and other
-MCP-compatible clients can connect to. Exposes 12 tools:
+MCP-compatible clients can connect to. Exposes web search, fetch,
+download, browser automation, sessions, tabs, network/trace diagnostics,
+domain skills, observe / coordinate actions, interaction helpers, CDP
+endpoints, and high-level recipes (search-best, find-and-download,
+web_research, fill-form-and-extract) as MCP tools.
 
-**Single-shot tools**:
-- ``web_search`` -- search + extract top results
-- ``web_fetch`` -- fetch and extract a single URL (smart binary routing)
-- ``web_download`` -- download a file or save a web page
-- ``web_screenshot`` -- screenshot a page
-- ``web_interact`` -- run a scripted browser action sequence
+The exact tool count grows with each release; categories above are
+stable. See ``@mcp.tool()`` decorators in this module for the
+authoritative current list.
 
-**High-level recipes**:
-- ``web_search_best`` -- search and open the best-ranked result
-- ``web_find_and_download`` -- search and download the first matching file
-- ``web_research`` -- multi-page research with structured citations
-- ``web_fill_form_and_extract`` -- open page, fill search/filter form, extract content
+v1.6.9: the ``mcp`` package is now an *optional* dependency. Install
+it explicitly when running the MCP server::
 
-**Browser sessions** -- retain cookies/login across multiple tool calls:
-- ``create_browser_session`` -- start a persistent browser session
-- ``close_browser_session`` -- end a session and free its resources
-- ``list_browser_sessions`` -- list live sessions
+    pip install "web-agent-toolkit[mcp]"
+
+Plain ``pip install web-agent-toolkit`` is enough for the Python API
+(``Agent``, ``Recipes``) -- this module's import-time guard surfaces
+a clear hint if you try to run the MCP server without the extra.
 
 Each tool accepts an optional ``session_id`` to reuse a persistent context.
 
@@ -52,7 +51,18 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from loguru import logger
-from mcp.server.fastmcp import Context, FastMCP
+
+# v1.6.9: ``mcp`` is now an optional extra. Surface a clear install
+# hint instead of letting a bare ImportError propagate, so users who
+# pip-installed without [mcp] understand what's missing.
+try:
+    from mcp.server.fastmcp import Context, FastMCP
+except ImportError as exc:  # pragma: no cover - install-path branch
+    raise ImportError(
+        "The web_agent MCP server requires the optional 'mcp' dependency. "
+        'Install with: pip install "web-agent-toolkit[mcp]"'
+    ) from exc
+
 from pydantic import TypeAdapter
 
 from .agent import Agent

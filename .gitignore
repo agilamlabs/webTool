@@ -48,6 +48,10 @@ debug/
 cache/
 audit.jsonl
 *.audit.jsonl
+# v1.6.6: isolation_mode ephemeral profile dirs land here.
+.webtool/
+# v1.6.8: per-session JSONL trace dir lives under .webtool-audit/.
+.webtool-audit/
 
 # Loose generated files at the repo root (HTML/PDF/images dropped by tests
 # or by the agent during ad-hoc runs). Anything intentional belongs in

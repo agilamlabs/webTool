@@ -104,7 +104,7 @@ The following classes of attack are explicit goals to mitigate:
   fence, a prompt injection could trick the agent into uploading
   `~/.ssh/id_rsa`.
 
-### Browser-control attack surface (v1.6.6 / v1.6.8)
+### Browser-control attack surface (v1.6.6 / v1.6.8 / v1.6.9)
 
 The CDP attach + remote-CDP features introduce a second class of
 attack surface around browser process control:
@@ -132,6 +132,28 @@ attack surface around browser process control:
 - **Remote-CDP is incompatible with isolation + cdp_enabled.** The
   validator rejects these combinations: `remote_cdp` connects to a
   pre-existing browser whose profile we don't own.
+- **`remote_cdp` ownership tokens (v1.6.9).** Loopback alone does not
+  prove ownership -- a user's personal Chrome can run on
+  `127.0.0.1:9222` too. v1.6.9 adds filesystem-anchored ownership
+  proofs: every isolated launch writes a 64-char hex token
+  (`secrets.token_hex(32)`) to `<profile_dir>/.webtool-ownership`
+  (chmod 0o600 best-effort). `remote_cdp` callers must present a
+  matching token via `BrowserConfig.remote_cdp_ownership_token` and
+  `remote_cdp_profile_dir`; verification uses
+  `secrets.compare_digest`. The validator + `BrowserManager.start()`
+  check both happen BEFORE any CDP connection is opened. This makes
+  it impossible to "stumble into" a foreign loopback browser by
+  guessing a port.
+- **Coordinate-click form-submit safety (v1.6.9).** Prior to v1.6.9,
+  `Agent.click_xy(x, y)` logged a warning under `safe_mode` and
+  clicked anyway -- there was no element to inspect. v1.6.9 adds
+  `SafetyConfig.allow_coordinate_clicks` (default True, **forced
+  False** in `safe_mode`) plus a `document.elementFromPoint(x, y)`
+  inspector that walks up to 5 ancestors and blocks clicks on
+  submit / login / register / delete / pay / accept / consent
+  controls when `allow_form_submit=False`. This closes the
+  prompt-injection vector where an attacker tricks the agent into
+  using coord clicks to bypass the selector-path heuristic.
 
 ### Workspace + diagnostic data (v1.6.7 / v1.6.8)
 
@@ -243,6 +265,21 @@ The current safety layers, in order of when they apply:
 17. **Diagnostic-data minimisation** (v1.6.8) — network header
     capture and trace recording all default off; when enabled,
     `session_id` is regex-validated before being used as a filename.
+18. **`remote_cdp` ownership token** (v1.6.9) — every isolated launch
+    writes a 64-char random token to
+    `<profile_dir>/.webtool-ownership`; `remote_cdp` attaches require
+    a matching token (constant-time compare). Closes the
+    "stumble into a foreign loopback Chrome" attack.
+19. **Coordinate-click form-submit safety** (v1.6.9) —
+    `safety.allow_coordinate_clicks` (forced False in `safe_mode`)
+    plus a `document.elementFromPoint` inspector blocks submit /
+    login / pay controls under `allow_form_submit=False`. Closes
+    the click_xy bypass of the selector-path heuristic.
+20. **Chromium sandbox kept by default** (v1.6.9) — `--no-sandbox` is
+    no longer passed unconditionally. Local dev keeps the sandbox;
+    CI / container auto-detected via `CI`, `GITHUB_ACTIONS`, or
+    `/.dockerenv`. Per-tab renderer isolation against arbitrary-code
+    exploits stays on for the common case.
 
 ## Hardening Recommendations for Production
 

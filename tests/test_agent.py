@@ -109,3 +109,62 @@ class TestDownload:
         from pathlib import Path
 
         assert Path(result.filepath).exists()
+
+
+# ---------------------------------------------------------------------------
+# v1.6.9 integration: named profile persistence
+# ---------------------------------------------------------------------------
+
+
+class TestV169NamedProfilePersistence:
+    """v1.6.9: named profile must retain cookies + localStorage across
+    Agent lifetimes via ``chromium.launch_persistent_context``."""
+
+    @pytest.mark.asyncio
+    async def test_named_profile_persists_cookies_across_runs(self, tmp_path) -> None:
+        """Round-trip: run 1 sets a cookie; run 2 (same profile) reads it back."""
+        from web_agent import BrowserConfig, SafetyConfig
+
+        config = AppConfig(
+            base_dir=str(tmp_path),
+            log_level="WARNING",
+            browser=BrowserConfig(
+                isolation_mode=True,
+                profile_mode="named",
+                profile_dir="v169-persist-test",
+                cleanup_on_exit=False,
+                headless=True,
+            ),
+            safety=SafetyConfig(allow_js_evaluation=True),
+        )
+
+        # Run 1: navigate and set a localStorage value
+        async with Agent(config) as agent:
+            sid = await agent.create_session()
+            await agent.interact(
+                "https://httpbin.org/html",
+                [
+                    {
+                        "action": "evaluate",
+                        "script": "localStorage.setItem('wt_v169', 'persists');",
+                    }
+                ],
+                session_id=sid,
+            )
+
+        # Run 2: same profile, verify the value survived
+        async with Agent(config) as agent:
+            sid = await agent.create_session()
+            result = await agent.interact(
+                "https://httpbin.org/html",
+                [{"action": "evaluate", "script": "localStorage.getItem('wt_v169');"}],
+                session_id=sid,
+            )
+
+        # Pull the last action result and assert the value round-tripped
+        last = result.results[-1] if result.results else None
+        assert last is not None
+        assert last.status.value == "success"
+        # data['result'] holds the JS return value
+        value = (last.data or {}).get("result")
+        assert value == "persists", f"expected 'persists', got {value!r}"

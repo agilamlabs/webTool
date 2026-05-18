@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import tempfile
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from loguru import logger
 from playwright.async_api import (
@@ -22,10 +23,107 @@ from playwright.async_api import (
 from playwright_stealth import Stealth
 
 from .config import AppConfig
+from .ownership import OwnershipToken
 from .utils import get_random_user_agent, safe_join_path
 
 if TYPE_CHECKING:  # pragma: no cover -- avoid runtime import cycle
     from .network_collector import NetworkCollector
+
+
+def _resolve_user_agent(bcfg: Any) -> str | None:
+    """v1.6.9: pick a UA string per ``BrowserConfig.user_agent_mode``.
+
+    Returns ``None`` for ``"playwright_default"`` so Playwright picks
+    its bundled UA; the random pool runner otherwise; the explicit
+    string when mode is ``"explicit"`` (validator guarantees the
+    string is set).
+
+    ``bcfg`` is typed as ``Any`` because importing ``BrowserConfig``
+    here would create a cycle (config.py -> browser_manager.py -> ...).
+    """
+    mode = getattr(bcfg, "user_agent_mode", "random")
+    if mode == "explicit":
+        ua = bcfg.user_agent
+        return ua if isinstance(ua, str) else None
+    if mode == "playwright_default":
+        return None
+    return get_random_user_agent()
+
+
+def _should_disable_chromium_sandbox(cfg_value: Optional[bool]) -> bool:
+    """v1.6.9: decide whether to pass ``--no-sandbox`` to Chromium.
+
+    Behaviour:
+      * ``cfg_value=True``  -> always disable (pass --no-sandbox).
+      * ``cfg_value=False`` -> never disable (keep Chromium sandbox).
+      * ``cfg_value=None``  -> auto-detect:
+          - CI env var ``CI`` truthy (``true``/``1``/``yes``) -> disable
+          - CI env var ``GITHUB_ACTIONS`` truthy -> disable
+          - Container marker ``/.dockerenv`` present -> disable
+          - otherwise -> keep sandbox
+
+    Local-dev default (sandbox kept) is a deliberate hardening change in
+    v1.6.9: prior versions always passed ``--no-sandbox`` which weakened
+    Chromium's per-tab isolation against renderer exploits.
+    """
+    if cfg_value is not None:
+        return cfg_value
+    if os.environ.get("CI", "").strip().lower() in {"true", "1", "yes"}:
+        return True
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() in {"true", "1"}:
+        return True
+    with suppress(OSError):
+        if Path("/.dockerenv").exists():
+            return True
+    return False
+
+
+class _NoCloseContextProxy:
+    """v1.6.9: forwarding wrapper around a persistent BrowserContext
+    that turns ``close()`` into a no-op.
+
+    Why this exists
+    ---------------
+    Named persistent profiles use ``chromium.launch_persistent_context``
+    which returns a single shared ``BrowserContext``. The rest of the
+    codebase (``WebFetcher``, ``BrowserActions``, ``SessionManager``)
+    assumes the contexts returned by ``BrowserManager._build_context``
+    are caller-owned and calls ``await ctx.close()`` on cleanup. Closing
+    the persistent context would terminate every other session sharing
+    it, defeating the whole point of the persistent profile.
+
+    This proxy forwards every attribute access to the real context
+    (``__getattr__``) and overrides ``close()`` to do nothing. The
+    persistent context is closed exactly once, from ``BrowserManager.stop()``.
+
+    Identity / equality
+    -------------------
+    All proxies wrapping the same persistent context compare equal via
+    the underlying context, so caller-side dicts keyed by context
+    behave as if they always saw one context.
+    """
+
+    __slots__ = ("_ctx",)
+
+    def __init__(self, ctx: BrowserContext) -> None:
+        object.__setattr__(self, "_ctx", ctx)
+
+    def __getattr__(self, name: str) -> Any:
+        # __getattr__ only called when normal attribute lookup fails,
+        # which is the case for the wrapped context's attributes.
+        return getattr(self._ctx, name)
+
+    async def close(self, reason: Any = None) -> None:
+        """No-op: the persistent context is closed once, from BrowserManager.stop()."""
+        logger.debug("_NoCloseContextProxy.close() no-op (persistent profile)")
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _NoCloseContextProxy):
+            return self._ctx is other._ctx
+        return self._ctx is other
+
+    def __hash__(self) -> int:
+        return id(self._ctx)
 
 
 class BrowserManager:
@@ -67,6 +165,19 @@ class BrowserManager:
         # v1.6.8: True after a successful connect_over_cdp -- changes
         # stop() to disconnect-without-killing-process.
         self._is_remote_cdp: bool = False
+        # v1.6.9: ownership token issued into the active profile dir on
+        # isolated launches. None for non-isolated launches and for
+        # remote_cdp (where we did not own the launch).
+        self._issued_token: str | None = None
+        # v1.6.9: when isolation_mode + profile_mode=="named", we launch
+        # via chromium.launch_persistent_context which returns a
+        # BrowserContext (NOT a Browser). The persistent context IS the
+        # one and only context that shares profile state -- you cannot
+        # create additional contexts that see the same cookies. All
+        # callers therefore share this single context via
+        # _PersistentContextRef (no-op close so per-call cleanup leaves
+        # it alive across the Agent lifetime).
+        self._persistent_context: BrowserContext | None = None
 
     def _resolve_profile_dir(self) -> Path:
         """Resolve the effective user-data-dir for isolation_mode.
@@ -171,6 +282,19 @@ class BrowserManager:
             # browser, not launching one. The config validator has already
             # confirmed remote_cdp_url is a loopback ws:// endpoint.
             if bcfg.backend == "remote_cdp":
+                # v1.6.9: verify the ownership token BEFORE opening a
+                # CDP connection. The validator guarantees both fields
+                # are set when backend='remote_cdp'.
+                assert bcfg.remote_cdp_profile_dir is not None
+                assert bcfg.remote_cdp_ownership_token is not None
+                profile_path = Path(bcfg.remote_cdp_profile_dir)
+                if not OwnershipToken.verify(profile_path, bcfg.remote_cdp_ownership_token):
+                    raise BrowserError(
+                        f"Ownership token verification failed for {profile_path}. "
+                        "The remote browser is not webTool-owned, or the profile "
+                        "directory was modified after launch. remote_cdp refuses "
+                        "to attach without a valid token (v1.6.9)."
+                    )
                 try:
                     self._pw_cm = self._stealth.use_async(async_playwright())
                     self._playwright = await self._pw_cm.__aenter__()
@@ -181,7 +305,7 @@ class BrowserManager:
                     self._is_remote_cdp = True
                     self._started = True
                     logger.info(
-                        "Connected to remote CDP browser: {u}",
+                        "Connected to remote CDP browser: {u} (ownership verified)",
                         u=bcfg.remote_cdp_url,
                     )
                     return
@@ -202,15 +326,30 @@ class BrowserManager:
             if bcfg.isolation_mode:
                 self._effective_profile_dir = self._resolve_profile_dir()
 
-            # Build the args list dynamically. The first four are the
-            # v1.6.5 defaults; isolation + CDP append after.
+            # Build the args list dynamically. v1.6.9: --no-sandbox is
+            # now opt-in / auto-detected (CI + container heuristic).
+            # Local dev defaults to keeping Chromium's sandbox enabled.
             args: list[str] = [
-                "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-extensions",
             ]
-            if bcfg.isolation_mode and self._effective_profile_dir is not None:
+            if _should_disable_chromium_sandbox(bcfg.disable_chromium_sandbox):
+                args.insert(0, "--no-sandbox")
+            # v1.6.9: launch_persistent_context (named profile path)
+            # takes user_data_dir as an explicit arg, NOT via
+            # --user-data-dir CLI flag. Keep the CLI flag for the
+            # regular chromium.launch path (ephemeral isolation).
+            use_persistent = (
+                bcfg.isolation_mode
+                and bcfg.profile_mode == "named"
+                and self._effective_profile_dir is not None
+            )
+            if (
+                bcfg.isolation_mode
+                and self._effective_profile_dir is not None
+                and not use_persistent
+            ):
                 args.append(f"--user-data-dir={self._effective_profile_dir}")
             if bcfg.cdp_enabled:
                 args.append(f"--remote-debugging-port={bcfg.cdp_port}")
@@ -222,11 +361,59 @@ class BrowserManager:
                 self._pw_cm = self._stealth.use_async(async_playwright())
                 self._playwright = await self._pw_cm.__aenter__()
 
-                self._browser = await self._playwright.chromium.launch(
-                    headless=bcfg.headless,
-                    slow_mo=bcfg.slow_mo,
-                    args=args,
-                )
+                if use_persistent:
+                    # v1.6.9: named profile uses launch_persistent_context
+                    # which returns a BrowserContext directly. Cookies /
+                    # localStorage persist across runs because Chromium
+                    # writes them into user_data_dir. All callers share
+                    # this single context (Playwright limitation: you
+                    # cannot create additional contexts that share state
+                    # with a persistent profile context).
+                    assert self._effective_profile_dir is not None
+                    self._persistent_context = (
+                        await self._playwright.chromium.launch_persistent_context(
+                            user_data_dir=str(self._effective_profile_dir),
+                            headless=bcfg.headless,
+                            slow_mo=bcfg.slow_mo,
+                            args=args,
+                            viewport={
+                                "width": bcfg.viewport_width,
+                                "height": bcfg.viewport_height,
+                            },
+                            user_agent=_resolve_user_agent(bcfg),
+                            locale=bcfg.locale,
+                            timezone_id=bcfg.timezone_id,
+                            java_script_enabled=True,
+                            bypass_csp=False,
+                        )
+                    )
+                    self._persistent_context.set_default_timeout(bcfg.default_timeout)
+                    self._persistent_context.set_default_navigation_timeout(bcfg.navigation_timeout)
+                    # Apply resource blocking once on the persistent
+                    # context (per-call routing would accumulate).
+                    blocked = bcfg.block_resources
+                    if blocked:
+
+                        async def _block_resources(route: Route) -> None:
+                            if route.request.resource_type in blocked:
+                                await route.abort()
+                            else:
+                                await route.continue_()
+
+                        await self._persistent_context.route("**/*", _block_resources)
+                    # The persistent context exposes its parent browser
+                    # via .browser for callers that still need a Browser
+                    # ref (e.g. close paths). On some Playwright versions
+                    # this is None when launched via persistent context;
+                    # we keep _browser=None and route everything through
+                    # _persistent_context.
+                    self._browser = self._persistent_context.browser
+                else:
+                    self._browser = await self._playwright.chromium.launch(
+                        headless=bcfg.headless,
+                        slow_mo=bcfg.slow_mo,
+                        args=args,
+                    )
                 self._started = True
                 logger.info(
                     "Browser launched (headless={h}, isolation={iso}, cdp={cdp})",
@@ -241,6 +428,18 @@ class BrowserManager:
                         mode=bcfg.profile_mode,
                         owned=self._owned_profile_dir,
                     )
+                    # v1.6.9: write an ownership token under the profile dir
+                    # so remote_cdp callers can prove this browser was
+                    # launched by webTool. Issued for both ephemeral and
+                    # named profiles -- named profiles overwrite per launch.
+                    if self._effective_profile_dir is not None:
+                        with suppress(OSError):
+                            self._issued_token = OwnershipToken.issue(self._effective_profile_dir)
+                            logger.debug(
+                                "Ownership token issued at {p}/{f}",
+                                p=self._effective_profile_dir,
+                                f=OwnershipToken.FILENAME,
+                            )
                 if bcfg.cdp_enabled and self._effective_profile_dir is not None:
                     await self._discover_cdp_endpoint(self._effective_profile_dir)
                     if self._cdp_endpoint:
@@ -248,6 +447,10 @@ class BrowserManager:
             except Exception as exc:
                 # Roll back partial state and re-raise as BrowserError so callers
                 # can `except BrowserError` reliably.
+                if self._persistent_context is not None:
+                    with suppress(Exception):
+                        await self._persistent_context.close()
+                    self._persistent_context = None
                 if self._pw_cm is not None:
                     with suppress(Exception):
                         await self._pw_cm.__aexit__(None, None, None)
@@ -262,6 +465,7 @@ class BrowserManager:
                 self._owned_profile_dir = False
                 self._cdp_endpoint = None
                 self._cdp_port_resolved = None
+                self._issued_token = None
                 raise BrowserError(f"Failed to launch Chromium: {exc}") from exc
 
     async def _cleanup_profile_dir(self, profile_dir: Path, *, retries: int = 5) -> None:
@@ -312,9 +516,27 @@ class BrowserManager:
         disconnects the Playwright client without killing the remote
         Chromium process (per Playwright docs). This is the intended
         behaviour for cloud-browser / browser-farm callers.
+
+        v1.6.9: named persistent profiles close their single
+        ``BrowserContext`` (which in turn terminates the underlying
+        Chromium) before the regular browser path runs.
         """
         async with self._lifecycle_lock:
-            if self._browser:
+            if self._persistent_context is not None:
+                # v1.6.9: launch_persistent_context owns the chromium
+                # process. Closing the persistent context terminates it
+                # AND flushes profile data to disk -- which is exactly
+                # the named-profile contract.
+                try:
+                    await self._persistent_context.close()
+                except Exception as exc:
+                    logger.warning("Error closing persistent context: {e}", e=exc)
+                self._persistent_context = None
+                # Underlying browser ref (if any) is owned by the
+                # persistent context we just closed -- do NOT call
+                # close() on it again or we'll race on a dead handle.
+                self._browser = None
+            elif self._browser:
                 try:
                     # close() on a connect_over_cdp browser is a disconnect.
                     # On a locally-launched browser it terminates the process.
@@ -348,6 +570,7 @@ class BrowserManager:
             self._owned_profile_dir = False
             self._cdp_endpoint = None
             self._cdp_port_resolved = None
+            self._issued_token = None
             self._is_remote_cdp = False
             self._started = False
             logger.info("Browser closed")
@@ -364,6 +587,28 @@ class BrowserManager:
             return self._config.browser.remote_cdp_url
         return None
 
+    def get_ownership_token(self) -> str | None:
+        """v1.6.9: return the ownership token issued at launch.
+
+        Set only after a successful isolated launch (ephemeral or named).
+        Returns None for non-isolated launches and for ``remote_cdp``.
+        Callers wanting to spin up a sibling ``remote_cdp`` Agent against
+        the same browser pass this token via
+        ``BrowserConfig.remote_cdp_ownership_token`` plus
+        ``remote_cdp_profile_dir`` pointing at ``get_effective_profile_dir()``.
+        """
+        return self._issued_token
+
+    def get_effective_profile_dir(self) -> Path | None:
+        """v1.6.9: return the resolved profile dir for an isolated launch.
+
+        Pair with :meth:`get_ownership_token` to construct a sibling
+        ``remote_cdp`` config. Returns None when ``isolation_mode=False``,
+        before ``start()``, or when the backend is ``remote_cdp`` (we
+        don't own the remote profile).
+        """
+        return self._effective_profile_dir
+
     async def _build_context(
         self,
         user_agent: str | None = None,
@@ -374,19 +619,43 @@ class BrowserManager:
         Returns a context the caller is responsible for closing.
         Used by both ``new_context`` (semaphore-bounded, auto-closed) and
         ``create_persistent_context`` (no semaphore, caller-managed).
+
+        v1.6.9: when running under a named persistent profile, this
+        method returns the *single* shared persistent context wrapped in
+        a no-close proxy. The wrapper forwards all calls except
+        ``close()`` (which becomes a no-op) so per-caller cleanup logic
+        keeps working unchanged. ``user_agent`` and ``block_resources``
+        args are ignored in this mode -- those settings were applied
+        once when the persistent context was launched (Playwright does
+        not let us re-configure them post-launch).
         """
+        if self._persistent_context is not None:
+            if user_agent is not None or block_resources is not None:
+                logger.debug(
+                    "Named persistent profile: ignoring per-call user_agent / "
+                    "block_resources overrides (settings are pinned at launch)."
+                )
+            # _NoCloseContextProxy quacks like BrowserContext via __getattr__
+            # forwarding. mypy can't see the protocol so cast it down.
+            return cast(BrowserContext, _NoCloseContextProxy(self._persistent_context))
+
         if not self._browser:
             raise RuntimeError("BrowserManager not started. Call start() first.")
 
-        ua = user_agent or get_random_user_agent()
+        bcfg = self._config.browser
+        # v1.6.9: locale / timezone_id / user_agent now read from config
+        # (previously hardcoded). Explicit user_agent kwarg still wins
+        # for callers that need a one-off override (search-engine
+        # rotation in particular).
+        ua = user_agent if user_agent is not None else _resolve_user_agent(bcfg)
         ctx = await self._browser.new_context(
             user_agent=ua,
             viewport={
-                "width": self._config.browser.viewport_width,
-                "height": self._config.browser.viewport_height,
+                "width": bcfg.viewport_width,
+                "height": bcfg.viewport_height,
             },
-            locale="en-US",
-            timezone_id="America/New_York",
+            locale=bcfg.locale,
+            timezone_id=bcfg.timezone_id,
             java_script_enabled=True,
             bypass_csp=False,
         )

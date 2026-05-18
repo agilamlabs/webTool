@@ -6,18 +6,21 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.8**
+- Latest version: **1.6.9**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
 ## Setup
 
 ```bash
-# Core
+# Core (Python API only)
 pip install -e ".[dev]"
 playwright install chromium
 
-# Optional: PDF/XLSX extraction
+# Optional: MCP server (v1.6.9+; mcp[cli] is now an extra)
+pip install -e ".[mcp]"
+
+# Optional: PDF/XLSX/DOCX extractors
 pip install -e ".[binary]"
 ```
 
@@ -28,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~583 tests on Windows / 557 + 5 platform-conditional skips on Linux
+python -m pytest -v          # ~734 tests on Windows / ~708 + 5 platform-conditional skips on Linux
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -183,6 +186,49 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.9 added
+
+Hardening patch -- no new features, ten safety + consistency fixes.
+
+**P0 click_xy safety**
+- `SafetyConfig.allow_coordinate_clicks: bool = True` (forced `False`
+  by `safe_mode=True` via the existing master kill-switch pattern).
+- `BrowserActions._do_click_xy` now runs
+  `document.elementFromPoint(x, y)` (when `allow_form_submit=False`)
+  to inspect the target stack and block submit / login / delete / pay
+  controls.
+
+**P0 remote_cdp ownership token**
+- New `web_agent/ownership.py:OwnershipToken` writes
+  `<profile_dir>/.webtool-ownership` on every isolated launch.
+- `BrowserConfig.remote_cdp_ownership_token` +
+  `remote_cdp_profile_dir` are **required** for `backend='remote_cdp'`.
+- `BrowserManager.start()` verifies the token via
+  `secrets.compare_digest` before opening `connect_over_cdp`.
+- Sibling `remote_cdp` Agents read the token via
+  `OwnershipToken.read(profile_dir)`.
+
+**Named profile -> launch_persistent_context**
+- `chromium.launch_persistent_context` returns a `BrowserContext`, not
+  a `Browser`. All callers share the single persistent context via
+  the new `_NoCloseContextProxy` (no-op `close()`); the persistent
+  context is closed once from `BrowserManager.stop()`.
+- Cookies / localStorage now actually persist across `Agent`
+  lifetimes (integration test in `tests/test_agent.py::TestV169NamedProfilePersistence`).
+
+**Other**
+- `BrowserConfig.disable_chromium_sandbox: Optional[bool] = None`
+  auto-detects CI / container; local dev keeps the Chromium sandbox
+  enabled.
+- New `WebFetcher.fetch_smart` consolidates binary-vs-HTML routing;
+  every Agent + Recipes call site now uses it.
+- `mcp[cli]` moved to `[project.optional-dependencies] mcp`; install
+  with `pip install "web-agent-toolkit[mcp]"`.
+- `BrowserConfig.locale` / `timezone_id` / `user_agent_mode` /
+  `user_agent` configurable (defaults preserve v1.6.8 behavior).
+- `SkillsConfig.enabled` -> `project_skills_enabled` with deprecation
+  alias.
 
 ## What v1.6.8 added
 

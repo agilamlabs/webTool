@@ -340,9 +340,11 @@ class Recipes:
             reverse=True,
         )
 
-        # Fetch top hit
+        # Fetch top hit -- v1.6.9: route through fetch_smart so an
+        # extensionless binary URL (PDF served as Content-Type:application/pdf)
+        # gets fetch_binary'd instead of dumped into the HTML extractor.
         top = ranked[0]
-        fetch_result = await self._fetcher.fetch(top.url, session_id=session_id)
+        fetch_result = await self._fetcher.fetch_smart(top.url, session_id=session_id)
         extracted = self._extractor.extract(fetch_result)
         # Inherit correlation_id from current scope
         extracted.correlation_id = get_correlation_id()
@@ -548,8 +550,11 @@ class Recipes:
         ranked = sorted(allowed, key=lambda r: scores[r.url], reverse=True)
         targets = ranked[:max_pages]
 
-        # Fetch in parallel (bounded by BrowserManager semaphore inside fetcher)
-        fetch_tasks = [self._fetcher.fetch(r.url, session_id=session_id) for r in targets]
+        # Fetch in parallel (bounded by BrowserManager semaphore inside
+        # fetcher). v1.6.9: route through fetch_smart so extensionless
+        # binary URLs (regulator dashboards etc.) get fetch_binary'd
+        # instead of HTML-extracted.
+        fetch_tasks = [self._fetcher.fetch_smart(r.url, session_id=session_id) for r in targets]
         fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
         citations: list[Citation] = []
