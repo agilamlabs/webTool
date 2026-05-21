@@ -734,3 +734,484 @@ class TestV1611Integration:
             f"expected .pdf to be downloaded (Tier 1 match), got {called_url}"
         )
         assert result.status == FetchStatus.SUCCESS
+
+
+class TestV1612Integration:
+    """v1.6.12 throttle + telemetry-depth integration tests.
+
+    Covers Item 1 (parse_retry_after parser), Item 1 (RateLimiter.notify_429
+    extends next_allowed), Item 2 (WebFetcher's 429 branch composes the
+    two helpers + raises a retryable Exception), and Item 3
+    (NetworkEvent captures ``ttfb_ms`` + ``body_size`` from Playwright's
+    ``request.timing`` and ``Content-Length``). Pure unit tests on
+    helpers + a mock-driven collector test -- no Playwright launch.
+    """
+
+    def test_parse_retry_after_seconds(self) -> None:
+        """v1.6.12 Item 1: integer ``Retry-After`` form is the most
+        common server response. Tolerates whitespace + clamps to >= 0.
+        Returns None on absent or unparseable input."""
+        from web_agent.utils import parse_retry_after
+
+        assert parse_retry_after("120") == 120.0
+        assert parse_retry_after("  60  ") == 60.0
+        assert parse_retry_after("0") == 0.0
+        assert parse_retry_after(None) is None
+        assert parse_retry_after("") is None
+        assert parse_retry_after("not-a-number") is None
+        # Negative integer parses but clamps via the max() guard.
+        assert parse_retry_after("-5") == 0.0
+
+    def test_parse_retry_after_http_date(self) -> None:
+        """v1.6.12 Item 1: HTTP-date ``Retry-After`` form (RFC 9110
+        §10.2.3 alternate). Future dates return positive seconds; past
+        dates clamp to 0.0 (never negative)."""
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+
+        from web_agent.utils import parse_retry_after
+
+        future = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=10))
+        delta_future = parse_retry_after(future)
+        assert delta_future is not None
+        assert 8.0 < delta_future < 12.0, f"expected ~10s ahead, got {delta_future}"
+
+        past = format_datetime(datetime.now(timezone.utc) - timedelta(seconds=10))
+        delta_past = parse_retry_after(past)
+        assert delta_past == 0.0, f"expected clamped 0.0 for past date, got {delta_past}"
+
+    @pytest.mark.asyncio
+    async def test_rate_limiter_notify_429_extends_next_allowed(self) -> None:
+        """v1.6.12 Item 1: ``notify_429(host, retry_after)`` extends the
+        host's ``_next_allowed`` so the next ``acquire(host)`` waits
+        long enough. With ``retry_after=None`` the fallback is
+        ``interval * fallback_factor`` (default 2.0) -- doubles the
+        per-host interval. The 429 tally is recorded."""
+        import time as _time
+
+        from web_agent.rate_limiter import RateLimiter
+
+        # rps=10 -> interval=0.1s; fallback_factor=2.0 -> 0.2s fallback.
+        rl = RateLimiter(rps_per_host=10.0)
+
+        # Explicit retry_after wins when larger than the fallback.
+        before = _time.monotonic()
+        rl.notify_429("example.com", retry_after_seconds=0.5)
+        delta = rl._next_allowed["example.com"] - before
+        assert 0.45 < delta < 0.55, f"expected ~0.5s, got {delta}"
+        assert rl._429_counts == {"example.com": 1}
+
+        # Fallback fires when retry_after is None -- 0.2s (= 0.1 * 2).
+        before2 = _time.monotonic()
+        rl.notify_429("other.example", retry_after_seconds=None)
+        delta2 = rl._next_allowed["other.example"] - before2
+        assert 0.18 < delta2 < 0.25, f"expected ~0.2s fallback, got {delta2}"
+        assert rl._429_counts["other.example"] == 1
+
+        # Disabled limiter is a no-op.
+        rl_off = RateLimiter(rps_per_host=0)
+        rl_off.notify_429("example.com", retry_after_seconds=10.0)
+        assert "example.com" not in rl_off._next_allowed
+        assert rl_off._429_counts == {}
+
+    def test_signal_429_helper_signals_limiter_and_returns_retry_after(self) -> None:
+        """v1.6.12 review-pass I-5: ``WebFetcher._signal_429`` is the
+        shared helper used by both ``_fetch_with_retry`` (HTML, retry-
+        wrapped, then raises) and ``fetch_binary`` (no retry, then
+        returns HTTP_ERROR). Test the helper directly so we have
+        proper coverage of the (parse_retry_after, notify_429,
+        return-value) contract -- the source-inspection check in the
+        next test only catches code-removal regressions, not
+        wrong-argument bugs.
+        """
+        import time as _time
+        from unittest.mock import MagicMock
+
+        from web_agent.config import AppConfig
+        from web_agent.rate_limiter import RateLimiter
+        from web_agent.web_fetcher import WebFetcher
+
+        rl = RateLimiter(rps_per_host=2.0)  # interval 0.5s -> fallback 1.0s
+        wf = WebFetcher(
+            browser_manager=MagicMock(),
+            config=AppConfig(),
+            rate_limiter=rl,
+        )
+
+        # 1. Retry-After present -> parsed value returned, limiter signalled.
+        resp = MagicMock()
+        resp.headers = {"retry-after": "7"}
+        before = _time.monotonic()
+        parsed = wf._signal_429(resp, "https://example.com/x", "example.com")
+        assert parsed == 7.0, f"expected 7.0s, got {parsed}"
+        assert rl._429_counts == {"example.com": 1}
+        remaining = rl._next_allowed["example.com"] - before
+        assert 6.5 < remaining < 7.5, f"expected ~7s wait, got {remaining}"
+
+        # 2. Retry-After absent -> None returned, fallback (interval *
+        #    fallback_factor = 1.0s) applied.
+        rl2 = RateLimiter(rps_per_host=2.0)
+        wf2 = WebFetcher(
+            browser_manager=MagicMock(),
+            config=AppConfig(),
+            rate_limiter=rl2,
+        )
+        resp2 = MagicMock()
+        resp2.headers = {}
+        before2 = _time.monotonic()
+        parsed2 = wf2._signal_429(resp2, "https://example.com/x", "example.com")
+        assert parsed2 is None, f"expected None, got {parsed2}"
+        remaining2 = rl2._next_allowed["example.com"] - before2
+        assert 0.9 < remaining2 < 1.2, f"expected ~1.0s fallback, got {remaining2}"
+
+        # 3. No rate limiter wired -> helper still parses Retry-After
+        #    and returns it (no-op on the absent limiter).
+        wf3 = WebFetcher(browser_manager=MagicMock(), config=AppConfig())
+        resp3 = MagicMock()
+        resp3.headers = {"retry-after": "5"}
+        parsed3 = wf3._signal_429(resp3, "https://example.com/x", "example.com")
+        assert parsed3 == 5.0
+
+    def test_webfetcher_429_branch_composes_helpers(self) -> None:
+        """v1.6.12 Item 2: the 429 detection branch in WebFetcher.fetch
+        composes ``parse_retry_after`` + ``RateLimiter.notify_429``.
+
+        We test the composition contract (the helper calls and their
+        observable effects) plus a source-inspection check that the
+        branch exists in :meth:`WebFetcher.fetch`. A full Playwright
+        round-trip would require mocking the BrowserManager + page
+        chain at depth; live integration tests cover that path.
+        """
+        import inspect
+        import time as _time
+        from unittest.mock import MagicMock
+
+        from web_agent.rate_limiter import RateLimiter
+        from web_agent.utils import parse_retry_after
+        from web_agent.web_fetcher import WebFetcher
+
+        # 1. Composition: simulate what the branch does.
+        mock_response = MagicMock()
+        mock_response.headers = {"retry-after": "3"}
+        parsed = parse_retry_after(mock_response.headers.get("retry-after"))
+        assert parsed == 3.0
+
+        rl = RateLimiter(rps_per_host=2.0)  # interval 0.5s -> fallback 1.0s
+        before = _time.monotonic()
+        rl.notify_429("example.com", parsed)
+
+        remaining = rl._next_allowed["example.com"] - before
+        assert 2.5 < remaining < 3.5, (
+            f"3.0s Retry-After > 1.0s fallback -> expect ~3s wait, got {remaining}"
+        )
+        assert rl._429_counts == {"example.com": 1}
+
+        # 2. Source check: BOTH the HTML path (``_fetch_with_retry``)
+        # AND the binary path (``fetch_binary``) call ``_signal_429``
+        # on status_code 429. The HTML path raises (retry-wrapped);
+        # the binary path returns HTTP_ERROR. Use class-level
+        # inspect.getsource because ``_fetch_with_retry`` is nested
+        # inside :meth:`fetch`.
+        src = inspect.getsource(WebFetcher)
+        assert "status_code == 429" in src, "HTML 429 branch missing"
+        assert "resp.status_code == 429" in src, (
+            "binary 429 branch missing from fetch_binary (review-pass C-2)"
+        )
+        assert "_signal_429" in src, "shared 429 helper missing"
+        assert "notify_429" in src, "notify_429 call missing from _signal_429"
+        assert "parse_retry_after" in src, "parse_retry_after call missing from _signal_429"
+
+    def test_extract_json_ld_parses_single_object_and_array_and_graph(self) -> None:
+        """v1.6.12 structured-data slice: ``_extract_json_ld`` handles
+        the three top-level JSON-LD shapes (single object, array,
+        ``@graph`` wrapper) and unwraps ``@graph`` so callers get a
+        flat list of items, not the wrapper."""
+        from web_agent.content_extractor import _extract_json_ld
+
+        # 1. Single object
+        html_single = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Product","name":"Widget","offers":{"price":"9.99"}}
+        </script>
+        </head><body>x</body></html>
+        """
+        blocks = _extract_json_ld(html_single)
+        assert len(blocks) == 1
+        assert blocks[0]["@type"] == "Product"
+        assert blocks[0]["name"] == "Widget"
+
+        # 2. Top-level array
+        html_array = """
+        <html><head>
+        <script type="application/ld+json">
+        [{"@type":"Article","headline":"A"},{"@type":"Article","headline":"B"}]
+        </script>
+        </head><body>x</body></html>
+        """
+        blocks = _extract_json_ld(html_array)
+        assert [b["headline"] for b in blocks] == ["A", "B"]
+
+        # 3. @graph wrapper -- unwrapped to items
+        html_graph = """
+        <html><head>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@graph":[
+            {"@type":"BreadcrumbList","itemListElement":[]},
+            {"@type":"WebPage","name":"Home"}
+        ]}
+        </script>
+        </head></html>
+        """
+        blocks = _extract_json_ld(html_graph)
+        assert {b["@type"] for b in blocks} == {"BreadcrumbList", "WebPage"}
+
+    def test_extract_json_ld_handles_recursion_error_dos(self) -> None:
+        """v1.6.12 review-pass C-1: an adversarial JSON-LD blob with
+        thousands of levels of nesting raises ``RecursionError`` from
+        ``json.loads`` (CPython default recursion limit ~1000).
+        ``RecursionError`` derives from ``RuntimeError`` -> ``Exception``,
+        NOT ``ValueError`` or ``JSONDecodeError``, so the original
+        v1.6.12 exception tuple did NOT catch it -- a single malicious
+        page would crash the entire ``extract()`` call. This test
+        verifies the explicit ``RecursionError`` catch added in the
+        review pass."""
+        from web_agent.content_extractor import _extract_json_ld
+
+        # 5000-deep array nesting is well above the CPython recursion
+        # limit (~1000 levels). ``json.loads`` raises RecursionError
+        # on this input -- verified with a smoke test before writing.
+        deep_payload = "[" * 5000 + "]" * 5000
+        html = (
+            "<html><head>"
+            f'<script type="application/ld+json">{deep_payload}</script>'
+            '<script type="application/ld+json">'
+            '{"@type":"Article","headline":"Valid"}'
+            "</script>"
+            "</head></html>"
+        )
+        # MUST NOT RAISE. The valid block must still extract.
+        blocks = _extract_json_ld(html)
+        assert len(blocks) == 1, f"expected only the valid block to survive, got {len(blocks)}"
+        assert blocks[0]["headline"] == "Valid"
+
+    def test_extract_json_ld_swallows_malformed(self) -> None:
+        """v1.6.12: many sites ship broken JSON-LD (trailing commas,
+        single-quoted keys, embedded newlines without escaping). The
+        parser must NEVER raise -- malformed blocks are silently
+        skipped so the rest of the page still extracts."""
+        from web_agent.content_extractor import _extract_json_ld
+
+        html = """
+        <html><head>
+        <script type="application/ld+json">{this is not json}</script>
+        <script type="application/ld+json">
+            {"@type":"Product","name":"Widget",}
+        </script>
+        <script type="application/ld+json">
+            {"@type":"Article","headline":"Valid"}
+        </script>
+        </head></html>
+        """
+        blocks = _extract_json_ld(html)
+        # Only the valid block (Article) parses. The two malformed ones
+        # are swallowed.
+        assert len(blocks) == 1
+        assert blocks[0]["headline"] == "Valid"
+
+        # Empty / no JSON-LD -> empty list, not None or error.
+        assert _extract_json_ld("<html><body>x</body></html>") == []
+        assert _extract_json_ld("") == []
+
+    @pytest.mark.asyncio
+    async def test_network_collector_async_body_capture(self) -> None:
+        """v1.6.12: when ``capture_response_bodies=True`` AND the
+        Content-Type matches ``body_capture_content_types``, the
+        collector schedules an async body read. ``wait_for_pending_bodies``
+        drains the queued tasks so the captured body lands on the
+        NetworkEvent before snapshotting."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.config import DiagnosticsConfig
+        from web_agent.network_collector import NetworkCollector
+
+        diag = DiagnosticsConfig(
+            capture_network=True,
+            capture_response_bodies=True,
+            max_response_body_bytes=4096,
+            max_network_events=10,
+        )
+        collector = NetworkCollector(diag)
+
+        page = MagicMock()
+        import collections
+
+        collector._events[page] = collections.deque(maxlen=10)
+        collector._req_start[page] = {}
+
+        # Fake request with timing
+        req = MagicMock()
+        req.url = "https://api.example.com/data"
+        req.method = "GET"
+        req.resource_type = "xhr"
+        req.headers = {}
+        req.timing = {"startTime": 0.0, "responseStart": 10.0, "responseEnd": 50.0}
+
+        # Fake response: JSON content-type + body() returns a bytes payload
+        resp = MagicMock()
+        resp.request = req
+        resp.status = 200
+        resp.headers = {"content-type": "application/json", "content-length": "27"}
+        resp.body = AsyncMock(return_value=b'{"title":"Hello","value":42}')
+
+        collector._on_response(page, resp)
+        await collector.wait_for_pending_bodies()
+
+        events = collector.events_for(page)
+        assert len(events) == 1
+        evt = events[0]
+        assert evt.body_text == '{"title":"Hello","value":42}', (
+            f"body_text not captured: {evt.body_text!r}"
+        )
+        assert evt.body_truncated is False
+
+    @pytest.mark.asyncio
+    async def test_network_collector_body_capture_truncates_oversized(self) -> None:
+        """v1.6.12: bodies larger than ``max_response_body_bytes`` are
+        truncated byte-wise BEFORE decoding, and ``body_truncated`` is
+        set to True. Memory cap enforced regardless of server size."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.config import DiagnosticsConfig
+        from web_agent.network_collector import NetworkCollector
+
+        diag = DiagnosticsConfig(
+            capture_network=True,
+            capture_response_bodies=True,
+            max_response_body_bytes=1024,
+        )
+        collector = NetworkCollector(diag)
+        page = MagicMock()
+        import collections
+
+        collector._events[page] = collections.deque(maxlen=10)
+        collector._req_start[page] = {}
+
+        req = MagicMock()
+        req.url = "https://api.example.com/large"
+        req.method = "GET"
+        req.resource_type = "xhr"
+        req.headers = {}
+        req.timing = {"startTime": 0.0, "responseStart": 5.0}
+
+        big_body = b'{"data":"' + b"x" * 5000 + b'"}'
+        resp = MagicMock()
+        resp.request = req
+        resp.status = 200
+        resp.headers = {"content-type": "application/json"}
+        resp.body = AsyncMock(return_value=big_body)
+
+        collector._on_response(page, resp)
+        await collector.wait_for_pending_bodies()
+
+        events = collector.events_for(page)
+        assert len(events) == 1
+        evt = events[0]
+        assert evt.body_text is not None
+        assert len(evt.body_text.encode("utf-8")) <= 1024
+        assert evt.body_truncated is True
+
+    def test_extractor_prefer_api_routes_through_json_body(self) -> None:
+        """v1.6.12: ``ContentExtractor.extract(prefer_api=True)`` routes
+        extraction through a captured JSON response body instead of
+        the rendered HTML, when one is available. Falls back to HTML
+        extraction when no usable body is captured."""
+        from web_agent.config import AppConfig
+        from web_agent.content_extractor import ContentExtractor
+        from web_agent.models import FetchResult, NetworkEvent
+
+        cfg = AppConfig()
+        extractor = ContentExtractor(cfg)
+
+        json_body = '{"title":"API Title","content":"This is the real content","value":42}'
+        fr = FetchResult(
+            url="https://spa.example.com/page",
+            final_url="https://spa.example.com/page",
+            status=FetchStatus.SUCCESS,
+            html="<html><body>Some rendered junk</body></html>",
+            network_events=[
+                NetworkEvent(
+                    event_type="response",
+                    url="https://spa.example.com/api/page-data",
+                    method="GET",
+                    resource_type="xhr",
+                    status_code=200,
+                    content_type="application/json",
+                    body_text=json_body,
+                    body_truncated=False,
+                ),
+            ],
+        )
+
+        result = extractor.extract(fr, prefer_api=True)
+        assert result.extraction_method == "api_json", (
+            f"expected api_json, got {result.extraction_method}"
+        )
+        assert result.title == "API Title"
+        assert result.content is not None
+        assert "real content" in result.content
+
+        # Without prefer_api=True, the html path is used instead.
+        result2 = extractor.extract(fr, prefer_api=False)
+        assert result2.extraction_method != "api_json"
+
+    def test_network_event_captures_ttfb_and_body_size(self) -> None:
+        """v1.6.12 Item 3: ``_on_response`` reads
+        ``request.timing['responseStart']`` into ``NetworkEvent.ttfb_ms``
+        and ``Content-Length`` into ``NetworkEvent.body_size``.
+
+        Drives :meth:`NetworkCollector._on_response` directly with mocks
+        for the Playwright Request + Response (no browser launch)."""
+        from unittest.mock import MagicMock
+
+        from web_agent.config import DiagnosticsConfig
+        from web_agent.network_collector import NetworkCollector
+
+        diag = DiagnosticsConfig(capture_network=True, max_network_events=100)
+        collector = NetworkCollector(diag)
+
+        # Fake Page with a real-ish identity so the collector's
+        # WeakKeyDictionary can key off it. A bare object() works.
+        page = MagicMock()
+        # Pre-register the events deque so _on_response can append.
+        import collections
+
+        collector._events[page] = collections.deque(maxlen=100)
+        collector._req_start[page] = {}
+
+        # Fake Playwright Request: has url, method, resource_type,
+        # headers (dict), and a ``timing`` attribute with
+        # ``responseStart`` in ms.
+        req = MagicMock()
+        req.url = "https://example.com/doc"
+        req.method = "GET"
+        req.resource_type = "document"
+        req.headers = {}
+        req.timing = {"startTime": 0.0, "responseStart": 25.0, "responseEnd": 100.0}
+
+        # Fake Response with headers carrying Content-Length.
+        resp = MagicMock()
+        resp.request = req
+        resp.status = 200
+        resp.headers = {"content-type": "text/html", "content-length": "1024"}
+
+        collector._on_response(page, resp)
+
+        events = collector.events_for(page)
+        assert len(events) == 1, f"expected 1 event, got {len(events)}"
+        evt = events[0]
+        assert evt.event_type == "response"
+        assert evt.ttfb_ms == 25.0, f"expected ttfb_ms 25.0, got {evt.ttfb_ms!r}"
+        assert evt.body_size == 1024, f"expected body_size 1024, got {evt.body_size!r}"
+        assert evt.status_code == 200
+        assert evt.content_type == "text/html"

@@ -162,6 +162,51 @@ class NonRetryableHTTPError(Exception):
 # exceptions. If that changes, add ``RetryableHTTPError`` back here.
 
 
+def parse_retry_after(header_value: str | None) -> float | None:
+    """Parse an HTTP ``Retry-After`` header into seconds-from-now.
+
+    RFC 9110 §10.2.3: the header is EITHER an integer (delta-seconds)
+    OR an HTTP-date. Both forms are handled here; the result is the
+    number of seconds the client should wait before retrying.
+
+    v1.6.12: introduced so :meth:`RateLimiter.notify_429` and
+    :class:`WebFetcher` can back off the right amount on a 429
+    response. Exported from ``web_agent`` so callers writing custom
+    backoff logic can reuse it.
+
+    Args:
+        header_value: Raw header value or ``None`` (e.g. from
+            ``response.headers.get("retry-after")``).
+
+    Returns:
+        Float seconds from now (``>= 0.0``), or ``None`` if the header
+        is absent or unparseable. Negative deltas (past dates) clamp
+        to ``0.0``.
+    """
+    if not header_value:
+        return None
+    val = header_value.strip()
+    # Try integer seconds first (most common server form).
+    try:
+        return max(0.0, float(int(val)))
+    except (ValueError, TypeError):
+        pass
+    # Fall back to HTTP-date. ``parsedate_to_datetime`` raises on
+    # malformed input (typeshed types it as returning a ``datetime``,
+    # not ``Optional[datetime]``) so the try/except is the right gate.
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        target = parsedate_to_datetime(val)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        delta = (target - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Retry Policy Profiles
 # ---------------------------------------------------------------------------

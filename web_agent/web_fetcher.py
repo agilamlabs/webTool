@@ -40,6 +40,7 @@ from .utils import (
     async_retry,
     check_domain_allowed,
     get_random_user_agent,
+    parse_retry_after,
 )
 
 # Common office documents and archives -- shared between the fetcher
@@ -281,6 +282,42 @@ class WebFetcher:
         # download_candidates_runtime on success. None when the Agent
         # didn't provide one (older test scaffolding).
         self._network_collector = network_collector
+
+    # ------------------------------------------------------------------
+    # v1.6.12: shared 429 signalling helper
+    # ------------------------------------------------------------------
+
+    def _signal_429(self, response: Any, url: str, host: str) -> float | None:
+        """v1.6.12: parse ``Retry-After`` and notify the rate limiter.
+
+        Used by BOTH the HTML path (``_fetch_with_retry`` -- which then
+        raises a retryable Exception) and the binary path
+        (``fetch_binary`` -- which then returns ``FetchResult(status=
+        HTTP_ERROR)`` since the binary path is not retry-wrapped).
+        Does NOT raise itself -- callers decide on the post-signal
+        action.
+
+        Args:
+            response: Playwright Response (HTML path) or httpx Response
+                (binary path). Both expose ``.headers`` as a mapping
+                with lowercase keys.
+            url: Full URL of the request (for logging context only).
+            host: Hostname for the rate-limiter signal.
+
+        Returns:
+            Parsed ``Retry-After`` value in seconds, or ``None`` when
+            the header was absent or unparseable. Useful for callers
+            wanting to include the value in an error message.
+        """
+        retry_after: float | None = None
+        try:
+            if response is not None:
+                retry_after = parse_retry_after(response.headers.get("retry-after"))
+        except Exception:  # pragma: no cover -- defensive
+            pass
+        if self._rate_limiter is not None:
+            self._rate_limiter.notify_429(host, retry_after)
+        return retry_after
 
     async def fetch_smart(
         self,
@@ -573,6 +610,18 @@ class WebFetcher:
 
             if status_code and status_code in cfg.non_retryable_status_codes:
                 raise NonRetryableHTTPError(status_code, url)
+            if status_code == 429:
+                # v1.6.12: signal the rate limiter (extends next_allowed
+                # so the next ``acquire(host)`` waits Retry-After or
+                # fallback) then raise a retryable Exception so
+                # ``async_retry`` retries with the new wait honoured.
+                # Helper shared with ``fetch_binary``.
+                host = urlparse(url).hostname or ""
+                retry_after = self._signal_429(response, url, host)
+                raise Exception(
+                    f"HTTP 429 Too Many Requests for {url}"
+                    + (f" (Retry-After: {retry_after}s)" if retry_after is not None else "")
+                )
             if status_code and status_code >= 500:
                 raise Exception(f"Server error HTTP {status_code}")
 
@@ -584,6 +633,31 @@ class WebFetcher:
 
             html = await page.content()
 
+            # v1.6.12: true DOM parse time = ``domInteractive -
+            # responseEnd`` (time from "response fully received" to
+            # "DOM tree built"). Earlier draft used ``domComplete -
+            # domInteractive`` but that includes subresource loading +
+            # deferred-script execution -- it's post-parse load time,
+            # not parse time. Best-effort + swallowed on failure;
+            # ``about:blank`` / ``data:`` URLs and sandboxed iframes
+            # don't expose the Navigation Timing API.
+            dom_parse_ms: float | None = None
+            try:
+                dom_val = await page.evaluate(
+                    "() => {"
+                    " const entries = performance.getEntriesByType('navigation');"
+                    " if (!entries.length) return null;"
+                    " const nav = entries[0];"
+                    " if (typeof nav.domInteractive !== 'number' "
+                    "|| typeof nav.responseEnd !== 'number') return null;"
+                    " return Math.max(0, nav.domInteractive - nav.responseEnd);"
+                    "}"
+                )
+                if dom_val is not None:
+                    dom_parse_ms = round(float(dom_val), 2)
+            except Exception:  # pragma: no cover -- defensive
+                pass
+
             # v1.6.8: snapshot network events / api_candidates / download
             # intents BEFORE the caller closes the Page. The deques live
             # in a WeakKeyDictionary so a closed Page evicts them; we
@@ -592,9 +666,41 @@ class WebFetcher:
             api_cands: list[str] = []
             dl_intents: list[str] = []
             if self._network_collector is not None:
+                # v1.6.12: when response-body capture is on, drain any
+                # in-flight body reads BEFORE snapshotting so the
+                # captured bodies land on the events the caller sees.
+                # Bounded wait (5s default) so a stuck body never
+                # blocks the fetch indefinitely.
+                if self._config.diagnostics.capture_response_bodies:
+                    await self._network_collector.wait_for_pending_bodies()
                 net_events = self._network_collector.events_for(page)
                 api_cands = self._network_collector.api_candidates_for(page)
                 dl_intents = self._network_collector.download_intents_for(page)
+
+            # v1.6.12: aggregate per-fetch telemetry from network events.
+            # ``ttfb_ms`` = the document request's TTFB (not subresources).
+            # ``total_bytes_downloaded`` = page weight = sum of
+            # Content-Length over ALL response events (main doc +
+            # subresources: images, scripts, CSS, ...). The response
+            # body for the navigation itself is ``len(html)``.
+            ttfb_ms: float | None = None
+            total_bytes_downloaded: int | None = None
+            if net_events:
+                for evt in net_events:
+                    if (
+                        evt.event_type == "response"
+                        and evt.resource_type == "document"
+                        and evt.ttfb_ms is not None
+                    ):
+                        ttfb_ms = evt.ttfb_ms
+                        break
+                total = sum(
+                    evt.body_size or 0
+                    for evt in net_events
+                    if evt.event_type == "response" and evt.body_size
+                )
+                if total > 0:
+                    total_bytes_downloaded = total
 
             return FetchResult(
                 url=url,
@@ -606,6 +712,9 @@ class WebFetcher:
                 network_events=net_events,
                 api_candidates=api_cands,
                 download_candidates_runtime=dl_intents,
+                ttfb_ms=ttfb_ms,
+                dom_parse_ms=dom_parse_ms,
+                total_bytes_downloaded=total_bytes_downloaded,
             )
         except Exception as exc:
             # Capture debug artifacts on any failure path before re-raising
@@ -859,6 +968,31 @@ class WebFetcher:
                                 final_url=final_url,
                                 status=FetchStatus.BLOCKED,
                                 error_message=f"Redirected to disallowed URL: {final_url}",
+                                response_time_ms=timer.elapsed_ms,
+                                correlation_id=cid,
+                            )
+                        if resp.status_code == 429:
+                            # v1.6.12: signal the rate limiter so the
+                            # next ``fetch_binary`` call on this host
+                            # waits Retry-After. ``fetch_binary`` is
+                            # NOT retry-wrapped (unlike the HTML path),
+                            # so we return HTTP_ERROR rather than raise
+                            # -- the caller decides whether to retry.
+                            host = urlparse(url).hostname or ""
+                            retry_after = self._signal_429(resp, url, host)
+                            return FetchResult(
+                                url=url,
+                                final_url=final_url,
+                                status_code=resp.status_code,
+                                status=FetchStatus.HTTP_ERROR,
+                                error_message=(
+                                    "HTTP 429 Too Many Requests"
+                                    + (
+                                        f" (Retry-After: {retry_after}s)"
+                                        if retry_after is not None
+                                        else ""
+                                    )
+                                ),
                                 response_time_ms=timer.elapsed_ms,
                                 correlation_id=cid,
                             )

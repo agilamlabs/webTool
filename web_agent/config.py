@@ -985,6 +985,41 @@ class DiagnosticsConfig(BaseSettings):
         default=False,
         description="Capture response headers on each NetworkEvent. Off by default.",
     )
+    capture_response_bodies: bool = Field(
+        default=False,
+        description=(
+            "v1.6.12: capture response body text into ``NetworkEvent.body_text`` "
+            "for responses whose Content-Type matches ``body_capture_content_types``. "
+            "Off by default because body capture costs memory (each event holds "
+            "up to ``max_response_body_bytes`` bytes). Required for "
+            "``ContentExtractor.extract(prefer_api=True)`` to find usable JSON "
+            "payloads. Capture is async-scheduled from the response handler; "
+            "callers needing bodies must ``await NetworkCollector.wait_for_pending_bodies()`` "
+            "before snapshotting (already wired into :meth:`WebFetcher.fetch`)."
+        ),
+    )
+    max_response_body_bytes: int = Field(
+        default=262144,
+        ge=1024,
+        le=10 * 1024 * 1024,
+        description=(
+            "v1.6.12: per-response body cap in bytes. Bodies larger than this "
+            "are truncated and ``NetworkEvent.body_truncated`` is set to True. "
+            "Default 256 KiB -- enough for the typical API JSON payload, small "
+            "enough that 500 events x 256 KiB = ~125 MiB worst-case memory use. "
+            "Only consulted when ``capture_response_bodies=True``."
+        ),
+    )
+    body_capture_content_types: list[str] = Field(
+        default_factory=lambda: ["application/json", "application/ld+json", "text/json"],
+        description=(
+            "v1.6.12: Content-Type prefixes whose response bodies should be "
+            "captured. Matched case-insensitively against the start of the "
+            "response Content-Type (before any '; charset=...' suffix). Default "
+            "covers JSON variants. Add 'text/html' (cautious -- HTML can be "
+            "large) or other types for non-JSON capture."
+        ),
+    )
     capture_download_intents: bool = Field(
         default=False,
         description=(

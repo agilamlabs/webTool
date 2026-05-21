@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.11**
+- Latest version: **1.6.12**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~744 tests on Windows / ~718 + 5 platform-conditional skips on Linux
+python -m pytest -v          # ~755 tests on Windows / ~729 + 5 platform-conditional skips on Linux
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -186,6 +186,90 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.12 added
+
+Throttle + telemetry + structured-data patch on v1.6.11. Three
+slices: HTTP 429 handling, granular per-fetch telemetry, and
+structured-data extraction (JSON-LD always-on plus opt-in XHR/fetch
+JSON body capture and a `prefer_api` extractor mode).
+
+**Behaviour change (Item 1)**
+- HTTP 429 ("Too Many Requests") no longer returns
+  `FetchResult(status=SUCCESS, status_code=429)`. The new branch in
+  `WebFetcher._fetch_with_retry`:
+  1. Parses `Retry-After` via the new `parse_retry_after` helper.
+  2. Signals the per-host `RateLimiter` via the new `notify_429`
+     method -- extends `_next_allowed` so the next `acquire(host)`
+     waits at least `max(Retry-After, interval * 2.0)`.
+  3. Raises a retryable `Exception`, so `async_retry` retries with
+     the new wait honoured.
+
+  **Migration**: callers explicitly checking
+  `fetch_result.status_code == 429` will no longer see that case --
+  they will see either a successful retry result OR (after
+  `max_retries` exhausted) a raised `Exception`.
+
+**New public API (Item 2)**
+- `parse_retry_after(header_value: str | None) -> float | None` --
+  RFC 9110 §10.2.3 parser handling both integer-seconds and HTTP-date
+  forms. Re-exported from `web_agent`. Uses `email.utils` (stdlib).
+
+**New rate limiter method**
+- `RateLimiter.notify_429(host, retry_after_seconds=None, *, fallback_factor=2.0)`
+  -- callers use the limiter via `Agent` indirection, but the method
+  is callable on any constructed `RateLimiter` for advanced
+  scenarios. Internal `_429_counts` tally tracked for a future
+  adaptive-rps policy.
+
+**Telemetry depth (Item 3)**
+- `NetworkEvent.ttfb_ms` -- from Playwright's
+  `request.timing['responseStart']`. None on cross-origin requests
+  with restricted `Timing-Allow-Origin`.
+- `NetworkEvent.body_size` -- from `Content-Length` header. None on
+  chunked responses (we deliberately avoid `await response.body()`).
+- `FetchResult.ttfb_ms` -- TTFB of the first `document`-typed
+  response (the navigation).
+- `FetchResult.dom_parse_ms` -- from
+  `performance.getEntriesByType('navigation')[0]`'s
+  `domInteractive - responseEnd` (true parse time, not post-parse
+  load). None on `about:blank` / `data:` / sandboxed iframes.
+- `FetchResult.total_bytes_downloaded` -- page weight = sum across
+  all response `body_size` values when `capture_network=True`
+  (includes main document + subresources -- use `len(html)` for
+  the navigation response body size).
+
+All five new model fields are `Optional[...]` with `None` default.
+
+**Structured-data extraction (Items 6-8)**
+- **JSON-LD enrichment (always-on)**.
+  `ExtractionResult.structured_data: list[dict]` populated from
+  `<script type="application/ld+json">` blocks on every HTML
+  extraction. `@graph` containers are unwrapped. Malformed JSON-LD
+  is swallowed (very common in the wild). Module-level
+  `_extract_json_ld(html)` helper.
+- **XHR/fetch body capture (opt-in)**.
+  `DiagnosticsConfig.capture_response_bodies` + companion
+  `max_response_body_bytes` (default 256 KiB) +
+  `body_capture_content_types` (default JSON variants). When on,
+  `NetworkCollector` schedules async body reads + drains them via
+  the new `wait_for_pending_bodies(timeout=5.0)` (auto-wired into
+  `WebFetcher.fetch`). Two new `NetworkEvent` fields:
+  `body_text: Optional[str]` + `body_truncated: bool`.
+- **`ContentExtractor.extract(prefer_api=True)`** routes through
+  the largest captured JSON body when one is available; falls back
+  transparently to trafilatura/bs4/raw when not. New extraction
+  method value `"api_json"`. Useful on SPAs where the XHR payload
+  is strictly cleaner than the rendered DOM.
+
+**Tests**
+- 11 new unit-level integration tests in
+  `tests/test_agent.py::TestV1612Integration`. Originals:
+  `parse_retry_after` × 2, `notify_429`, `_signal_429`, WebFetcher
+  429-branch source-inspection, `NetworkCollector._on_response`
+  TTFB+body-size capture. New for structured-data:
+  `_extract_json_ld` happy + malformed-tolerant, async body capture
+  + truncation, `prefer_api=True` extractor routing.
 
 ## What v1.6.11 added
 
