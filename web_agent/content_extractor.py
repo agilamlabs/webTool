@@ -10,7 +10,8 @@ hint -- it never crashes the pipeline.
 
 from __future__ import annotations
 
-from typing import Optional
+import json
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import trafilatura
@@ -19,6 +20,61 @@ from loguru import logger
 
 from .config import AppConfig
 from .models import ExtractionResult, FetchResult, FetchStatus
+
+
+def _extract_json_ld(html: str) -> list[dict[str, Any]]:
+    """v1.6.12: parse ``<script type='application/ld+json'>`` blocks.
+
+    Returns a flat list of schema.org objects embedded in the page.
+    ``@graph`` containers are unwrapped so the result contains
+    individual items, not the graph wrapper. Malformed JSON-LD
+    (sadly very common -- trailing commas, single-quoted keys, etc.)
+    is swallowed silently; we never raise from this helper.
+
+    Args:
+        html: Raw page HTML.
+
+    Returns:
+        Flat list of dict objects (empty when no JSON-LD found / all
+        blocks malformed).
+    """
+    if not html:
+        return []
+    blocks: list[dict[str, Any]] = []
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:  # pragma: no cover -- defensive
+        return []
+    for script in soup.find_all("script", type="application/ld+json"):
+        # ``script.string`` is None when the tag has children (e.g.
+        # CDATA-wrapped); fall back to ``get_text()``.
+        text = script.string if script.string else script.get_text()
+        if not text or not text.strip():
+            continue
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            # Many sites have malformed JSON-LD. Swallow and continue.
+            # ``RecursionError`` covers an adversarial DoS: an attacker
+            # could embed deeply-nested JSON (>1000 levels) to crash the
+            # default CPython parser. ``RecursionError`` derives from
+            # ``RuntimeError``, NOT ``ValueError`` / ``JSONDecodeError``,
+            # so it must be caught explicitly here.
+            continue
+        # JSON-LD allows either a single object or an array at the
+        # top level. Handle both.
+        candidates: list[Any] = data if isinstance(data, list) else [data]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            # Unwrap ``@graph`` containers -- the graph wrapper is
+            # rarely what callers want; they want the contained items.
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                blocks.extend(g for g in graph if isinstance(g, dict))
+            else:
+                blocks.append(item)
+    return blocks
 
 
 def _is_pdf(fr: FetchResult) -> bool:
@@ -55,24 +111,46 @@ class ContentExtractor:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
 
-    def extract(self, fetch_result: FetchResult, *, strict: bool = False) -> ExtractionResult:
+    def extract(
+        self,
+        fetch_result: FetchResult,
+        *,
+        strict: bool = False,
+        prefer_api: bool = False,
+    ) -> ExtractionResult:
         """Extract structured content from a FetchResult.
 
         Dispatches on FetchResult contents:
           - ``binary`` populated -> PDF or XLSX branch (requires ``[binary]`` extra)
           - ``html`` populated -> three-tier HTML fallback chain
+            (+ v1.6.12 optional API-candidates path when ``prefer_api=True``)
 
         HTML fallback chain:
-          1. trafilatura (best quality, F1 ~0.958)
-          2. BeautifulSoup4 structural extraction
-          3. Raw text stripping (last resort)
+          1. (v1.6.12) ``prefer_api=True`` AND a captured XHR/fetch JSON
+             response body is available -> ``api_json`` extraction.
+          2. trafilatura (best quality, F1 ~0.958)
+          3. BeautifulSoup4 structural extraction
+          4. Raw text stripping (last resort)
+
+        v1.6.12: every HTML result is enriched with
+        ``structured_data`` -- parsed ``<script type='application/ld+
+        json'>`` blocks -- always-on (cheap, no opt-in needed). When
+        the page has no JSON-LD or all blocks are malformed, the list
+        is empty.
 
         Args:
             fetch_result: The FetchResult to extract from.
-            strict: If True, raise :class:`ExtractionError` when all three
-                layers fail to produce content (very rare, since raw is
-                a last-resort always-success path). When False, returns
-                an ExtractionResult with extraction_method="none".
+            strict: If True, raise :class:`ExtractionError` when all
+                three layers fail to produce content (very rare, since
+                raw is a last-resort always-success path). When False,
+                returns an ExtractionResult with extraction_method="none".
+            prefer_api: v1.6.12. When True AND ``fetch_result.network_events``
+                contains a response event with a captured JSON body
+                (requires ``DiagnosticsConfig.capture_response_bodies=
+                True``), route extraction through that body instead of
+                the rendered HTML. Useful on SPAs where the XHR payload
+                is strictly cleaner than the DOM. Default False
+                preserves the v1.6.11 behaviour.
 
         Raises:
             ExtractionError: If ``strict=True`` and all layers fail.
@@ -117,15 +195,42 @@ class ContentExtractor:
         html = fetch_result.html
         min_len = self._config.extraction.min_content_length
 
+        # v1.6.12: JSON-LD enrichment. The helper swallows malformed
+        # JSON (including ``RecursionError`` from deeply-nested
+        # adversarial payloads). Cost: one extra BS4+lxml parse per
+        # fetch (~5-20 ms on a 50-200 KB page). On the bs4 / raw
+        # fallback paths this duplicates the parse those extractors
+        # already do; a future patch can share the parsed soup, but
+        # the duplication is acceptable for now (small absolute cost,
+        # keeps the JSON-LD path decoupled from the fallback chain).
+        # Compute once; attach to whichever extractor wins.
+        structured = _extract_json_ld(html)
+
+        # v1.6.12: prefer_api path -- when the caller opted in AND the
+        # FetchResult carries a captured JSON response body, route
+        # extraction through that body instead of the rendered HTML.
+        if prefer_api:
+            api_result = self._extract_from_api_candidates(fetch_result, url)
+            if api_result is not None:
+                api_result.structured_data = structured
+                return api_result
+            logger.debug(
+                "prefer_api=True but no usable JSON body captured for {url}; "
+                "falling back to HTML extraction",
+                url=url,
+            )
+
         # Layer 1: trafilatura
         result = self._extract_trafilatura(html, url)
         if result and result.content and len(result.content) >= min_len:
+            result.structured_data = structured
             return result
         logger.debug("Trafilatura insufficient for {url}, trying BS4", url=url)
 
         # Layer 2: BeautifulSoup
         result = self._extract_bs4(html, url)
         if result and result.content and len(result.content) >= min_len:
+            result.structured_data = structured
             return result
         logger.debug("BS4 insufficient for {url}, falling back to raw", url=url)
 
@@ -138,7 +243,108 @@ class ContentExtractor:
                 f"All three extraction layers failed for {url} "
                 f"(content_length={raw_result.content_length})"
             )
+        raw_result.structured_data = structured
         return raw_result
+
+    # ------------------------------------------------------------------
+    # v1.6.12: API-candidates extraction (prefer_api=True path)
+    # ------------------------------------------------------------------
+
+    def _extract_from_api_candidates(
+        self, fetch_result: FetchResult, url: str
+    ) -> Optional[ExtractionResult]:
+        """v1.6.12: extract from a captured XHR/fetch JSON response body.
+
+        Scans :attr:`FetchResult.network_events` for response events
+        with a captured ``body_text`` (requires
+        ``DiagnosticsConfig.capture_response_bodies=True``) and JSON
+        content-type. Picks the LARGEST body and uses it as the
+        extraction source. Returns ``None`` when no candidate found
+        -- caller falls back to HTML extraction.
+
+        The extracted ``content`` is the pretty-printed JSON; ``title``
+        is derived heuristically from common top-level keys
+        (``title`` / ``headline`` / ``name``) when present. The parsed
+        JSON is NOT put into ``structured_data`` -- that field is
+        reserved for JSON-LD blocks parsed from the rendered HTML;
+        ``extract`` populates it separately.
+
+        Heuristic limitations (known, documented for caller awareness):
+
+        - **Picks the largest body, not the most relevant.** A page that
+          emits both a small product-detail API response (~2 KB) AND a
+          large analytics / Segment / GA4 batched-hit payload (~10-50
+          KB) will silently extract the analytics blob. Watch the
+          DEBUG log line emitted on selection to spot this.
+        - **No URL-pattern filter.** Cannot tell the caller "use the
+          response from ``/api/page-data``, not ``/v1/track``". A
+          future patch can accept a regex / glob.
+        - **Title heuristic is top-level only.** Nested shapes like
+          ``{data: {title: "..."}}`` won't populate
+          ``ExtractionResult.title``, though the JSON body still ends
+          up in ``content`` and a caller can parse it themselves.
+        """
+        if not fetch_result.network_events:
+            return None
+        # Find responses with a captured JSON body. Prefer the largest
+        # body as a simple heuristic for "the main API call".
+        best_evt = None
+        best_size = 0
+        for evt in fetch_result.network_events:
+            if evt.event_type != "response":
+                continue
+            if evt.resource_type not in {"xhr", "fetch"}:
+                continue
+            if not evt.body_text:
+                continue
+            ct = (evt.content_type or "").lower()
+            if "json" not in ct:
+                continue
+            size = len(evt.body_text)
+            if size > best_size:
+                best_evt = evt
+                best_size = size
+        if best_evt is None or not best_evt.body_text:
+            return None
+        try:
+            parsed = json.loads(best_evt.body_text)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            return None
+        # v1.6.12: emit the chosen URL at DEBUG so callers spotting
+        # garbage extractions (analytics ping picked over real API)
+        # have a diagnostic signal. The heuristic is documented in
+        # the docstring; this log line is the runtime telemetry.
+        logger.debug(
+            "prefer_api selected XHR/fetch body for {url}: chosen_url={chosen} body_size={size}",
+            url=url,
+            chosen=best_evt.url,
+            size=best_size,
+        )
+
+        # Heuristic title from top-level keys (defensive against None /
+        # non-string types).
+        title: Optional[str] = None
+        if isinstance(parsed, dict):
+            for key in ("title", "headline", "name"):
+                val = parsed.get(key)
+                if isinstance(val, str) and val.strip():
+                    title = val.strip()
+                    break
+
+        # Pretty-print as the content payload. Truncate is implicitly
+        # handled by the body_size cap at capture time.
+        try:
+            pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pretty = best_evt.body_text  # fall back to raw
+
+        return ExtractionResult(
+            url=url,
+            title=title,
+            content=pretty,
+            extraction_method="api_json",
+            content_length=len(pretty),
+        )
 
     # ------------------------------------------------------------------
     # Binary branches: PDF + XLSX

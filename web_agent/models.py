@@ -97,6 +97,52 @@ class NetworkEvent(BaseModel):
         default=0.0,
         description="Approximate timing (request->response) when measurable, else 0.",
     )
+    ttfb_ms: Optional[float] = Field(
+        default=None,
+        description=(
+            "v1.6.12: time-to-first-byte in milliseconds, derived from "
+            "Playwright's ``request.timing['responseStart']`` (ms from "
+            "startTime to first response byte). Approximates the "
+            "network delay before any response data arrives. None when "
+            "timing data is unavailable (e.g. cross-origin requests "
+            "with restricted ``Timing-Allow-Origin``) or when the "
+            "request failed before a response."
+        ),
+    )
+    body_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "v1.6.12: response body size in bytes, from the "
+            "``Content-Length`` header when present. None for chunked "
+            "responses (common for dynamic HTML) or when the header is "
+            "absent. We deliberately do NOT read ``await response.body()"
+            "`` -- it would double memory pressure and break large "
+            "downloads."
+        ),
+    )
+    body_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.6.12: captured response body text. None unless "
+            "``DiagnosticsConfig.capture_response_bodies=True`` AND the "
+            "response Content-Type matches "
+            "``body_capture_content_types`` (defaults to JSON-ish). "
+            "Capped at ``DiagnosticsConfig.max_response_body_bytes`` "
+            "(default 256 KiB); see ``body_truncated`` below. Populated "
+            "asynchronously after the response event fires; callers who "
+            "need it must ``await NetworkCollector.wait_for_pending_bodies"
+            "()`` before snapshotting events. This is the input "
+            "``ContentExtractor.extract(prefer_api=True)`` consumes."
+        ),
+    )
+    body_truncated: bool = Field(
+        default=False,
+        description=(
+            "v1.6.12: True when ``body_text`` was truncated to the "
+            "``max_response_body_bytes`` cap. Always False when "
+            "``body_text`` is None."
+        ),
+    )
     failure_text: Optional[str] = Field(
         default=None,
         description=(
@@ -131,6 +177,45 @@ class FetchResult(BaseModel):
     )
     error_message: Optional[str] = Field(default=None)
     response_time_ms: float = Field(default=0.0)
+    ttfb_ms: Optional[float] = Field(
+        default=None,
+        description=(
+            "v1.6.12: Time-to-first-byte for the navigation request in "
+            "milliseconds. Derived from the first ``document`` "
+            "``NetworkEvent.ttfb_ms`` (Playwright's ``request.timing"
+            "['responseStart']``). None when network capture is off, "
+            "when the binary fetch path is used, or when timing data "
+            "is unavailable."
+        ),
+    )
+    dom_parse_ms: Optional[float] = Field(
+        default=None,
+        description=(
+            "v1.6.12: DOM parse time in milliseconds, computed as "
+            "``domInteractive - responseEnd`` from "
+            "``performance.getEntriesByType('navigation')[0]`` -- i.e. "
+            "time spent parsing the HTML after the response was fully "
+            "received. (An earlier v1.6.12 draft used ``domComplete - "
+            "domInteractive`` which is post-parse subresource-load "
+            "time, not parse time.) None when the page didn't expose "
+            "the API (cross-origin sandbox, ``about:blank``, ``data:`` "
+            "URLs) or when ``page.evaluate`` raised."
+        ),
+    )
+    total_bytes_downloaded: Optional[int] = Field(
+        default=None,
+        description=(
+            "v1.6.12: page weight in bytes -- sum of "
+            "``NetworkEvent.body_size`` across all response events "
+            "captured during the fetch (main document + ALL "
+            "subresources: images, scripts, CSS, fonts, XHR). Only "
+            "populated when ``DiagnosticsConfig.capture_network=True``. "
+            "None when capture is off or no events carried a "
+            "``Content-Length`` header. NOTE: this is NOT the response "
+            "body size of the navigation -- use ``len(html)`` or "
+            "``len(binary)`` for that."
+        ),
+    )
     correlation_id: Optional[str] = Field(
         default=None, description="Request correlation id for tracing"
     )
@@ -191,9 +276,29 @@ class ExtractionResult(BaseModel):
     language: Optional[str] = Field(default=None, description="Detected language")
     extraction_method: str = Field(
         default="none",
-        description="Which extractor succeeded: trafilatura|bs4|raw|none",
+        description=(
+            "Which extractor succeeded: trafilatura|bs4|raw|api_json|none. "
+            "v1.6.12 added ``api_json`` -- caller passed "
+            "``prefer_api=True`` and a captured XHR/fetch JSON response "
+            "body was used as the content source instead of the rendered "
+            "HTML (cleaner on SPAs that ship a JSON payload)."
+        ),
     )
     content_length: int = Field(default=0, description="Character count of extracted content")
+    structured_data: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "v1.6.12: parsed ``<script type='application/ld+json'>`` "
+            "blocks from the page. Each entry is a dict matching the "
+            "schema.org / JSON-LD object embedded in the page (Product, "
+            "Article, Recipe, Event, BreadcrumbList, Organization, ...). "
+            "``@graph`` containers are unwrapped so the list contains "
+            "individual items, not the graph wrapper. Empty when the "
+            "page has no JSON-LD or all blocks were malformed JSON "
+            "(swallowed silently). Populated for HTML extractions only "
+            "-- binary FetchResults yield an empty list."
+        ),
+    )
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: Optional[str] = Field(default=None)
 

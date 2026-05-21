@@ -73,6 +73,11 @@ class NetworkCollector:
         # discard it via add_done_callback. See:
         # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
         self._pending_deletes: set[asyncio.Task[None]] = set()
+        # v1.6.12: same strong-reference pattern for async body-capture
+        # tasks scheduled from the (sync) ``_on_response`` handler.
+        # Callers needing bodies must drain via
+        # :meth:`wait_for_pending_bodies` before snapshotting events.
+        self._pending_body_captures: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # public API
@@ -227,6 +232,32 @@ class NetworkCollector:
                 ctype = resp.headers.get("content-type")
             except Exception:
                 pass
+            # v1.6.12: capture TTFB + body size for granular telemetry.
+            # Both are best-effort -- ``request.timing`` may be missing
+            # for cross-origin requests (Timing-Allow-Origin) and
+            # ``Content-Length`` is dropped on chunked responses.
+            ttfb_ms: float | None = None
+            body_size: int | None = None
+            try:
+                timing = req.timing
+                # Playwright's ``RequestTiming`` is a dict with
+                # ``responseStart`` in ms relative to ``startTime``.
+                # Playwright uses ``-1`` to signal "unavailable" -- a
+                # value of ``0`` is technically valid (cache hit with
+                # no measurable delay), so we filter on ``!= -1`` /
+                # ``>= 0`` rather than ``> 0`` (the earlier draft).
+                if timing is not None:
+                    rs = timing.get("responseStart", -1)
+                    if rs is not None and rs >= 0:
+                        ttfb_ms = round(float(rs), 2)
+            except Exception:
+                pass
+            try:
+                cl = resp.headers.get("content-length")
+                if cl is not None:
+                    body_size = int(cl)
+            except (ValueError, TypeError, AttributeError):
+                pass
             evt = NetworkEvent(
                 event_type="response",
                 url=req.url,
@@ -237,11 +268,25 @@ class NetworkCollector:
                 request_headers=(dict(req.headers) if self._diag.include_request_headers else {}),
                 response_headers=headers,
                 timing_ms=round(timing_ms, 2),
+                ttfb_ms=ttfb_ms,
+                body_size=body_size,
                 correlation_id=get_correlation_id(),
             )
             buf = self._events.get(page)
             if buf is not None:
                 buf.append(evt)
+            # v1.6.12: optionally schedule async body capture. We can't
+            # ``await`` here (the listener is registered sync), so we
+            # fire-and-forget a task that reads the body and mutates the
+            # NetworkEvent in-place. Callers must drain via
+            # ``wait_for_pending_bodies`` before snapshotting if they
+            # need the body text.
+            if self._diag.capture_response_bodies and ctype and self._should_capture_body(ctype):
+                with contextlib.suppress(RuntimeError):
+                    loop = asyncio.get_running_loop()
+                    task = loop.create_task(self._capture_response_body(evt, resp))
+                    self._pending_body_captures.add(task)
+                    task.add_done_callback(self._pending_body_captures.discard)
         except Exception as exc:  # pragma: no cover -- defensive
             logger.debug("NetworkCollector._on_response swallowed: {e}", e=exc)
 
@@ -308,6 +353,73 @@ class NetworkCollector:
     async def _safe_delete(download: Any) -> None:
         with contextlib.suppress(Exception):
             await download.delete()
+
+    # ------------------------------------------------------------------
+    # v1.6.12: response body capture
+    # ------------------------------------------------------------------
+
+    def _should_capture_body(self, content_type: str) -> bool:
+        """v1.6.12: True iff ``content_type`` matches a configured prefix."""
+        ct = content_type.lower().split(";", 1)[0].strip()
+        if not ct:
+            return False
+        for prefix in self._diag.body_capture_content_types:
+            if ct.startswith(prefix.lower()):
+                return True
+        return False
+
+    async def _capture_response_body(self, evt: NetworkEvent, resp: Any) -> None:
+        """v1.6.12: read response body, apply cap, mutate evt in-place.
+
+        Best-effort -- any failure (closed page, decode error, network
+        failure) is swallowed and the event's body_text stays None. The
+        cap from ``DiagnosticsConfig.max_response_body_bytes`` is
+        enforced byte-wise BEFORE decoding so we never load more than
+        configured into memory.
+        """
+        try:
+            body_bytes = await resp.body()
+        except Exception as exc:  # pragma: no cover -- defensive
+            logger.debug("body capture failed for {url}: {e}", url=evt.url, e=exc)
+            return
+        if not isinstance(body_bytes, (bytes, bytearray)):
+            return
+        max_bytes = self._diag.max_response_body_bytes
+        truncated = len(body_bytes) > max_bytes
+        if truncated:
+            body_bytes = bytes(body_bytes[:max_bytes])
+        try:
+            text = bytes(body_bytes).decode("utf-8", errors="replace")
+        except Exception:  # pragma: no cover -- defensive
+            return
+        # Pydantic models are mutable by default; safe to set after the
+        # event was already appended to the deque.
+        evt.body_text = text
+        evt.body_truncated = truncated
+
+    async def wait_for_pending_bodies(self, *, timeout: float = 5.0) -> None:
+        """v1.6.12: drain in-flight body-capture tasks before snapshotting.
+
+        Best-effort -- on timeout the remaining tasks are left running
+        and the corresponding events will have ``body_text=None``.
+
+        Args:
+            timeout: Maximum seconds to wait. Default 5.0.
+        """
+        if not self._pending_body_captures:
+            return
+        pending = list(self._pending_body_captures)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                "wait_for_pending_bodies timed out after {t}s ({n} still pending)",
+                t=timeout,
+                n=len(self._pending_body_captures),
+            )
 
 
 __all__ = ["NetworkCollector"]

@@ -10,10 +10,59 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.11** — *Follow-up polish patch.* No new
-> features; seven items addressing one behavioural issue, one
-> correctness gap, one stale-migration-wording bug, plus four polish
-> items. Headlines:
+> **What's new in 1.6.12** — *Throttle + telemetry + structured-data
+> patch.* HTTP 429 handling, granular telemetry, and structured-data
+> extraction (JSON-LD always-on plus opt-in XHR/fetch JSON body
+> capture and a `prefer_api=True` extractor mode). Headlines:
+>
+> * **HTTP 429 is no longer silently "successful".** Pre-v1.6.12,
+>   `WebFetcher` returned a `FetchResult(status=SUCCESS, status_code=429)`
+>   on a "Too Many Requests" response -- a false positive that
+>   polluted downstream extraction. v1.6.12 parses the `Retry-After`
+>   header, signals the per-host `RateLimiter` via the new
+>   `notify_429(host, retry_after)` so the next `acquire(host)` waits
+>   long enough, then raises a retryable `Exception` so `async_retry`
+>   retries. Decorator jitter stacks on top of the rate-limiter wait.
+> * **`parse_retry_after(header_value: str | None) -> float | None`**
+>   handles both RFC 9110 §10.2.3 forms (integer delta-seconds + HTTP
+>   date). Exported from `web_agent` for callers writing custom
+>   backoff logic.
+> * **Telemetry depth**: `NetworkEvent` gains `ttfb_ms` (from
+>   Playwright's `request.timing['responseStart']`) and `body_size`
+>   (from `Content-Length`). `FetchResult` gains `ttfb_ms` (first
+>   `document`-typed response), `dom_parse_ms` (computed via
+>   `performance.getEntriesByType('navigation')`), and
+>   `total_bytes_downloaded` (page weight = sum across all response
+>   events; use `len(html)` for the navigation's response body
+>   size). All five fields are `Optional[...]` with `None` default
+>   -- existing `FetchResult(...)` callers see no signature break.
+> * **JSON-LD enrichment (always-on)**.
+>   `ExtractionResult.structured_data: list[dict]` is populated from
+>   `<script type="application/ld+json">` blocks on every HTML
+>   extraction. Schema.org Product / Article / Recipe / Event /
+>   BreadcrumbList objects ship straight through. `@graph`
+>   containers are unwrapped. Malformed JSON-LD is swallowed.
+> * **XHR/fetch body capture (opt-in)**. New
+>   `DiagnosticsConfig.capture_response_bodies` (default `False`).
+>   When enabled, JSON-typed XHR/fetch response bodies are captured
+>   onto `NetworkEvent.body_text` (capped by
+>   `max_response_body_bytes`, default 256 KiB; `body_truncated`
+>   signals when truncation happened). Capture is async-scheduled;
+>   the fetch automatically drains pending captures before
+>   snapshotting.
+> * **`ContentExtractor.extract(prefer_api=True)`**. Routes
+>   extraction through the largest captured JSON body when one is
+>   available -- emits `extraction_method="api_json"`. Cleaner than
+>   the rendered DOM on SPAs that ship a `/api/page-data` payload.
+>   Falls back transparently to trafilatura/bs4/raw when no usable
+>   body was captured.
+>
+> See [CHANGELOG.md](CHANGELOG.md#1612---2026-05-21) for the full
+> entry including the 429 behaviour-change migration note.
+>
+> **v1.6.11** — *Follow-up polish patch.* No new features; seven
+> items addressing one behavioural issue, one correctness gap, one
+> stale-migration-wording bug, plus four polish items. Headlines:
 >
 > * **`web_research(extract_files=True)` skips non-extractable kinds
 >   before fetching.** Pre-v1.6.11, `.mp4` / `.exe` / `.iso` / `.zip`

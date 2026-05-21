@@ -40,7 +40,7 @@ Custom configuration::
         ...
 """
 
-__version__ = "1.6.11"
+__version__ = "1.6.12"
 
 from .agent import Agent
 from .audit import AuditLogger
@@ -132,7 +132,7 @@ from .search_providers import (
     SearXNGProvider,
 )
 from .trace_recorder import SessionTraceRecorder
-from .utils import BudgetTracker, RetryPolicy, get_retry_policy
+from .utils import BudgetTracker, RetryPolicy, get_retry_policy, parse_retry_after
 from .web_fetcher import EXTRACTABLE_BINARY_KINDS, is_binary_kind, is_extractable_binary_kind
 
 __all__ = [
@@ -164,6 +164,8 @@ __all__ = [
     "RetryPolicy",
     "get_retry_policy",
     "BudgetTracker",
+    # HTTP helpers (v1.6.12)
+    "parse_retry_after",
     # Politeness + audit
     "AuditLogger",
     "RateLimiter",
