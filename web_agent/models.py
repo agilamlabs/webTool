@@ -50,6 +50,16 @@ class FetchStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+# v1.6.13: single source of truth for the html-capture tier values.
+# Returned from ``web_agent.utils.safe_page_content`` and stored on
+# ``FetchResult.html_capture_source``. Defined here (in models.py)
+# rather than in utils.py so the model field type and the helper's
+# return type can't drift -- mypy enforces equality. utils.py imports
+# this alias; the natural direction is utils -> models (models is a
+# leaf module with no internal imports).
+HtmlCaptureSource = Literal["content", "evaluate", "cdp", "navigating"]
+
+
 class NetworkEvent(BaseModel):
     """v1.6.8: a single Playwright network event captured during a page session.
 
@@ -214,6 +224,26 @@ class FetchResult(BaseModel):
             "``Content-Length`` header. NOTE: this is NOT the response "
             "body size of the navigation -- use ``len(html)`` or "
             "``len(binary)`` for that."
+        ),
+    )
+    html_capture_source: Optional[HtmlCaptureSource] = Field(
+        default=None,
+        description=(
+            "v1.6.13: which capture tier produced ``html``. Set by "
+            "``WebFetcher`` via :func:`web_agent.safe_page_content`:\n\n"
+            "- ``content`` -- standard ``page.content()`` succeeded "
+            "(happy path; the overwhelming majority of fetches).\n"
+            "- ``evaluate`` -- tier-1 hit Playwright's mid-navigation "
+            'race ("page is navigating and changing the content") '
+            "but ``page.evaluate('...outerHTML')`` recovered the DOM.\n"
+            "- ``cdp`` -- tier-1 and tier-2 both failed; CDP "
+            "``DOM.getOuterHTML`` recovered the DOM by reading the "
+            "browser's internal tree directly.\n"
+            "- ``navigating`` -- all three tiers failed; ``html`` will "
+            'be ``""``. Treat the result as degraded.\n\n'
+            "``None`` when html capture didn't run (binary fetch path) "
+            "or when the FetchResult was constructed outside the "
+            "standard WebFetcher flow (e.g. unit tests, cached results)."
         ),
     )
     correlation_id: Optional[str] = Field(

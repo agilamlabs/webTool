@@ -41,6 +41,7 @@ from .utils import (
     check_domain_allowed,
     get_random_user_agent,
     parse_retry_after,
+    safe_page_content,
 )
 
 # Common office documents and archives -- shared between the fetcher
@@ -631,7 +632,20 @@ class WebFetcher:
             if cfg.extra_wait_ms > 0:
                 await asyncio.sleep(cfg.extra_wait_ms / 1000)
 
-            html = await page.content()
+            # v1.6.13: capture via the 3-tier helper so the
+            # mid-navigation race ("Unable to retrieve content because the
+            # page is navigating and changing the content") doesn't kill
+            # an otherwise-successful fetch. Tier 1 = page.content() with
+            # bounded retry; tier 2 = page.evaluate(outerHTML); tier 3 =
+            # CDP DOM.getOuterHTML. The chosen tier is surfaced on
+            # ``FetchResult.html_capture_source`` for telemetry.
+            html, html_capture_source = await safe_page_content(page)
+            if html_capture_source == "navigating":
+                logger.warning(
+                    "page.content() abandoned after all tiers for {url} -- "
+                    "FetchResult.html will be empty",
+                    url=url,
+                )
 
             # v1.6.12: true DOM parse time = ``domInteractive -
             # responseEnd`` (time from "response fully received" to
@@ -715,6 +729,7 @@ class WebFetcher:
                 ttfb_ms=ttfb_ms,
                 dom_parse_ms=dom_parse_ms,
                 total_bytes_downloaded=total_bytes_downloaded,
+                html_capture_source=html_capture_source,
             )
         except Exception as exc:
             # Capture debug artifacts on any failure path before re-raising

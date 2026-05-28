@@ -38,7 +38,7 @@ from .models import DownloadResult, FetchStatus
 from .rate_limiter import RateLimiter
 from .robots import RobotsChecker
 from .session_manager import SessionManager
-from .utils import check_domain_allowed, get_random_user_agent, safe_join_path
+from .utils import check_domain_allowed, get_random_user_agent, safe_join_path, safe_page_content
 from .web_fetcher import _OFFICE_AND_ARCHIVE_EXTENSIONS
 
 # Extensions that are web pages (should be saved via page.content(), not expect_download)
@@ -429,7 +429,42 @@ class Downloader:
                         content_type=content_type,
                     )
 
-        html = await page.content()
+        # v1.6.13: 3-tier capture so a mid-navigation race doesn't crash
+        # the page-save path. ``html_source`` is logged when degraded so
+        # the operator can investigate, but the file still gets written
+        # from whatever tier succeeded (empty string -> empty file, but
+        # we surface a warning + return an HTTP_ERROR result in that case).
+        html, html_source = await safe_page_content(page)
+        if html_source == "navigating":
+            logger.warning(
+                "save_page: page.content() abandoned after all tiers for {url}",
+                url=url,
+            )
+            # v1.6.13 review-pass I-1: NETWORK_ERROR (not HTTP_ERROR) --
+            # this is a content-capture transport failure, not a bad
+            # HTTP status. The server returned a fine response; we
+            # just couldn't snapshot the DOM because the page never
+            # stopped navigating. Callers branching on
+            # ``DownloadResult.status`` to distinguish server errors
+            # from transport failures need NETWORK_ERROR here.
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename=filepath.name,
+                status=FetchStatus.NETWORK_ERROR,
+                error_message=(
+                    "Could not capture page content: the page kept "
+                    "navigating across all capture tiers (content / "
+                    "evaluate / CDP). See logs for details."
+                ),
+                content_type=content_type,
+            )
+        if html_source != "content":
+            logger.info(
+                "save_page: captured via {src} tier (page.content race) for {url}",
+                src=html_source,
+                url=url,
+            )
         # In-memory pre-check: stop before write if the rendered DOM is too large.
         encoded_size = len(html.encode("utf-8"))
         if encoded_size > max_bytes:

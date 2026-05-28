@@ -22,6 +22,7 @@ from playwright.async_api import Page
 
 from .config import AppConfig
 from .correlation import get_correlation_id
+from .utils import safe_page_content
 
 
 class DebugCapture:
@@ -77,9 +78,20 @@ class DebugCapture:
             if self._config.debug.capture_html:
                 html_path = self._next_artifact_path(label, "html")
                 try:
-                    html = await page.content()
-                    html_path.write_text(html, encoding="utf-8")
-                    artifacts.append(str(html_path))
+                    # v1.6.13: 3-tier capture -- debug snapshots are
+                    # *especially* prone to the navigation-race error
+                    # because they fire mid-failure when the page is
+                    # often already redirecting away. We accept a "" +
+                    # "navigating" tuple silently and skip the write.
+                    html, html_source = await safe_page_content(page)
+                    if html:
+                        html_path.write_text(html, encoding="utf-8")
+                        artifacts.append(str(html_path))
+                        if html_source != "content":
+                            logger.debug(
+                                "Debug HTML captured via {src} tier",
+                                src=html_source,
+                            )
                 except Exception as exc:
                     logger.debug("Debug HTML capture failed: {e}", e=exc)
 
