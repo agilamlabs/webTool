@@ -282,9 +282,18 @@ async def web_interact(
 ) -> ActionSequenceResult:
     """Execute a scripted sequence of browser actions on a URL.
 
-    Supports 12 action types: click, type, fill, scroll, screenshot, navigate,
-    dialog, hover, select, keyboard, wait, evaluate. Each action is a dict with
-    an ``action`` discriminator and action-specific parameters.
+    Supports 19 action types: click, type, fill, scroll, screenshot, navigate,
+    dialog, hover, select, keyboard, wait, evaluate, click_xy, type_text,
+    press_key, upload_file, iframe_click, shadow_dom_click, drag_and_drop.
+    Each action is a dict with an ``action`` discriminator and
+    action-specific parameters.
+
+    v1.6.14 C-5: this docstring is the only signal the LLM gets about
+    what the tool can do. Stale counts/lists hide the v1.6.6/v1.6.7
+    action types from the model, so coord-fallback and skill actions
+    (click_xy, iframe_click, shadow_dom_click, drag_and_drop, etc.)
+    effectively don't exist from the LLM's perspective. Keep this list
+    in lockstep with ``Action`` in ``models.py``.
 
     Selectors can be either a CSS string or a semantic LocatorSpec dict::
 

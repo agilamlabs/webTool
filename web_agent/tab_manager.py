@@ -195,16 +195,25 @@ class TabManager:
             page = self._tabs.get(tab_id)
             if page is None:
                 raise KeyError(f"Unknown tab_id: {tab_id!r}")
-            # _evict_on_close will fire via the page.on("close") listener
-            # we attached at registration. Closing the page synchronously
-            # drops it from _tabs/_opened_at and updates _current_tab_id.
-        try:
-            await page.close()
-        except Exception as exc:
-            logger.warning("Error closing tab {tid}: {e}", tid=tab_id, e=exc)
-            # Force the eviction even if Playwright's close raised, so the
-            # state stays consistent.
-            self._evict_on_close(tab_id)
+            # v1.6.14 C-8: hold the lock across page.close() so concurrent
+            # switch_tab / list / new_tab cannot observe an inconsistent
+            # state during teardown. _evict_on_close (the sync close-event
+            # handler) runs WITHOUT acquiring the lock and mutates
+            # _tabs / _current_tab_id synchronously during the await --
+            # that's safe because we hold the lock; no other coroutine can
+            # interleave a read/write while page.close() is in-flight and
+            # the close-event handler is dispatching.
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except Exception as exc:
+                logger.warning("Error closing tab {tid}: {e}", tid=tab_id, e=exc)
+                # Force the eviction even if Playwright's close raised, so
+                # the state stays consistent. _evict_on_close is idempotent
+                # (early-return when tab_id is already gone) so this is
+                # safe even if Playwright's close event already fired.
+                if tab_id in self._tabs:
+                    self._evict_on_close(tab_id)
 
     def current(self) -> Optional[Page]:
         """Return the current tab's Page, or None if no tabs are live."""

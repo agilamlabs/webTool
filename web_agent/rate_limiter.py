@@ -35,6 +35,17 @@ class RateLimiter:
         adjustments. State is in-memory and not shared across processes.
     """
 
+    # v1.6.14 C-1: maximum sleep induced by a single ``Retry-After`` value.
+    # A misbehaving (or hostile) server can return ``Retry-After: 99999999``
+    # which, parsed verbatim by :func:`parse_retry_after`, would block the
+    # next ``acquire(host)`` for ~1157 days. We cap the per-event extension
+    # at 5 minutes so a single bad header can hurt throughput but cannot
+    # wedge the agent for hours/days. 5 minutes balances "long enough to
+    # genuinely back off a rate-limited host" against "short enough that
+    # the agent recovers on the next retry cycle" -- much longer and the
+    # async_retry wrapper above this would itself give up first.
+    MAX_RETRY_AFTER_SECONDS: float = 300.0
+
     def __init__(self, rps_per_host: float = 2.0) -> None:
         self._enabled = rps_per_host > 0
         self._interval = 1.0 / rps_per_host if self._enabled else 0.0
@@ -98,6 +109,14 @@ class RateLimiter:
         the next ``acquire(host)`` call. The 429 incident is tallied
         internally in ``self._429_counts`` for future adaptive-rps work.
 
+        v1.6.14 C-1: the computed delay is clamped to
+        :attr:`MAX_RETRY_AFTER_SECONDS` (5 minutes) to prevent a hostile
+        or misconfigured server from wedging the agent for days via a
+        ``Retry-After: 99999999`` header. Without the cap, a single
+        extreme value would block subsequent :meth:`acquire` calls for
+        the cap value's wall-clock duration -- a denial-of-service from
+        any HTTP endpoint that returns 429s.
+
         No-op when the limiter is disabled (``rps_per_host <= 0``) or
         the host string is empty.
 
@@ -118,6 +137,11 @@ class RateLimiter:
         # an explicit short Retry-After can't shorten our own minimum
         # backoff; we always wait at least the fallback.
         delay = max(retry_after_seconds or 0.0, self._interval * fallback_factor)
+        # v1.6.14 C-1: cap the delay so a hostile/misbehaving server
+        # returning an absurd Retry-After (e.g. 99999999s ~= 1157 days)
+        # cannot wedge the agent for hours/days. See class constant
+        # docstring for the rationale on the 5-minute ceiling.
+        delay = min(delay, self.MAX_RETRY_AFTER_SECONDS)
         now = time.monotonic()
         current = self._next_allowed.get(host, 0.0)
         # Take the later of current next_allowed and (now + delay).

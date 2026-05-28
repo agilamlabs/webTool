@@ -350,6 +350,25 @@ class BrowserActions:
                     "EvaluateInput blocked: safety.allow_js_evaluation=False "
                     "(set safety.allow_js_evaluation=True to opt in)"
                 )
+            # v1.6.14 C-2: WaitInput(target=FUNCTION) calls
+            # page.wait_for_function(action.value), which executes
+            # arbitrary JS in the page context -- a parallel JS-eval
+            # path that EvaluateInput's gate alone does not cover. Without
+            # this check an LLM-controlled sequence can bypass
+            # allow_js_evaluation=False by emitting a wait-function with
+            # malicious JS (e.g. cookie exfiltration). Gate it here at
+            # the same chokepoint as EvaluateInput.
+            if (
+                isinstance(a, WaitInput)
+                and a.target == WaitTarget.FUNCTION
+                and not safety.allow_js_evaluation
+            ):
+                return _block_all(
+                    "WaitInput(target=FUNCTION) blocked: "
+                    "safety.allow_js_evaluation=False "
+                    "(wait_for_function executes arbitrary JS; "
+                    "set safety.allow_js_evaluation=True to opt in)"
+                )
             if (
                 isinstance(a, ClickInput)
                 and not safety.allow_form_submit

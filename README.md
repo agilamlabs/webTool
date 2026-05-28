@@ -10,7 +10,48 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.13** — *Page-content capture resilience.*
+> **What's new in 1.6.14** — *Hardening slice — 8 Critical fixes
+> from a brutal full-codebase audit.* No new features; pure
+> correctness, security, and DoS hardening. Bundle of 8 fixes
+> across 10 source files and 3 new test files (+22 tests,
+> AsyncMock-driven). Headlines:
+>
+> * **Security**: `WaitInput(target=FUNCTION)` now honours
+>   `safety.allow_js_evaluation` (closes a cookie exfiltration
+>   vector via prompt injection — pre-v1.6.14 the JS-evaluation
+>   gate only covered `EvaluateInput`, not `wait_for_function`);
+>   `Agent.replay_trace` + `TraceRecorder.load_entries` now contain
+>   `trace_file` paths to `trace_dir` (closes an LFI via the MCP
+>   `web_replay_trace` tool); `web_interact` MCP docstring now
+>   lists all **19 action types**, not the stale "12" — re-enables
+>   7 v1.6.6/v1.6.7 actions that were invisible to MCP callers.
+> * **Throughput / DoS**: `RateLimiter.notify_429` caps
+>   `Retry-After` at 300 s — a server's `Retry-After: 99999999`
+>   used to put the limiter into a ~3-year sleep;
+>   `WebFetcher.fetch_many` with `session_id` is now bounded by
+>   `asyncio.Semaphore(BrowserConfig.max_pages_per_session_fetch)`
+>   (default 5) — pre-v1.6.14 reproducibly crashed Chromium at
+>   20+ parallel pages on a session;
+>   `NetworkCollector.wait_for_pending_bodies` now correctly
+>   cancels orphaned tasks on timeout instead of letting them
+>   continue running against possibly-closed Pages.
+> * **Pipeline**: `Recipes.fill_form_and_extract` returns
+>   `extraction_method="none"` (instead of misleading SUCCESS
+>   with empty html) when the navigation race kills capture;
+>   `TabManager.close_tab` now holds `_lock` across `page.close()`
+>   to prevent concurrent `switch_tab` from observing inconsistent
+>   intermediate state.
+>
+> **No breaking changes** to documented v1.6.13 public APIs. New
+> `BrowserConfig.max_pages_per_session_fetch=5` default is the
+> only behavioural cap; raise it if you have a beefy renderer.
+> Implementation was delegated to 3 specialised agents working in
+> parallel on disjoint file sets — total wall-clock ~12 minutes.
+>
+> See [CHANGELOG.md](CHANGELOG.md#1614---2026-05-28) for the full
+> entry including the threat model for each fix.
+>
+> **v1.6.13** — *Page-content capture resilience.*
 > Single-slice patch addressing one specific production failure mode:
 > `page.content()` raising `"Unable to retrieve content because the
 > page is navigating and changing the content"` mid-fetch. The race

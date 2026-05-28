@@ -174,10 +174,25 @@ class SessionTraceRecorder:
 
         Raises FileNotFoundError if the path doesn't exist. Empty lines
         and lines that fail JSON parsing are skipped with a WARNING.
+
+        v1.6.14 C-3 defense-in-depth: ``Agent.replay_trace`` is the
+        primary chokepoint that validates the path lives inside
+        ``trace_dir``, but ``load_entries`` is a public method on the
+        recorder and could be called directly by integrators. Repeat the
+        containment check here so an LLM-driven path (or any future
+        caller) can't bypass it by skipping the Agent layer. Existence
+        is checked first so the long-standing ``FileNotFoundError``
+        contract for missing paths is preserved -- the threat C-3
+        addresses is *content disclosure*, not directory probing.
         """
-        p = Path(trace_file)
+        p = Path(trace_file).resolve()
         if not p.exists():
             raise FileNotFoundError(f"Trace file not found: {p}")
+        trace_root = self._dir.resolve()
+        try:
+            p.relative_to(trace_root)
+        except ValueError as e:
+            raise ValueError(f"trace_file must be inside trace_dir ({trace_root}); got {p}") from e
         entries: list[dict[str, Any]] = []
         with p.open(encoding="utf-8") as f:
             for lineno, raw in enumerate(f, start=1):

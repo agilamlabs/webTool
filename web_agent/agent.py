@@ -1605,6 +1605,27 @@ class Agent:
 
         from .models import Action
 
+        # v1.6.14 C-3: Local-File-Inclusion defense. ``trace_file`` is
+        # accepted directly from the LLM via the ``web_replay_trace`` MCP
+        # tool and flows straight into a file open below. Without this
+        # containment check an attacker could pass ``/etc/passwd`` (or a
+        # ``..`` chain escaping ``trace_dir``) and the JSONL loader would
+        # happily read it. Resolve to an absolute path and verify it
+        # lives under the configured trace_dir. ValueError surfaces
+        # cleanly to the MCP layer.
+        p = Path(trace_file).resolve()
+        trace_root = self._trace_recorder.trace_dir.resolve()
+        try:
+            p.relative_to(trace_root)
+        except ValueError as exc:
+            # Name the exception ``exc`` (not ``e``) because the comprehensions
+            # and for-loops below in this method already bind ``e`` -- mypy
+            # treats the post-except reuse of ``e`` as a shadow of the deleted
+            # exception variable and emits ``misc`` errors.
+            raise ValueError(
+                f"trace_file must be inside trace_dir ({trace_root}); got {p}"
+            ) from exc
+
         async with self._call_scope("replay_trace", {"trace_file": str(trace_file)}) as cid:
             entries = self._trace_recorder.load_entries(trace_file)
             # Only entries whose method starts with "action." replay cleanly.

@@ -903,9 +903,29 @@ class Recipes:
             html, html_source = await safe_page_content(page)
             final_url = page.url
             if html_source == "navigating":
+                # v1.6.14 C-6: all 3 capture tiers failed -- this is a
+                # transport-level capture failure (matches downloader.py
+                # NETWORK_ERROR pattern in ``_do_save_page``), NOT a
+                # successful fetch with empty content. Returning a
+                # FetchResult(status=SUCCESS, html="") would lie to the
+                # caller: the downstream extractor sees ``not fr.html``
+                # and emits ``extraction_method="none"`` anyway, but the
+                # SUCCESS wrapper hides the fact that this was a capture
+                # failure (form may have succeeded, but the post-submit
+                # page never settled). Short-circuit with
+                # ``extraction_method="none"`` and ``content_length=0`` so
+                # the caller can distinguish "form worked, page has no
+                # content" from "navigation race killed extraction".
                 logger.warning(
-                    "fill_form_and_extract: page.content() abandoned after all tiers for {url}",
+                    "fill_form_and_extract: page.content() abandoned after all "
+                    "tiers for {url}; returning extraction_method='none'",
                     url=url,
+                )
+                return ExtractionResult(
+                    url=url,
+                    extraction_method="none",
+                    content_length=0,
+                    correlation_id=get_correlation_id(),
                 )
             fr = FetchResult(
                 url=url,
