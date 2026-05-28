@@ -1,5 +1,190 @@
 # Changelog
 
+## [1.6.13] - 2026-05-28
+
+### Page Content Capture Resilience
+
+Single-slice patch addressing one specific production failure mode
+that the v1.6.12 close-out brainstorm surfaced: `page.content()`
+raising `"Unable to retrieve content because the page is navigating
+and changing the content"` mid-fetch. The race is **transient** -- the
+page is loaded fine, the snapshot moment was wrong -- but pre-v1.6.13
+it bubbled up through `WebFetcher._fetch_with_retry`, triggered a
+full re-navigation via the `async_retry` decorator (wasting 2-5s per
+occurrence), and on aggressively redirecting pages (Cloudflare
+interstitials, meta-refresh, hydrating SPAs) could exhaust retries
+and fail the fetch entirely. Test count grows ~755 -> ~764
+(9 new tests in `tests/test_agent.py::TestV1613Integration`).
+
+### Public API addition
+
+1. **`safe_page_content(page, *, retries=3, settle_ms=250, use_cdp_fallback=True, cdp_timeout_ms=5000) -> tuple[str, HtmlCaptureSource]`**
+   in [`utils.py`](web_agent/utils.py), where `HtmlCaptureSource =
+   Literal["content", "evaluate", "cdp", "navigating"]` is defined
+   and exported from [`models.py`](web_agent/models.py) -- single
+   source of truth shared with the
+   `FetchResult.html_capture_source` field so mypy enforces equality
+   between the helper's return type and the model field.
+   Three-tier capture:
+
+   - **Tier 1 -- `page.content()` with bounded retry.** Up to `retries`
+     attempts. Only the specific navigation-race error is retried
+     (detected via message-substring match on
+     `"navigating and changing"` or `"page is navigating"`); any
+     other exception re-raises so the outer `async_retry` decorator
+     owns generic failure handling. **Between** attempts the helper
+     does `wait_for_load_state("domcontentloaded", timeout=2000)`
+     (best-effort) plus a `settle_ms` sleep -- but the settle is
+     SKIPPED after the final attempt (tier-2 runs in-page via
+     `page.evaluate` and doesn't need DCL).
+   - **Tier 2 -- `page.evaluate('...outerHTML')`.** Runs inside the
+     page context and tolerates some races the remote-protocol
+     `page.content()` rejects. Returns whatever the page-side DOM
+     has right now.
+   - **Tier 3 -- CDP `DOM.getOuterHTML`.** Reads the browser's
+     internal DOM tree directly, bypassing the JS-side navigation
+     checks both prior tiers honour. Each `cdp.send` is wrapped in
+     `asyncio.wait_for(..., timeout=cdp_timeout_ms/1000)` so a hung
+     CDP session can't block the helper indefinitely. The session is
+     detached in a `finally` block so we never leak it. Skipped when
+     `use_cdp_fallback=False` (useful for non-Chromium backends).
+
+   Returns `(html, source)` where `source` is one of `"content" |
+   "evaluate" | "cdp" | "navigating"`. Designed to **never raise on
+   the navigation-race path** -- callers get a tuple back always.
+   The "navigating" case (`html=""`) means all three tiers failed;
+   the caller should treat the fetch as degraded. Exported from
+   `web_agent.*` so callers writing custom flows can reuse it.
+
+### Model addition
+
+2. **`FetchResult.html_capture_source: Optional[HtmlCaptureSource]`**
+   in [`models.py`](web_agent/models.py) (the `HtmlCaptureSource`
+   alias resolves to `Literal["content", "evaluate", "cdp", "navigating"]`).
+   Populated by `WebFetcher._fetch_with_retry` after the
+   `safe_page_content` call. Lets downstream consumers (extractors,
+   telemetry pipelines, recipes) branch on whether the HTML came from
+   the happy path or one of the fallback tiers. `None` for binary
+   fetches and for FetchResults constructed outside the standard
+   WebFetcher flow (cached, unit tests).
+
+### Call sites refactored to use `safe_page_content`
+
+All four `page.content()` call sites in the package now go through
+the helper:
+
+3. **`web_fetcher.py:634`** -- the main fetch path. Propagates the
+   winning tier into `FetchResult.html_capture_source`. Logs a
+   `WARNING` when the capture is abandoned (`source="navigating"`,
+   `html=""`).
+4. **`downloader.py:432`** -- the page-save path. Logs the source
+   tier at `INFO` when non-happy-path, returns `HTTP_ERROR` when all
+   tiers abandon (we will not write a zero-byte file to disk and
+   pretend success).
+5. **`recipes.py:898`** -- `fill_form_and_extract` (very prone to
+   the race because form-submit flows trigger redirects). Propagates
+   tier source into the inner FetchResult so extraction telemetry
+   sees it.
+6. **`debug.py:80`** -- failure-time HTML snapshots. Now use the
+   helper too, because the debug capture often fires *exactly* when
+   the page is mid-redirect (post-failure cleanup). Empty captures
+   are silently skipped (no zero-byte artifact files).
+
+### Tests
+
+7. **`TestV1613Integration` (9 tests)** in `tests/test_agent.py`,
+   all using `unittest.mock.AsyncMock` -- no Playwright launch:
+   - `test_safe_page_content_happy_path` -- tier-1 success, tiers
+     2/3 never called.
+   - `test_safe_page_content_retries_on_navigation_race` -- two
+     races then success; 3 `page.content` calls, 2 settles.
+   - `test_safe_page_content_evaluate_fallback` -- all tier-1
+     races, tier-2 wins; CDP never reached.
+   - `test_safe_page_content_cdp_fallback` -- tier-1 + tier-2
+     fail, CDP returns HTML; verifies `cdp.detach()` cleanup runs.
+   - `test_safe_page_content_all_tiers_fail` -- everything blows
+     up, returns `("", "navigating")` without raising.
+   - `test_safe_page_content_reraises_non_race_errors` -- targeted
+     guard: `ERR_CONNECTION_RESET` etc. propagate; tiers 2/3 do
+     NOT run.
+   - `test_safe_page_content_skips_cdp_when_disabled` -- explicit
+     `use_cdp_fallback=False` keeps CDP out of the picture.
+   - `test_fetch_result_has_html_capture_source_field` -- schema
+     test for the new model field (default `None`, accepts the
+     four literals, rejects unknown values).
+   - `test_is_navigation_race_marker_detection` -- exercises both
+     upstream message variants + confirms generic errors don't
+     trigger the race path.
+
+### Files changed
+
+- `web_agent/utils.py` (~140 LOC added: `safe_page_content` +
+  `_is_navigation_race` + markers)
+- `web_agent/models.py` (`html_capture_source` field on `FetchResult`)
+- `web_agent/web_fetcher.py` (import + tier-source capture +
+  propagation to `FetchResult`)
+- `web_agent/downloader.py` (import + degraded-source logging +
+  abandoned-capture error path)
+- `web_agent/recipes.py` (import + tier propagation in
+  `fill_form_and_extract`)
+- `web_agent/debug.py` (import + tier-source logging + empty-skip)
+- `web_agent/__init__.py` (version 1.6.12 -> 1.6.13; export
+  `safe_page_content`)
+- `tests/test_agent.py` (`TestV1613Integration`, 9 tests)
+- `CHANGELOG.md`, `README.md`, `AGENTS.md` (entry + banners)
+
+### Rationale + alternatives considered
+
+- **Why not just bump `async_retry.max_retries`?** A retry there
+  triggers a full re-navigation -- 2-5s wasted per occurrence on a
+  page that's already loaded fine. The retry belongs at the
+  content-capture layer, not the fetch layer.
+- **Why not introduce `RetryablePageContentError`?** No caller would
+  need to catch it -- the helper handles the retry internally and
+  returns a tuple. Adding a class forces an import dance with zero
+  behaviour change.
+- **Why not catch the typed Playwright error class?** The class
+  (`playwright._impl._errors.Error`) is private. The message string
+  is the stable signal -- and we match on a substring that has been
+  consistent across Playwright 1.40-1.50.
+- **Why a final `("", "navigating")` instead of raising?** A
+  degraded fetch with telemetry is more useful than a failed fetch
+  with the same telemetry buried in an exception. Downstream
+  extraction returns empty content naturally; callers who care can
+  branch on `FetchResult.html_capture_source == "navigating"`.
+
+### Migration
+
+No breaking changes. All v1.6.12 public APIs unchanged. The new
+`FetchResult.html_capture_source` field defaults to `None`, so
+existing `FetchResult(**existing_dict)` callers see no change.
+
+### Review-pass fixes (folded into the same slice)
+
+A `feature-dev:code-reviewer` audit found 0 Critical, 2 Important,
+3 Minor issues; all 5 fixed in this release:
+
+- **I-1**: `downloader.py` now returns `FetchStatus.NETWORK_ERROR`
+  (not `HTTP_ERROR`) when all 3 capture tiers abandon. A
+  content-capture failure is a transport-level error -- the server
+  returned a fine response -- so `HTTP_ERROR` would mislead callers
+  branching on status.
+- **I-2**: `safe_page_content` now skips the `wait_for_load_state` +
+  `settle_ms` sleep after the **final** tier-1 attempt (tier-2 runs
+  in-page via `page.evaluate` and doesn't depend on DCL). Saves up
+  to 2.25s of latency on the degraded path.
+- **M-1**: `HtmlCaptureSource` `Literal` alias moved from `utils.py`
+  to `models.py` so the model field type and the helper's return
+  type can't drift. Exported from `web_agent.*`.
+- **M-2**: `cdp_timeout_ms` is now wired -- each `cdp.send` is
+  wrapped in `asyncio.wait_for(..., timeout=cdp_timeout_ms/1000)`.
+  A hung CDP session can no longer block the helper indefinitely;
+  on timeout the outer `except Exception` falls through to the final
+  `("", "navigating")` return.
+- **M-3**: AGENTS.md and CHANGELOG.md doc signatures updated to
+  show the narrowed `tuple[str, HtmlCaptureSource]` return type
+  rather than the loose `tuple[str, str]`.
+
 ## [1.6.12] - 2026-05-21
 
 ### Throttle + Telemetry Depth + Structured-Data Extraction

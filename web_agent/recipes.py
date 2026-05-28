@@ -39,7 +39,7 @@ from .models import (
 )
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
-from .utils import BudgetTracker, check_domain_allowed
+from .utils import BudgetTracker, check_domain_allowed, safe_page_content
 from .web_fetcher import (
     WebFetcher,
     _is_download_url,
@@ -895,13 +895,24 @@ class Recipes:
                 )
 
             # Step 6: extract
-            html = await page.content()
+            # v1.6.13: 3-tier safe capture so a mid-navigation race
+            # (very common on form-submit flows that trigger a redirect)
+            # doesn't blow up extraction. Source is propagated to the
+            # FetchResult so the downstream extractor + telemetry can see
+            # whether we hit the degraded path.
+            html, html_source = await safe_page_content(page)
             final_url = page.url
+            if html_source == "navigating":
+                logger.warning(
+                    "fill_form_and_extract: page.content() abandoned after all tiers for {url}",
+                    url=url,
+                )
             fr = FetchResult(
                 url=url,
                 final_url=final_url,
                 status=FetchStatus.SUCCESS,
                 html=html,
+                html_capture_source=html_source,
                 correlation_id=get_correlation_id(),
             )
             extracted = self._extractor.extract(fr)

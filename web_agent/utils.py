@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import ipaddress
 import random
@@ -20,8 +21,11 @@ from loguru import logger
 
 # Import to ensure loguru patcher is installed when utils is imported
 from . import correlation as _correlation  # noqa: F401
+from .models import HtmlCaptureSource
 
 if TYPE_CHECKING:
+    from playwright.async_api import Page
+
     from .config import SafetyConfig
 
 T = TypeVar("T")
@@ -205,6 +209,192 @@ def parse_retry_after(header_value: str | None) -> float | None:
         return max(0.0, delta)
     except (TypeError, ValueError, IndexError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Page Content Capture (v1.6.13)
+# ---------------------------------------------------------------------------
+# Marker substrings in Playwright's "Unable to retrieve content because the
+# page is navigating and changing the content" error. Both substrings cover
+# variations seen across Playwright 1.40-1.50; matching on either prevents
+# us from chasing the exact message format if upstream rewords it.
+_NAVIGATION_RACE_MARKERS = ("navigating and changing", "page is navigating")
+
+
+def _is_navigation_race(exc: BaseException) -> bool:
+    """Return True if ``exc`` looks like Playwright's mid-navigation race.
+
+    Detected via message-substring match because the typed Playwright
+    error class (``playwright._impl._errors.Error``) is not part of the
+    documented public API and the message itself is the stable signal.
+    """
+    msg = str(exc)
+    return any(marker in msg for marker in _NAVIGATION_RACE_MARKERS)
+
+
+async def safe_page_content(
+    page: Page,
+    *,
+    retries: int = 3,
+    settle_ms: int = 250,
+    use_cdp_fallback: bool = True,
+    cdp_timeout_ms: int = 5000,
+) -> tuple[str, HtmlCaptureSource]:
+    """Capture ``page.content()`` resiliently across in-flight navigations.
+
+    Playwright raises ``Error: Unable to retrieve content because the page
+    is navigating and changing the content`` when ``page.content()`` is
+    invoked exactly when the document is being torn down or replaced
+    (client-side redirects, SPA route swaps, meta-refresh, Cloudflare
+    interstitials, hydration mid-flight). The race is **transient** -- the
+    page is fine, the snapshot moment was wrong -- so the right response
+    is "wait a beat and retry," not "fail the fetch."
+
+    This helper implements three fallback tiers:
+
+    1. **``page.content()`` with bounded retry.** Up to ``retries``
+       attempts. Between attempts the helper does
+       ``wait_for_load_state('domcontentloaded', timeout=2000)``
+       (best-effort, exceptions swallowed) plus a ``settle_ms`` sleep,
+       but ONLY between attempts -- the settle is skipped after the
+       final tier-1 attempt because the next step is tier-2 which runs
+       in-page via ``page.evaluate`` and does not depend on DCL having
+       fired. (v1.6.13 review-pass I-2: the prior version wasted up to
+       2.25s on the last attempt before falling through.) Only the
+       specific navigation-race error is retried; every other exception
+       re-raises immediately so the outer ``async_retry`` decorator can
+       do its normal work.
+
+    2. **``page.evaluate('document.documentElement.outerHTML')``.** Runs
+       inside the page context and tolerates some races that the
+       remote-protocol ``page.content()`` rejects. Returns whatever the
+       page-side DOM has right now.
+
+    3. **CDP ``DOM.getOuterHTML``.** Reads the browser's internal DOM
+       tree directly, bypassing the JS-side navigation checks both prior
+       tiers honour. Only attempted when ``use_cdp_fallback=True``
+       (default) and the page is on a CDP-capable backend (Chromium).
+       The session is detached in a ``finally`` block so we never leak
+       it. Failure (non-Chromium browser, detached page, CDP timeout)
+       falls through to the final ``""`` return.
+
+    Args:
+        page: The Playwright ``Page`` to capture.
+        retries: Maximum tier-1 attempts. Default 3 (one initial try +
+            two retries).
+        settle_ms: Milliseconds to sleep between tier-1 retries after
+            ``wait_for_load_state``. Default 250.
+        use_cdp_fallback: When True (default), tier 3 is attempted if
+            tiers 1 and 2 both fail. Pass False to skip CDP (e.g. for
+            non-Chromium backends where the extra round-trip is wasted).
+        cdp_timeout_ms: Per-command timeout (in milliseconds) for the
+            tier-3 CDP calls. v1.6.13 review-pass M-2: wired via
+            ``asyncio.wait_for`` around each ``cdp.send`` so a hung CDP
+            session can never block the helper indefinitely. On
+            timeout the outer ``except Exception`` falls through to
+            the final ``("", "navigating")`` return. Default 5000.
+
+    Returns:
+        A ``(html, source)`` tuple where ``source`` is one of:
+
+        - ``"content"``: tier 1 succeeded.
+        - ``"evaluate"``: tier 2 succeeded.
+        - ``"cdp"``: tier 3 succeeded.
+        - ``"navigating"``: all tiers failed. ``html`` is ``""``. The
+          caller should treat the fetch as degraded -- e.g. set
+          ``FetchResult.html_capture_source="navigating"`` so downstream
+          telemetry / extractors can branch on it.
+
+    Notes:
+        Designed to never raise on the navigation-race path -- callers
+        can rely on always getting a tuple back. Non-race exceptions
+        propagate (so the outer ``async_retry`` still owns generic
+        failure handling like network drops, timeouts, etc.).
+    """
+    last_err: Exception | None = None
+    total_attempts = max(1, retries)
+
+    # Tier 1: page.content() with bounded retry on the specific race.
+    for attempt in range(total_attempts):
+        try:
+            html = await page.content()
+            return html, "content"
+        except Exception as exc:
+            if not _is_navigation_race(exc):
+                raise
+            last_err = exc
+            # v1.6.13 review-pass I-2: skip the settle on the LAST
+            # attempt -- tier-2 (page.evaluate) runs in-page context
+            # and doesn't depend on domcontentloaded having fired, so
+            # the wait + sleep on the final iteration is pure waste
+            # (up to 2.25s of latency on the already-degraded path).
+            if attempt < total_attempts - 1:
+                # Best-effort settle: domcontentloaded usually fires
+                # quickly after the in-progress navigation resolves;
+                # the 2s cap stops us from blocking on pages that never
+                # reach DCL (long-poll, streamed responses).
+                with contextlib.suppress(Exception):
+                    await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                if settle_ms > 0:
+                    await asyncio.sleep(settle_ms / 1000)
+
+    # Tier 2: page.evaluate runs in the page context and tolerates some
+    # races that the remote-protocol page.content() rejects.
+    try:
+        evaluated = await page.evaluate(
+            "() => (document && document.documentElement "
+            "&& document.documentElement.outerHTML) || ''"
+        )
+        if isinstance(evaluated, str) and evaluated:
+            logger.debug(
+                "safe_page_content tier-2 (evaluate) succeeded after race: {e}",
+                e=last_err,
+            )
+            return evaluated, "evaluate"
+    except Exception as exc:
+        logger.debug("safe_page_content tier-2 (evaluate) failed: {e}", e=exc)
+
+    # Tier 3: CDP DOM.getOuterHTML reads the browser's internal DOM tree
+    # and bypasses most JS-side navigation checks. v1.6.13 review-pass
+    # M-2: each cdp.send is wrapped in asyncio.wait_for so a hung CDP
+    # session can't block the helper indefinitely; on TimeoutError the
+    # outer except falls through to the final ("", "navigating") path.
+    if use_cdp_fallback:
+        cdp = None
+        cdp_timeout = max(0.001, cdp_timeout_ms / 1000)
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            doc = await asyncio.wait_for(
+                cdp.send("DOM.getDocument", {"depth": -1, "pierce": True}),
+                timeout=cdp_timeout,
+            )
+            root_id = doc.get("root", {}).get("nodeId")
+            if root_id is not None:
+                outer = await asyncio.wait_for(
+                    cdp.send("DOM.getOuterHTML", {"nodeId": root_id}),
+                    timeout=cdp_timeout,
+                )
+                html = outer.get("outerHTML", "") if isinstance(outer, dict) else ""
+                if isinstance(html, str) and html:
+                    logger.debug(
+                        "safe_page_content tier-3 (CDP) succeeded after race: {e}",
+                        e=last_err,
+                    )
+                    return html, "cdp"
+        except Exception as exc:
+            logger.debug("safe_page_content tier-3 (CDP) failed: {e}", e=exc)
+        finally:
+            if cdp is not None:
+                with contextlib.suppress(Exception):
+                    await cdp.detach()
+
+    # All tiers failed. Caller gets ("", "navigating") and can mark the
+    # FetchResult degraded rather than crash the whole pipeline.
+    logger.warning(
+        "safe_page_content abandoned after all tiers (last error: {e})",
+        e=last_err,
+    )
+    return "", "navigating"
 
 
 # ---------------------------------------------------------------------------

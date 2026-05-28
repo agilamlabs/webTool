@@ -1215,3 +1215,312 @@ class TestV1612Integration:
         assert evt.body_size == 1024, f"expected body_size 1024, got {evt.body_size!r}"
         assert evt.status_code == 200
         assert evt.content_type == "text/html"
+
+
+# v1.6.13: page-content capture resilience (Options B + C from the
+# v1.6.12 close-out discussion). Mid-navigation races no longer kill an
+# otherwise-successful fetch -- ``safe_page_content`` walks three tiers
+# (page.content -> page.evaluate -> CDP DOM.getOuterHTML) and surfaces
+# the winning tier on ``FetchResult.html_capture_source`` for telemetry.
+class TestV1613Integration:
+    """v1.6.13: ``safe_page_content`` 3-tier capture + html_capture_source."""
+
+    # The exact Playwright error message used by tier-1 race detection.
+    # Matching this substring is the stable signal we rely on -- the
+    # typed exception class is private to playwright._impl.
+    _RACE_MSG = "Unable to retrieve content because the page is navigating and changing the content"
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_happy_path(self) -> None:
+        """Tier-1 ``page.content()`` succeeds -> returns ("html", "content")."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        page = MagicMock()
+        page.content = AsyncMock(return_value="<html><body>ok</body></html>")
+        page.evaluate = AsyncMock()  # should NOT be called
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock()  # should NOT be called
+
+        html, source = await safe_page_content(page)
+
+        assert source == "content"
+        assert html == "<html><body>ok</body></html>"
+        page.content.assert_awaited_once()
+        page.evaluate.assert_not_awaited()
+        page.context.new_cdp_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_retries_on_navigation_race(self) -> None:
+        """Tier-1 race twice, then success -> ("html", "content") with 3 calls."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        race_err = Exception(self._RACE_MSG)
+        page = MagicMock()
+        page.content = AsyncMock(side_effect=[race_err, race_err, "<html>recovered</html>"])
+        page.wait_for_load_state = AsyncMock()  # best-effort settle, no-op
+        page.evaluate = AsyncMock()  # not reached
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock()  # not reached
+
+        html, source = await safe_page_content(page, retries=3, settle_ms=0)
+
+        assert source == "content"
+        assert html == "<html>recovered</html>"
+        assert page.content.await_count == 3
+        # 2 settles between the 3 attempts.
+        assert page.wait_for_load_state.await_count == 2
+        page.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_skips_settle_on_last_attempt(self) -> None:
+        """v1.6.13 review-pass I-2: with N tier-1 attempts all racing,
+        the settle (wait_for_load_state + sleep) runs N-1 times, not N.
+
+        The settle after the final attempt is pure waste because tier-2
+        (page.evaluate) doesn't depend on domcontentloaded having fired.
+        Saved up to 2.25s of latency on the degraded path."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        race_err = Exception(self._RACE_MSG)
+        page = MagicMock()
+        # 4 races -> 4 tier-1 attempts -> tier-2 falls through.
+        page.content = AsyncMock(side_effect=race_err)
+        page.wait_for_load_state = AsyncMock()
+        page.evaluate = AsyncMock(return_value="<html>via evaluate</html>")
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock()  # not reached
+
+        html, source = await safe_page_content(page, retries=4, settle_ms=0)
+
+        assert source == "evaluate"
+        assert html == "<html>via evaluate</html>"
+        # 4 tier-1 attempts, but only 3 settles (skipped on the 4th).
+        assert page.content.await_count == 4
+        assert page.wait_for_load_state.await_count == 3, (
+            f"expected 3 settles (N-1=3), got {page.wait_for_load_state.await_count}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_cdp_timeout_falls_through(self) -> None:
+        """v1.6.13 review-pass M-2: ``cdp_timeout_ms`` wired via
+        ``asyncio.wait_for`` so a hung CDP session can't block the
+        helper indefinitely; on TimeoutError the outer except falls
+        through to the final ("", "navigating") return."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        race_err = Exception(self._RACE_MSG)
+        page = MagicMock()
+        page.content = AsyncMock(side_effect=race_err)
+        page.wait_for_load_state = AsyncMock()
+        page.evaluate = AsyncMock(return_value="")  # tier-2 fails
+
+        async def _hung_send(*_a: object, **_kw: object) -> dict:
+            # Simulate a hung CDP -- sleep longer than the configured
+            # timeout. asyncio.wait_for around it should fire first.
+            await asyncio.sleep(1.0)
+            return {"root": {"nodeId": 1}}
+
+        cdp = AsyncMock()
+        cdp.send = _hung_send
+        cdp.detach = AsyncMock()
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=cdp)
+
+        html, source = await safe_page_content(
+            page,
+            retries=2,
+            settle_ms=0,
+            use_cdp_fallback=True,
+            cdp_timeout_ms=50,  # 50ms cap; sleep above is 1s -> times out
+        )
+
+        assert source == "navigating"
+        assert html == ""
+        # Even on timeout the detach cleanup must still run.
+        cdp.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_evaluate_fallback(self) -> None:
+        """All tier-1 attempts race; tier-2 evaluate wins."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        race_err = Exception(self._RACE_MSG)
+        page = MagicMock()
+        page.content = AsyncMock(side_effect=race_err)
+        page.wait_for_load_state = AsyncMock()
+        page.evaluate = AsyncMock(return_value="<html>via evaluate</html>")
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock()  # not reached
+
+        html, source = await safe_page_content(page, retries=2, settle_ms=0)
+
+        assert source == "evaluate"
+        assert html == "<html>via evaluate</html>"
+        assert page.content.await_count == 2
+        page.evaluate.assert_awaited_once()
+        page.context.new_cdp_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_cdp_fallback(self) -> None:
+        """Tier-1 + tier-2 fail; CDP ``DOM.getOuterHTML`` wins."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        race_err = Exception(self._RACE_MSG)
+        page = MagicMock()
+        page.content = AsyncMock(side_effect=race_err)
+        page.wait_for_load_state = AsyncMock()
+        # evaluate returns empty -> tier-2 considered failed
+        page.evaluate = AsyncMock(return_value="")
+
+        # CDP session: DOM.getDocument -> nodeId 1; DOM.getOuterHTML ->
+        # the HTML payload.
+        cdp = AsyncMock()
+        cdp.send = AsyncMock(
+            side_effect=[
+                {"root": {"nodeId": 1}},  # DOM.getDocument
+                {"outerHTML": "<html>via cdp</html>"},  # DOM.getOuterHTML
+            ]
+        )
+        cdp.detach = AsyncMock()
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(return_value=cdp)
+
+        html, source = await safe_page_content(page, retries=2, settle_ms=0, use_cdp_fallback=True)
+
+        assert source == "cdp"
+        assert html == "<html>via cdp</html>"
+        page.context.new_cdp_session.assert_awaited_once_with(page)
+        assert cdp.send.await_count == 2
+        cdp.detach.assert_awaited_once()  # cleanup ran
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_all_tiers_fail(self) -> None:
+        """Every tier fails -> ("", "navigating") + no raise."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        race_err = Exception(self._RACE_MSG)
+        page = MagicMock()
+        page.content = AsyncMock(side_effect=race_err)
+        page.wait_for_load_state = AsyncMock()
+        page.evaluate = AsyncMock(side_effect=Exception("evaluate blew up"))
+
+        # CDP throws on session creation (non-Chromium / detached page).
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock(side_effect=Exception("CDP unavailable"))
+
+        html, source = await safe_page_content(page, retries=2, settle_ms=0, use_cdp_fallback=True)
+
+        assert source == "navigating"
+        assert html == ""
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_reraises_non_race_errors(self) -> None:
+        """Non-race exceptions from page.content() propagate; helper is targeted."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        # A timeout / network error -- NOT the navigation race. Helper
+        # must NOT swallow this; the outer ``async_retry`` decorator owns
+        # generic retry semantics.
+        boom = Exception("net::ERR_CONNECTION_RESET")
+        page = MagicMock()
+        page.content = AsyncMock(side_effect=boom)
+        page.evaluate = AsyncMock()  # not reached
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock()  # not reached
+
+        with pytest.raises(Exception, match="ERR_CONNECTION_RESET"):
+            await safe_page_content(page, retries=3, settle_ms=0)
+
+        # Tier-2 and tier-3 must NOT run when tier-1 re-raises non-race.
+        page.evaluate.assert_not_awaited()
+        page.context.new_cdp_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_safe_page_content_skips_cdp_when_disabled(self) -> None:
+        """``use_cdp_fallback=False`` -> tier-3 never attempted."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from web_agent.utils import safe_page_content
+
+        race_err = Exception(self._RACE_MSG)
+        page = MagicMock()
+        page.content = AsyncMock(side_effect=race_err)
+        page.wait_for_load_state = AsyncMock()
+        page.evaluate = AsyncMock(return_value="")  # tier-2 fails
+        page.context = MagicMock()
+        page.context.new_cdp_session = AsyncMock()  # must NOT be called
+
+        html, source = await safe_page_content(page, retries=2, settle_ms=0, use_cdp_fallback=False)
+
+        assert source == "navigating"
+        assert html == ""
+        page.context.new_cdp_session.assert_not_awaited()
+
+    def test_fetch_result_has_html_capture_source_field(self) -> None:
+        """Schema test: FetchResult exposes ``html_capture_source`` with
+        the four-valued literal type and a ``None`` default."""
+        from web_agent.models import FetchResult, FetchStatus
+
+        # Default is None (back-compat: existing test fixtures unchanged).
+        fr = FetchResult(
+            url="https://x.test/",
+            final_url="https://x.test/",
+            status=FetchStatus.SUCCESS,
+            html="<html></html>",
+        )
+        assert fr.html_capture_source is None
+
+        # All 4 literal values accepted.
+        for src in ("content", "evaluate", "cdp", "navigating"):
+            fr2 = FetchResult(
+                url="https://x.test/",
+                final_url="https://x.test/",
+                status=FetchStatus.SUCCESS,
+                html="" if src == "navigating" else "<html></html>",
+                html_capture_source=src,  # type: ignore[arg-type]
+            )
+            assert fr2.html_capture_source == src
+
+        # Invalid literal value -> Pydantic validation error.
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            FetchResult(
+                url="https://x.test/",
+                final_url="https://x.test/",
+                status=FetchStatus.SUCCESS,
+                html="",
+                html_capture_source="bogus",  # type: ignore[arg-type]
+            )
+
+    def test_is_navigation_race_marker_detection(self) -> None:
+        """``_is_navigation_race`` matches both upstream message variants
+        and rejects unrelated errors."""
+        from web_agent.utils import _is_navigation_race
+
+        # Both variants Playwright has shipped match.
+        assert _is_navigation_race(Exception(self._RACE_MSG))
+        assert _is_navigation_race(
+            Exception("Error: Page.content: page is navigating, please retry")
+        )
+        # Generic errors do NOT match.
+        assert not _is_navigation_race(Exception("net::ERR_CONNECTION_RESET"))
+        assert not _is_navigation_race(Exception("Timeout 30000ms exceeded"))
+        assert not _is_navigation_race(Exception(""))

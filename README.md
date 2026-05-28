@@ -10,8 +10,48 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
-> **What's new in 1.6.12** — *Throttle + telemetry + structured-data
-> patch.* HTTP 429 handling, granular telemetry, and structured-data
+> **What's new in 1.6.13** — *Page-content capture resilience.*
+> Single-slice patch addressing one specific production failure mode:
+> `page.content()` raising `"Unable to retrieve content because the
+> page is navigating and changing the content"` mid-fetch. The race
+> is transient (page is fine, snapshot moment was wrong) but
+> pre-v1.6.13 it triggered a full re-navigation via the
+> `async_retry` decorator (2-5s wasted) and on aggressively
+> redirecting pages (Cloudflare interstitials, hydrating SPAs,
+> meta-refresh) could exhaust retries entirely. Headlines:
+>
+> * **`safe_page_content(page, *, retries=3, settle_ms=250,
+>   use_cdp_fallback=True)`** is a new public helper in `utils.py`
+>   that walks three tiers: (1) `page.content()` with bounded retry
+>   on the specific race; (2) `page.evaluate('...outerHTML')`
+>   (runs page-side, tolerates some races the remote protocol
+>   rejects); (3) CDP `DOM.getOuterHTML` (reads the browser's
+>   internal DOM tree, bypasses JS-side checks). Returns
+>   `(html, source)` where source is `"content" | "evaluate" | "cdp"
+>   | "navigating"`. Never raises on the race path; non-race errors
+>   re-raise so the outer `async_retry` decorator owns generic
+>   failure handling.
+> * **`FetchResult.html_capture_source`** surfaces which tier won.
+>   `None` for binary fetches; the four literals for HTML.
+>   `"navigating"` means all tiers failed and `html=""` -- treat as
+>   degraded.
+> * **All 4 `page.content()` call sites refactored**:
+>   [`web_fetcher.py`](web_agent/web_fetcher.py) (main fetch, sets
+>   `html_capture_source`), [`downloader.py`](web_agent/downloader.py)
+>   (save-page, returns `HTTP_ERROR` when all tiers abandon -- no
+>   zero-byte files), [`recipes.py`](web_agent/recipes.py)
+>   (`fill_form_and_extract`, where form-submit redirects make the
+>   race especially common), [`debug.py`](web_agent/debug.py)
+>   (failure-time snapshots, which fire mid-redirect by design).
+> * **No new dependencies. No breaking changes.** All v1.6.12
+>   public APIs unchanged. `html_capture_source` defaults to `None`
+>   so existing `FetchResult(...)` callers see no schema break.
+>
+> See [CHANGELOG.md](CHANGELOG.md#1613---2026-05-28) for the
+> full entry including the alternatives-considered notes.
+>
+> **v1.6.12** — *Throttle + telemetry + structured-data patch.*
+> HTTP 429 handling, granular telemetry, and structured-data
 > extraction (JSON-LD always-on plus opt-in XHR/fetch JSON body
 > capture and a `prefer_api=True` extractor mode). Headlines:
 >
