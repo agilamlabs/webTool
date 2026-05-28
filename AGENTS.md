@@ -6,7 +6,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
 
-- Latest version: **1.6.13**
+- Latest version: **1.6.14**
 - Python: **3.10+**
 - Single source of truth for the project surface: `web_agent/__init__.py`
 
@@ -186,6 +186,94 @@ These rules constrain every change:
 - `prefer_domains=[...]` parameter on ranking-based recipes.
 - `Agent.fill_form_and_extract(url, FormFilterSpec)` for dynamic calendar/filter pages.
 - Optional `[binary]` extra: `pip install web-agent-toolkit[binary]`.
+
+## What v1.6.14 added
+
+**Hardening slice — 8 Critical fixes from a brutal full-codebase
+audit.** No new features. Pure correctness, security, and DoS
+hardening. Bundle of 8 fixes across 10 source files + 3 new test
+files (+22 tests). Implementation delegated to 3 specialised
+`general-purpose` agents working in parallel on disjoint file sets;
+~12 minutes wall-clock.
+
+The 8 Criticals were surfaced by a v1.6.13 close-out review that
+spawned 4 parallel `feature-dev:code-reviewer` agents (security,
+fetch/extract correctness, browser orchestration, API/tests/docs).
+The synthesis identified 8 must-fix findings with confidence ≥85%,
+which became this slice.
+
+**Security cluster (C-2, C-3, C-5)** — `browser_actions.py`,
+`agent.py`, `trace_recorder.py`, `mcp_server.py`
+
+- **C-2**: `WaitInput(target=FUNCTION)` honours
+  `safety.allow_js_evaluation`. Pre-flight scanner in
+  `BrowserActions.execute_sequence` previously gated only
+  `EvaluateInput`; `wait_for_function` executes arbitrary JS in
+  the page context and was a cookie-exfil vector via LLM prompt
+  injection. Now gated symmetrically.
+- **C-3**: `Agent.replay_trace` + `TraceRecorder.load_entries`
+  reject `trace_file` paths outside `trace_dir`. Defence-in-depth
+  (both layers check) closes a LFI via MCP `web_replay_trace`.
+- **C-5**: `web_interact` MCP docstring updated 12 -> 19 action
+  types. The stale doc hid 7 v1.6.6/v1.6.7 actions (`click_xy`,
+  `type_text`, `press_key`, `upload_file`, `iframe_click`,
+  `shadow_dom_click`, `drag_and_drop`) from every MCP client's LLM.
+
+**Throughput / DoS cluster (C-1, C-4, C-7)** — `rate_limiter.py`,
+`web_fetcher.py`, `network_collector.py`, `config.py`
+
+- **C-1**: `RateLimiter.MAX_RETRY_AFTER_SECONDS = 300.0` class
+  constant + clamp in `notify_429`. A server's
+  `Retry-After: 99999999` used to put `acquire(host)` into a
+  ~1157-day sleep. Now capped at 5 minutes.
+- **C-4**: `WebFetcher.fetch_many` with `session_id` bounded by
+  `asyncio.Semaphore(BrowserConfig.max_pages_per_session_fetch)`
+  (new config field, default 5, ge=1, le=50). Pre-v1.6.14 ran
+  unbounded `asyncio.gather` over a single `BrowserContext`,
+  reproducibly crashing the Chromium renderer at ~20+ parallel
+  pages.
+- **C-7**: `NetworkCollector.wait_for_pending_bodies` rewritten to
+  use `asyncio.wait(timeout=...)` + explicit `task.cancel()` per
+  pending task + drain. The previous
+  `asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True),
+  timeout=N)` cancelled the gather wrapper but NOT its children,
+  orphaning body-capture tasks against possibly-closed Pages.
+
+**Pipeline cluster (C-6, C-8)** — `recipes.py`, `tab_manager.py`
+
+- **C-6**: `Recipes.fill_form_and_extract` short-circuits with
+  `ExtractionResult(extraction_method="none", content_length=0)`
+  when `safe_page_content` returns `("", "navigating")`. Pre-
+  v1.6.14 built a misleading `FetchResult(status=SUCCESS, html="")`
+  that hid the capture failure from the caller. Matches the
+  `Downloader._do_save_page` `NETWORK_ERROR` pattern from v1.6.13.
+- **C-8**: `TabManager.close_tab` holds `_lock` across
+  `page.close()`. Pre-v1.6.14 the lock was released before the
+  await, so a concurrent `switch_tab` could observe an
+  inconsistent intermediate state while `_evict_on_close` (sync
+  Playwright close-event callback) was mutating `_tabs` /
+  `_current_tab_id`.
+
+**Tests (22 new, AsyncMock-driven, no Playwright launch)**
+
+- `tests/test_v1614_security.py` (8 tests): WaitInput JS gate
+  block + allow paths, regression guard for non-FUNCTION wait
+  targets, replay_trace containment for absolute and `..` escape,
+  defence-in-depth at the trace-recorder layer, docstring
+  introspection for all 19 action types.
+- `tests/test_v1614_throughput.py` (8 tests): Retry-After cap
+  with extreme and `None` cases + normal-value pass-through;
+  fetch_many session-path semaphore + ephemeral-path no-gate;
+  wait_for_pending_bodies cancellation + empty + drain.
+- `tests/test_v1614_pipeline.py` (4 tests): fill_form
+  nav-race short-circuit + happy-path preservation; close_tab
+  lock-held-across-close + double-close idempotency.
+
+**No breaking changes** to documented v1.6.13 public APIs. The new
+`BrowserConfig.max_pages_per_session_fetch=5` default is the only
+behavioural cap; raise via `AppConfig(browser={"max_pages_per_session_fetch": 20})`
+if you want the pre-v1.6.14 unbounded behaviour (at your renderer's
+risk).
 
 ## What v1.6.13 added
 

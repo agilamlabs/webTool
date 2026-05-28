@@ -400,26 +400,48 @@ class NetworkCollector:
     async def wait_for_pending_bodies(self, *, timeout: float = 5.0) -> None:
         """v1.6.12: drain in-flight body-capture tasks before snapshotting.
 
-        Best-effort -- on timeout the remaining tasks are left running
-        and the corresponding events will have ``body_text=None``.
+        v1.6.14 C-7: any tasks that do NOT complete inside ``timeout`` are
+        explicitly cancelled so they cannot keep running orphaned against
+        a Page that the caller is about to close. The previous
+        ``asyncio.wait_for(asyncio.gather(..., return_exceptions=True))``
+        construction cancelled the gather wrapper future but
+        ``gather(return_exceptions=True)`` does NOT cascade cancellation
+        to its children -- they continued running, racing the now-closed
+        Page and surfacing "Task exception was never retrieved" /
+        Playwright "Target closed" noise. Cancellation is also drained
+        with a second ``gather`` so we don't leave "Task was destroyed
+        but it is pending!" warnings in test output. The
+        ``add_done_callback`` registered in ``_on_response`` keeps
+        ``_pending_body_captures`` consistent automatically.
 
         Args:
-            timeout: Maximum seconds to wait. Default 5.0.
+            timeout: Maximum seconds to wait for in-flight body reads to
+                finish. Default 5.0. Tasks still pending at the deadline
+                are cancelled (and drained) before this method returns.
         """
         if not self._pending_body_captures:
             return
-        pending = list(self._pending_body_captures)
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*pending, return_exceptions=True),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
+        pending_tasks = list(self._pending_body_captures)
+        # v1.6.14 C-7: ``asyncio.wait`` returns (done, pending) but we
+        # don't introspect ``done`` -- the per-task done callback in
+        # ``_on_response`` already removes finished tasks from
+        # ``_pending_body_captures``. ``_done`` is named-with-underscore
+        # so ruff/RUF059 doesn't flag it as an unused unpack target.
+        _done, pending = await asyncio.wait(pending_tasks, timeout=timeout)
+        if pending:
+            # v1.6.14 C-7: cancel orphans so they can't keep running
+            # against a (possibly closed) Page.
+            for task in pending:
+                task.cancel()
             logger.debug(
-                "wait_for_pending_bodies timed out after {t}s ({n} still pending)",
+                "wait_for_pending_bodies cancelling {n} tasks still pending after {t}s",
+                n=len(pending),
                 t=timeout,
-                n=len(self._pending_body_captures),
             )
+            # Drain the cancellations -- otherwise CPython logs
+            # "Task was destroyed but it is pending!" once the GC
+            # eventually collects them.
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 __all__ = ["NetworkCollector"]

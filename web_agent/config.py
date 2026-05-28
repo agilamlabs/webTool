@@ -107,6 +107,28 @@ class BrowserConfig(BaseSettings):
     default_timeout: int = 30000
     navigation_timeout: int = 45000
     max_contexts: int = 3
+    # v1.6.14 C-4: cap on concurrent ``ctx.new_page()`` calls inside a
+    # single :meth:`WebFetcher.fetch_many` invocation when a
+    # ``session_id`` is supplied. The ephemeral path (no session_id) is
+    # already gated by :class:`BrowserManager`'s context semaphore
+    # (``max_contexts``), but the session path shares one
+    # BrowserContext and bypasses that gate -- ~20+ concurrent
+    # ``new_page()`` calls reproducibly crash Chromium's renderer.
+    # Default 5 keeps per-session throughput healthy while staying well
+    # below the empirically-observed crash threshold.
+    max_pages_per_session_fetch: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "v1.6.14 C-4: maximum concurrent pages created inside one "
+            ":meth:`WebFetcher.fetch_many` call when a ``session_id`` is "
+            "supplied. Prevents Chromium renderer crashes from too many "
+            "parallel ``ctx.new_page()`` calls sharing a single "
+            "BrowserContext. The ephemeral (no-session) path is already "
+            "gated by ``max_contexts`` via ``BrowserManager``."
+        ),
+    )
     block_resources: list[str] = Field(
         default_factory=lambda: ["image", "font", "stylesheet", "media"]
     )

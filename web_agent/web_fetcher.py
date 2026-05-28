@@ -745,6 +745,18 @@ class WebFetcher:
     ) -> list[FetchResult]:
         """Fetch multiple URLs concurrently, bounded by BrowserManager's semaphore.
 
+        v1.6.14 C-4: when ``session_id`` is supplied, an
+        :class:`asyncio.Semaphore` gates the concurrent ``self.fetch``
+        calls to :attr:`BrowserConfig.max_pages_per_session_fetch`. The
+        session path creates pages via ``ctx.new_page()`` directly
+        (bypassing :class:`BrowserManager`'s context semaphore that
+        otherwise caps concurrency on the ephemeral path), so without
+        this gate 20+ concurrent fetches against one BrowserContext
+        reproducibly crash Chromium's renderer. The ephemeral path (no
+        ``session_id``) is intentionally left untouched -- it goes
+        through ``BrowserManager.new_page`` which is already gated by
+        ``max_contexts``.
+
         Args:
             urls: List of URLs to fetch.
             session_id: Optional shared persistent session for all fetches.
@@ -752,7 +764,21 @@ class WebFetcher:
         Returns:
             List of FetchResult in the same order as input URLs.
         """
-        tasks = [self.fetch(url, session_id=session_id) for url in urls]
+        if session_id is not None:
+            # v1.6.14 C-4: session-path gate. The semaphore is created
+            # per-call (not stored on the WebFetcher) because a
+            # different session_id in a subsequent call shouldn't share
+            # the budget -- this is "concurrency inside one fetch_many",
+            # not "concurrency across the WebFetcher's lifetime".
+            sem = asyncio.Semaphore(self._config.browser.max_pages_per_session_fetch)
+
+            async def _gated(u: str) -> FetchResult:
+                async with sem:
+                    return await self.fetch(u, session_id=session_id)
+
+            tasks = [_gated(url) for url in urls]
+        else:
+            tasks = [self.fetch(url, session_id=session_id) for url in urls]
         return list(await asyncio.gather(*tasks))
 
     async def classify_url(

