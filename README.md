@@ -11,10 +11,16 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
 > **What's new in 1.6.14** — *Hardening slice — 8 Critical fixes
-> from a brutal full-codebase audit.* No new features; pure
-> correctness, security, and DoS hardening. Bundle of 8 fixes
-> across 10 source files and 3 new test files (+22 tests,
-> AsyncMock-driven). Headlines:
+> from a brutal full-codebase audit, plus a deeper review-hardening
+> follow-up (44 more findings: 1 Critical / 10 High / 21 Medium / 12
+> Low — all fixed in-place, no version bump).* No new features; pure
+> correctness, security, and DoS hardening. The follow-up adds a
+> connect-time DNS-rebinding guard (C-1), obfuscated-IP SSRF
+> normalisation, a session-namespaced fetch cache, handler-level
+> JS-eval gating, and ~20 more — see CHANGELOG. The original 8-fix
+> bundle spans 10 source files + 3 new test files (+22 tests); the
+> follow-up adds +26 (`tests/test_v1614_review_hardening.py`).
+> Headlines (original bundle):
 >
 > * **Security**: `WaitInput(target=FUNCTION)` now honours
 >   `safety.allow_js_evaluation` (closes a cookie exfiltration

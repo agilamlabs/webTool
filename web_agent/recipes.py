@@ -611,6 +611,14 @@ class Recipes:
         summary_pages: list[ExtractionResult] = []
 
         for item, fr in zip(targets, fetch_results, strict=True):
+            if isinstance(fr, asyncio.CancelledError):
+                # v1.6.14 E-4: never swallow cancellation. gather(
+                # return_exceptions=True) hands back a CancelledError as a
+                # result object; treating it as a generic "fetch error"
+                # would mask a real task cancellation and let web_research
+                # keep running (and holding browser resources) after the
+                # caller cancelled. Re-raise so cancellation propagates.
+                raise fr
             if isinstance(fr, BaseException):
                 bag.warn(
                     "fetch_exception",

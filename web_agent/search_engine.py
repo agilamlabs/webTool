@@ -110,7 +110,13 @@ class SearchEngine:
 
         # Cache lookup -- key includes max_results so different result
         # counts for the same query don't collide.
-        cache_key = f"search:{query}:{max_r}"
+        #
+        # v1.6.14 C-3: also fold in ``safe_search`` so two differently
+        # configured engines sharing a cache backend can't serve each
+        # other's (differently-filtered) results. Search results are not
+        # per-session/authenticated, so -- unlike the fetch cache -- no
+        # session identity is needed in the key here.
+        cache_key = f"search:{int(self._config.search.safe_search)}:{query}:{max_r}"
         if self._cache is not None:
             cached = await self._cache.get(cache_key)
             if cached is not None:

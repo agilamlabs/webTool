@@ -623,6 +623,7 @@ class LocatorSpec(BaseModel):
             (
                 self.selector,
                 self.role,
+                self.role_name,
                 self.text,
                 self.label,
                 self.placeholder,

@@ -76,6 +76,17 @@ class TabManager:
         Auto-registers the page with a generated tab_id but does NOT
         change ``_current_tab_id``. The launcher tab keeps focus until
         explicit ``switch_tab``.
+
+        Concurrency invariant (v1.6.14 F-2): this sync callback mutates
+        ``_tabs`` / ``_reverse`` / ``_opened_at`` WITHOUT holding
+        ``self._lock`` -- it can't, the lock is async and Playwright
+        dispatches this handler synchronously. That is safe only because
+        (a) the mutations below run as an atomic group with no ``await``
+        between them, so no coroutine can observe a half-updated state,
+        and (b) every reader (``list`` / ``switch_tab`` / ``close_tab``)
+        snapshots ``_tabs`` under the lock before awaiting, so none
+        iterates the dict while this callback mutates it. Preserve BOTH
+        properties if you edit this method or add a new reader.
         """
         # Skip pages already registered (the initial page is registered
         # synchronously by register_initial_page before this listener
@@ -255,6 +266,14 @@ class TabManager:
             current = self._current_tab_id
             opened = dict(self._opened_at)
         for tid, page in items:
+            # v1.6.14 F-7: a tab can close between the locked snapshot and
+            # this await-y introspection; skip closed pages so list() never
+            # emits a stale TabInfo (empty url for a gone tab).
+            try:
+                if page.is_closed():
+                    continue
+            except Exception:
+                continue
             try:
                 url = page.url
             except Exception:

@@ -185,6 +185,10 @@ async def web_search(
         warnings/errors, download_candidates, and per-URL diagnostics.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
+    # v1.6.14 F-4: clamp the LLM-supplied count to a sane ceiling. An
+    # unbounded max_results is a prompt-injection DoS amplifier -- a tool
+    # call asking for 100000 results would fan out that many page fetches.
+    max_results = min(max(max_results, 1), 50)
     return await agent.search_and_extract(
         query,
         max_results=max_results,
@@ -442,6 +446,11 @@ async def web_research(
         per-URL diagnostics.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
+    # v1.6.14 F-4: clamp LLM-supplied counts to sane ceilings to bound
+    # prompt-injection-driven fan-out (max_pages parallel fetches; depth
+    # is reserved but clamped defensively against negative/huge values).
+    max_pages = min(max(max_pages, 1), 50)
+    depth = min(max(depth, 1), 3)
     return await agent.web_research(
         query,
         depth=depth,

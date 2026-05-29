@@ -67,16 +67,39 @@ class Workspace:
         return self._ws_cfg.enabled
 
     def root(self) -> Path:
-        """Return the resolved workspace root.
+        """Return the resolved workspace root, confined under ``base_dir``.
 
         Always returns a Path (not Optional) so callers can subscribe
         without nullchecks; gate calls behind :meth:`enabled` if you
         care whether the workspace is active.
+
+        v1.6.14 F-6: an absolute ``workspace_dir`` is rejected rather
+        than honoured verbatim. ``config.py`` does NOT resolve
+        ``workspace_dir`` against ``base_dir`` (unlike ``debug_dir`` /
+        ``download_dir`` / ...), so this consumption point is the sole
+        containment gate. Accepting an absolute path here would let an
+        operator-supplied (or env-injected) ``workspace_dir`` root the
+        agent's read/write surface at ``/etc`` or ``C:\\Windows``,
+        bypassing ``safe_join_path`` entirely. We funnel every path
+        through ``safe_join_path`` against the resolved base so the
+        workspace can never escape ``base_dir``.
+
+        Raises:
+            WorkspaceError: If ``workspace_dir`` is absolute on any
+                platform, or otherwise escapes ``base_dir``.
         """
         base = Path(self._config.base_dir).resolve()
         if _is_cross_platform_absolute(self._ws_cfg.workspace_dir):
-            return Path(self._ws_cfg.workspace_dir)
-        return safe_join_path(base, self._ws_cfg.workspace_dir)
+            raise WorkspaceError(
+                f"workspace.workspace_dir must be relative to base_dir; "
+                f"absolute paths are rejected (got {self._ws_cfg.workspace_dir!r})."
+            )
+        try:
+            return safe_join_path(base, self._ws_cfg.workspace_dir)
+        except ValueError as exc:
+            raise WorkspaceError(
+                f"workspace.workspace_dir escapes base_dir ({self._ws_cfg.workspace_dir!r}): {exc}"
+            ) from exc
 
     def _resolve(self, rel_path: str) -> Path:
         """Resolve ``rel_path`` under the workspace root with traversal protection."""

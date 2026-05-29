@@ -410,6 +410,10 @@ class BrowserActions:
         page = None
         ctx_mgr = None
         owner = "ephemeral"
+        # v1.6.14 A-2: bound dialog handler reference, set once registered
+        # inside the try. Bound early to None so the finally can remove it
+        # unconditionally even if page-acquisition raises before registration.
+        dialog_handler: Any = None
         # v1.6.8: bind early so the except path / final return doesn't
         # see an UnboundLocalError when an exception fires before the
         # success-snapshot line inside the try.
@@ -465,7 +469,13 @@ class BrowserActions:
                 host = urlparse(page.url).hostname or ""
                 return _block_all(f"Initial navigation redirected to disallowed domain: {host}")
 
-            page.on("dialog", dialog_state.handle)
+            # v1.6.14 A-2: keep the exact handler reference we register so
+            # the finally block can remove_listener it. dialog_state.handle
+            # is a bound method -- accessing it twice yields two distinct
+            # objects, so capturing it once is required for the later
+            # remove_listener to match.
+            dialog_handler = dialog_state.handle
+            page.on("dialog", dialog_handler)
             _PAGE_DIALOG_STATES[page] = dialog_state
 
             for action_input in actions:
@@ -573,9 +583,26 @@ class BrowserActions:
             # and ``page`` is still alive here (close happens below).
             if self._network_collector is not None and page is not None:
                 with contextlib.suppress(Exception):
+                    # v1.6.14 A-4: when response-body capture is on, drain
+                    # in-flight body reads BEFORE snapshotting events (and
+                    # before the page is closed below). Otherwise body_text
+                    # never populates and the orphaned tasks race a closed
+                    # page. Mirrors web_fetcher.py's pre-snapshot drain;
+                    # wait_for_pending_bodies has a bounded default timeout.
+                    if self._config.diagnostics.capture_response_bodies:
+                        await self._network_collector.wait_for_pending_bodies()
                     net_events = self._network_collector.events_for(page)
                     api_cands = self._network_collector.api_candidates_for(page)
                     dl_intents = self._network_collector.download_intents_for(page)
+            # v1.6.14 A-2: remove the dialog listener for ALL pages, not just
+            # ephemeral ones. The previous code only closed (and thereby
+            # detached) ephemeral pages; session-persistent tabs survive the
+            # sequence, so each execute_sequence stacked another listener and
+            # eventually tripped Playwright's "Dialog already handled". The
+            # handler reference is the exact bound method we registered.
+            if page is not None and dialog_handler is not None:
+                with contextlib.suppress(Exception):
+                    page.remove_listener("dialog", dialog_handler)
             # v1.6.6: only close pages WE created. Persistent session tabs
             # outlive sequences so subsequent interact() calls share state.
             if page is not None and owner == "session_ephemeral":
@@ -869,12 +896,30 @@ class BrowserActions:
 
         # Mode 2: Infinite scroll
         if action.infinite_scroll:
+            # v1.6.14 A-6: bound each evaluate call so a hung page can't
+            # stall for up to max_iterations x an unbounded wait. Playwright's
+            # Page.evaluate (1.58) takes NO timeout kwarg, so we wrap each call
+            # in asyncio.wait_for to impose a per-call deadline. A few-second
+            # cap keeps the bounded loop bounded in wall-clock time too; reuse
+            # the resolved action/config timeout but clamp it so a single
+            # iteration can't run away. A timed-out evaluate raises
+            # TimeoutError, which execute_action surfaces as a TIMEOUT result.
+            scroll_eval_timeout = min(timeout, 5000) / 1000
             iterations = 0
             for _ in range(action.infinite_scroll_max):
-                prev_height = await page.evaluate("document.body.scrollHeight")
-                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                prev_height = await asyncio.wait_for(
+                    page.evaluate("document.body.scrollHeight"),
+                    timeout=scroll_eval_timeout,
+                )
+                await asyncio.wait_for(
+                    page.evaluate("window.scrollBy(0, window.innerHeight)"),
+                    timeout=scroll_eval_timeout,
+                )
                 await asyncio.sleep(action.infinite_scroll_delay_ms / 1000)
-                new_height = await page.evaluate("document.body.scrollHeight")
+                new_height = await asyncio.wait_for(
+                    page.evaluate("document.body.scrollHeight"),
+                    timeout=scroll_eval_timeout,
+                )
                 iterations += 1
                 if new_height == prev_height:
                     break
@@ -1103,6 +1148,23 @@ class BrowserActions:
                 )
             await page.locator(f"text={action.value}").wait_for(timeout=timeout)
         elif action.target == WaitTarget.FUNCTION:
+            # v1.6.14 A-1: self-enforce the JS-eval gate. wait_for_function
+            # executes arbitrary JS in the page context, so it is a parallel
+            # JS-eval path. execute_sequence's pre-flight gates it, but the
+            # public entry points execute_action / execute_single_on_session
+            # dispatch here directly and bypass that pre-flight. Re-check the
+            # same SafetyConfig the pre-flight uses so the gate holds at every
+            # entry point.
+            if not self._config.safety.allow_js_evaluation:
+                from .exceptions import ActionError
+
+                raise ActionError(
+                    "WaitInput(target=FUNCTION) blocked: "
+                    "safety.allow_js_evaluation=False "
+                    "(wait_for_function executes arbitrary JS; "
+                    "set safety.allow_js_evaluation=True to opt in)",
+                    action="wait",
+                )
             if not action.value:
                 return ActionResult(
                     action=ActionType.WAIT,
@@ -1119,6 +1181,19 @@ class BrowserActions:
         )
 
     async def _do_evaluate(self, page: Page, action: EvaluateInput) -> ActionResult:
+        # v1.6.14 A-1: self-enforce the JS-eval gate at the handler so the
+        # public entry points execute_action / execute_single_on_session --
+        # which dispatch here directly, bypassing execute_sequence's
+        # pre-flight -- cannot run arbitrary JS when the operator has opted
+        # out. Uses the same SafetyConfig the pre-flight reads.
+        if not self._config.safety.allow_js_evaluation:
+            from .exceptions import ActionError
+
+            raise ActionError(
+                "EvaluateInput blocked: safety.allow_js_evaluation=False "
+                "(set safety.allow_js_evaluation=True to opt in)",
+                action="evaluate",
+            )
         result = await page.evaluate(action.expression)
         # Ensure the result is JSON-serializable
         try:
@@ -1366,6 +1441,22 @@ class BrowserActions:
                     f"to permit arbitrary local files.",
                     operation="upload_file",
                 ) from exc
+        else:
+            # v1.6.14 A-7: the escape hatch is enabled, so an out-of-dir
+            # upload is permitted -- but log it at WARNING so the audit
+            # trail records that a file reached outside download_dir. A
+            # prompt-injection exfil attempt (e.g. uploading ~/.ssh/id_rsa)
+            # surfaces here rather than passing silently.
+            base = Path(self._config.download.download_dir).resolve()
+            try:
+                resolved.relative_to(base)
+            except ValueError:
+                logger.warning(
+                    "upload_file: path {p} is OUTSIDE download_dir {b} "
+                    "(permitted because allow_upload_outside_download_dir=True)",
+                    p=resolved,
+                    b=base,
+                )
 
         if not resolved.exists():
             raise SafeModeBlockedError(
@@ -1401,7 +1492,12 @@ class BrowserActions:
             action=ActionType.UPLOAD_FILE,
             status=ActionStatus.SUCCESS,
             selector=_selector_repr(action.selector),
-            data={"paths": resolved_paths},
+            # v1.6.14 A-3: surface only basenames, never the resolved absolute
+            # paths. Echoing absolute filesystem paths back through the
+            # ActionResult (and thus to an MCP/LLM caller) leaks the server's
+            # directory layout and acts as a path oracle. The upload itself
+            # still used the full resolved paths above.
+            data={"paths": [Path(p).name for p in resolved_paths], "count": len(resolved_paths)},
         )
 
     async def _do_iframe_click(self, page: Page, action: IframeClickInput) -> ActionResult:

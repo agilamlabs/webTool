@@ -1614,20 +1614,29 @@ class Agent:
         # lives under the configured trace_dir. ValueError surfaces
         # cleanly to the MCP layer.
         p = Path(trace_file).resolve()
-        trace_root = self._trace_recorder.trace_dir.resolve()
-        try:
-            p.relative_to(trace_root)
-        except ValueError as exc:
-            # Name the exception ``exc`` (not ``e``) because the comprehensions
-            # and for-loops below in this method already bind ``e`` -- mypy
-            # treats the post-except reuse of ``e`` as a shadow of the deleted
-            # exception variable and emits ``misc`` errors.
-            raise ValueError(
-                f"trace_file must be inside trace_dir ({trace_root}); got {p}"
-            ) from exc
 
         async with self._call_scope("replay_trace", {"trace_file": str(trace_file)}) as cid:
-            entries = self._trace_recorder.load_entries(trace_file)
+            # v1.6.14 C-3 + review B-2: Local-File-Inclusion defense, now
+            # INSIDE _call_scope so a rejected path is recorded in the audit
+            # log (a blocked LFI attempt is exactly what a security monitor
+            # wants to see -- the prior placement checked before the scope and
+            # left rejections invisible). ``trace_file`` arrives straight from
+            # the LLM via the web_replay_trace MCP tool and flows into a file
+            # open; resolve to absolute and verify it lives under the
+            # configured trace_dir. Name the var ``exc`` (not ``e``) -- the
+            # for-loops below bind ``e`` and mypy flags reuse of a deleted
+            # except variable.
+            trace_root = self._trace_recorder.trace_dir.resolve()
+            try:
+                p.relative_to(trace_root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"trace_file must be inside trace_dir ({trace_root}); got {p}"
+                ) from exc
+            # v1.6.14 review F-5: load from the already-resolved, containment-
+            # checked path -- not the raw trace_file string -- so the loader
+            # reads exactly what we validated.
+            entries = self._trace_recorder.load_entries(p)
             # Only entries whose method starts with "action." replay cleanly.
             # Other (future) entry types like "scope.start" are skipped.
             action_entries = [e for e in entries if str(e.get("method", "")).startswith("action.")]
@@ -1671,14 +1680,36 @@ class Agent:
         self, result: AgentResult, output_path: str | Path | None = None
     ) -> Path:
         """Save an AgentResult to a JSON file."""
-        out_dir = Path(self._config.output_dir)
+        out_dir = Path(self._config.output_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if output_path is None:
             safe_query = "".join(c if c.isalnum() else "_" for c in result.query)[:50]
             output_path = out_dir / f"{safe_query}.json"
         else:
-            output_path = Path(output_path)
+            # v1.6.14 B-5: confine a caller/CLI-supplied output_path to
+            # output_dir. Previously any absolute or ``..`` path was written
+            # verbatim, so a path from the CLI / an MCP caller could clobber
+            # arbitrary files. Absolute paths must already resolve under
+            # output_dir; relative paths go through safe_join_path (which
+            # rejects ``..`` escapes). Either violation raises ValueError.
+            from .utils import _is_cross_platform_absolute, safe_join_path
+
+            raw = str(output_path)
+            if _is_cross_platform_absolute(raw):
+                resolved = Path(raw).resolve()
+                try:
+                    resolved.relative_to(out_dir)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"output_path must be inside output_dir ({out_dir}); got {resolved}"
+                    ) from exc
+                output_path = resolved
+            else:
+                try:
+                    output_path = safe_join_path(out_dir, raw)
+                except ValueError as exc:
+                    raise ValueError(f"output_path escapes output_dir ({out_dir}): {exc}") from exc
 
         output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         logger.info("Results saved to {path}", path=output_path)

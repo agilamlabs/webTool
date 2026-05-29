@@ -40,12 +40,20 @@ def _extract_json_ld(html: str) -> list[dict[str, Any]]:
     """
     if not html:
         return []
+    # v1.6.14 E-3: cap total JSON-LD blocks so a hostile page can't force
+    # unbounded growth of ``structured_data`` -- a single ``@graph`` with
+    # 100k entries, or thousands of ld+json scripts, would otherwise be
+    # accumulated wholesale into the result (and serialized downstream).
+    # 500 is far above any legitimate page's structured-data count.
+    max_blocks = 500
     blocks: list[dict[str, Any]] = []
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:  # pragma: no cover -- defensive
         return []
     for script in soup.find_all("script", type="application/ld+json"):
+        if len(blocks) >= max_blocks:
+            break
         # ``script.string`` is None when the tag has children (e.g.
         # CDATA-wrapped); fall back to ``get_text()``.
         text = script.string if script.string else script.get_text()
@@ -53,25 +61,33 @@ def _extract_json_ld(html: str) -> list[dict[str, Any]]:
             continue
         try:
             data = json.loads(text)
-        except (json.JSONDecodeError, ValueError, RecursionError):
+        except (json.JSONDecodeError, ValueError, RecursionError, MemoryError):
             # Many sites have malformed JSON-LD. Swallow and continue.
             # ``RecursionError`` covers an adversarial DoS: an attacker
             # could embed deeply-nested JSON (>1000 levels) to crash the
-            # default CPython parser. ``RecursionError`` derives from
-            # ``RuntimeError``, NOT ``ValueError`` / ``JSONDecodeError``,
-            # so it must be caught explicitly here.
+            # default CPython parser. ``MemoryError`` (v1.6.14 E-3) covers a
+            # huge flat blob. Neither derives from ``ValueError`` /
+            # ``JSONDecodeError``, so they must be caught explicitly here.
             continue
         # JSON-LD allows either a single object or an array at the
         # top level. Handle both.
         candidates: list[Any] = data if isinstance(data, list) else [data]
         for item in candidates:
+            if len(blocks) >= max_blocks:
+                break
             if not isinstance(item, dict):
                 continue
             # Unwrap ``@graph`` containers -- the graph wrapper is
             # rarely what callers want; they want the contained items.
             graph = item.get("@graph")
             if isinstance(graph, list):
-                blocks.extend(g for g in graph if isinstance(g, dict))
+                # v1.6.14 E-3: bounded so a single giant @graph can't blow
+                # past the cap in one extend().
+                for g in graph:
+                    if len(blocks) >= max_blocks:
+                        break
+                    if isinstance(g, dict):
+                        blocks.append(g)
             else:
                 blocks.append(item)
     return blocks
@@ -331,12 +347,22 @@ class ContentExtractor:
                     title = val.strip()
                     break
 
-        # Pretty-print as the content payload. Truncate is implicitly
-        # handled by the body_size cap at capture time.
+        # Pretty-print as the content payload.
         try:
             pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
         except (TypeError, ValueError):
             pretty = best_evt.body_text  # fall back to raw
+
+        # v1.6.14 E-6: cap the emitted content. The capture-time body cap
+        # bounds ``best_evt.body_text``, NOT this re-serialized ``pretty``
+        # output: indent=2 re-formatting can inflate a compact JSON body
+        # several-fold (a 256 KiB compact blob with many short keys can
+        # balloon past 1 MB), so the prior "truncation is implicit" claim
+        # was wrong. Hard-cap here so content_length stays honest and a
+        # hostile API body can't blow up downstream token budgets.
+        max_api_content = 512 * 1024
+        if pretty and len(pretty) > max_api_content:
+            pretty = pretty[:max_api_content]
 
         return ExtractionResult(
             url=url,
