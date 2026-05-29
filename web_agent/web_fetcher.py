@@ -40,6 +40,7 @@ from .utils import (
     async_retry,
     check_domain_allowed,
     get_random_user_agent,
+    is_private_address,
     parse_retry_after,
     safe_page_content,
 )
@@ -250,6 +251,41 @@ def _url_ext_classification(url: str) -> str:
     return "unknown"
 
 
+async def _response_peer_is_private(response: Any) -> bool:
+    """Return True if a Playwright Response's actual peer IP is private.
+
+    v1.6.14 C-1(b): closes post-connect DNS rebinding for the navigation
+    path. ``check_domain_allowed`` validates the host against *cached*
+    DNS, but Chromium re-resolves at connect time -- so a host that
+    resolved public at check time can rebind to an internal address
+    (169.254.169.254, RFC1918, loopback) before the actual TCP connect.
+    Playwright exposes the real peer via ``Response.server_addr()`` (a
+    dict-like with ``ipAddress`` / ``port``, or ``None``); we re-run the
+    private-IP check on that concrete address.
+
+    Returns False (cannot prove private) when ``response`` is None, when
+    ``server_addr`` is unavailable/None, or when no ``ipAddress`` is
+    present -- the caller still has the host-level gate as the first line.
+    """
+    if response is None:
+        return False
+    try:
+        server_addr = await response.server_addr()
+    except Exception:  # pragma: no cover -- defensive (older Playwright)
+        return False
+    if not server_addr:
+        return False
+    # server_addr is a TypedDict-like mapping: {"ipAddress": str, "port": int}.
+    ip_address = ""
+    try:
+        ip_address = (server_addr.get("ipAddress") or "").strip()
+    except AttributeError:  # pragma: no cover -- unexpected shape
+        return False
+    if not ip_address:
+        return False
+    return is_private_address(ip_address)
+
+
 class WebFetcher:
     """Fetches web pages using Playwright with retry, safety, and debug support.
 
@@ -433,9 +469,19 @@ class WebFetcher:
         # disallow to win. Compliance > a few extra robots fetches per
         # cached URL (those are themselves cached by RobotsChecker).
         # Cache lookup runs before the rate limiter so a cache hit
-        # doesn't burn a per-host token. Key is just the URL.
+        # doesn't burn a per-host token.
+        #
+        # v1.6.14 C-3: fold session identity into the cache key. The
+        # pre-v1.6.14 key was ``f"fetch:{url}"`` with no session/cookie
+        # identity, so authenticated HTML fetched inside session A could
+        # be served to a request running under session B (cross-session
+        # data leak). Namespacing by ``session_id`` isolates persistent
+        # sessions from each other; the ephemeral (no ``session_id``)
+        # path keeps a single shared ``'ephemeral'`` namespace, preserving
+        # its prior cross-call sharing behaviour exactly.
+        cache_key = f"fetch:{session_id or 'ephemeral'}:{url}"
         if self._cache is not None:
-            cached = await self._cache.get(f"fetch:{url}")
+            cached = await self._cache.get(cache_key)
             if cached is not None:
                 logger.debug("Cache hit: {url}", url=url)
                 cached["correlation_id"] = cid
@@ -453,8 +499,9 @@ class WebFetcher:
             result.correlation_id = cid
             # Cache successful fetches only -- caching errors / blocks
             # would lock in transient failures across the TTL window.
+            # Key matches the lookup above (session-namespaced, C-3).
             if self._cache is not None and result.status == FetchStatus.SUCCESS:
-                await self._cache.set(f"fetch:{url}", result.model_dump(mode="json"))
+                await self._cache.set(cache_key, result.model_dump(mode="json"))
             return result
         except NonRetryableHTTPError as e:
             return FetchResult(
@@ -599,12 +646,41 @@ class WebFetcher:
             # Re-validate the URL after Playwright follows any redirects
             # (defense-in-depth SSRF protection: a whitelisted host could
             # redirect to a private IP / denied domain).
+            #
+            # v1.6.14 C-7: also validate the server-side final URL
+            # (``response.url``), not just ``page.url``. A meta-refresh or
+            # ``Location:`` redirect to an internal host is reflected in
+            # the navigation Response's URL even when ``page.url`` lags or
+            # is rewritten client-side, so checking both closes that gap.
             final_url = page.url
-            if final_url != url and not check_domain_allowed(final_url, self._config.safety):
+            response_url = response.url if response is not None else None
+            for candidate in (final_url, response_url):
+                if (
+                    candidate
+                    and candidate != url
+                    and not check_domain_allowed(candidate, self._config.safety)
+                ):
+                    from .exceptions import NavigationError
+
+                    raise NavigationError(
+                        f"Page redirected to disallowed URL: {candidate}",
+                        url=candidate,
+                        status_code=status_code,
+                    )
+
+            # v1.6.14 C-1(b): re-check the ACTUAL connected peer IP. The
+            # host-level gate above uses cached DNS; Chromium re-resolves
+            # at connect time, so a rebind to an internal address would
+            # otherwise slip through. ``response.server_addr()`` reports
+            # the real peer; block it when private-IP protection is on.
+            if getattr(self._config.safety, "block_private_ips", False) and (
+                await _response_peer_is_private(response)
+            ):
                 from .exceptions import NavigationError
 
                 raise NavigationError(
-                    f"Page redirected to disallowed URL: {final_url}",
+                    f"Navigation connected to a private/loopback/link-local "
+                    f"peer for {url} (post-connect DNS-rebinding guard)",
                     url=final_url,
                     status_code=status_code,
                 )
@@ -993,9 +1069,19 @@ class WebFetcher:
         timer = Timer()
         try:
             with timer:
+                # v1.6.14 C-6: derive the binary-fetch timeout from
+                # navigation_timeout (ms -> s) but BOUND it. navigation_timeout
+                # is a page-load knob; reusing it unbounded means a large value
+                # (e.g. 300000ms) becomes a 300s httpx timeout, compounding
+                # across retries into minutes of blocking. Cap at 120s -- a
+                # generous per-operation (connect/read) bound for a streamed
+                # binary, safe against a runaway config value.
+                binary_timeout_s = min(
+                    max(self._config.browser.navigation_timeout / 1000.0, 1.0), 120.0
+                )
                 async with httpx.AsyncClient(
                     follow_redirects=True,
-                    timeout=self._config.browser.navigation_timeout / 1000,
+                    timeout=binary_timeout_s,
                     headers={"User-Agent": get_random_user_agent()},
                     cookies=cookie_jar,
                 ) as client:

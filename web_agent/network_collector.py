@@ -60,11 +60,17 @@ class NetworkCollector:
         # repeated attach() calls (from e.g. TabManager and SessionManager
         # racing the same initial page) would register duplicate listeners.
         self._attached: WeakSet[Any] = WeakSet()
-        # request.url -> monotonic start time for timing_ms calculation.
-        # WeakKeyDictionary outer + plain dict inner because Request objects
-        # are cheap and short-lived; we wipe inner dict on Page close via
-        # the WeakKeyDictionary parent.
-        self._req_start: WeakKeyDictionary[Any, dict[str, float]] = WeakKeyDictionary()
+        # Request object -> monotonic start time for timing_ms calculation.
+        # v1.6.14 A-5: keyed by the Request OBJECT, not req.url. Keying by
+        # URL meant two concurrent requests to the same URL clobbered each
+        # other's start time (and the response pop matched the wrong one),
+        # corrupting timing_ms and silently dropping a response's timing.
+        # The same Request wrapper is delivered to _on_request and as
+        # resp.request / the failed request, so object identity matches
+        # reliably. WeakKeyDictionary outer wipes the inner dict on Page
+        # close; the inner dict holds short-lived strong refs to Requests
+        # only between their request and response/failure events.
+        self._req_start: WeakKeyDictionary[Any, dict[Any, float]] = WeakKeyDictionary()
         # v1.6.8 (review C-2 fix): strong references for fire-and-forget
         # tmpfile-cleanup tasks. asyncio.create_task returns a Task whose
         # only reference here would be the inner local in _on_download --
@@ -197,7 +203,7 @@ class NetworkCollector:
             rtype = req.resource_type
             if self._diag.network_resource_types and rtype not in self._diag.network_resource_types:
                 return
-            self._req_start.setdefault(page, {})[req.url] = time.monotonic()
+            self._req_start.setdefault(page, {})[req] = time.monotonic()
             headers = dict(req.headers) if self._diag.include_request_headers else {}
             evt = NetworkEvent(
                 event_type="request",
@@ -219,7 +225,7 @@ class NetworkCollector:
             rtype = req.resource_type
             if self._diag.network_resource_types and rtype not in self._diag.network_resource_types:
                 return
-            start = self._req_start.get(page, {}).pop(req.url, None)
+            start = self._req_start.get(page, {}).pop(req, None)
             timing_ms = (time.monotonic() - start) * 1000.0 if start else 0.0
             headers: dict[str, str] = {}
             ctype: str | None = None
@@ -303,7 +309,7 @@ class NetworkCollector:
                     failure = f.get("errorText", "") if isinstance(f, dict) else str(f)
             except Exception:
                 pass
-            self._req_start.get(page, {}).pop(req.url, None)
+            self._req_start.get(page, {}).pop(req, None)
             evt = NetworkEvent(
                 event_type="requestfailed",
                 url=req.url,

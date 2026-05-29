@@ -38,7 +38,13 @@ from .models import DownloadResult, FetchStatus
 from .rate_limiter import RateLimiter
 from .robots import RobotsChecker
 from .session_manager import SessionManager
-from .utils import check_domain_allowed, get_random_user_agent, safe_join_path, safe_page_content
+from .utils import (
+    check_domain_allowed,
+    get_random_user_agent,
+    is_private_address,
+    safe_join_path,
+    safe_page_content,
+)
 from .web_fetcher import _OFFICE_AND_ARCHIVE_EXTENSIONS
 
 # Extensions that are web pages (should be saved via page.content(), not expect_download)
@@ -89,6 +95,30 @@ def _is_web_page_url(url: str) -> bool:
         return True
     # No extension at all usually means a web page
     return not ext
+
+
+def _httpx_peer_ip(response: httpx.Response) -> str:
+    """Best-effort actual peer IP of an httpx streaming response.
+
+    Reads httpcore's ``network_stream`` extension (httpx >= 0.20 /
+    httpcore >= 1.0) and its ``server_addr`` extra-info -- the concrete
+    socket peer the request actually connected to. Returns ``""`` when the
+    peer can't be determined (a transport without the extension, or a mock
+    transport in tests); the caller then relies on the host-level SSRF
+    gate. Logs at debug when unavailable so a skipped guard stays
+    observable rather than failing open invisibly.
+    """
+    try:
+        stream = response.extensions.get("network_stream")
+        if stream is None:
+            logger.debug("httpx peer-IP unavailable: no network_stream extension")
+            return ""
+        server_addr = stream.get_extra_info("server_addr")
+        if not server_addr:
+            return ""
+        return str(server_addr[0])
+    except Exception:  # pragma: no cover -- defensive
+        return ""
 
 
 class Downloader:
@@ -299,6 +329,21 @@ class Downloader:
         ) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 response.raise_for_status()
+                # v1.6.14 C-1(c): post-connect peer-IP re-check (DNS
+                # rebinding). check_domain_allowed validated the host against
+                # cached DNS, but httpx re-resolves at connect time, so a
+                # rebind to an internal address could slip through. Inspect
+                # the actual connected peer and refuse if it is
+                # private/loopback/link-local. Mirrors the Playwright
+                # ``server_addr`` guard (C-1b) in web_fetcher.
+                if getattr(safety, "block_private_ips", False):
+                    peer_ip = _httpx_peer_ip(response)
+                    if peer_ip and is_private_address(peer_ip):
+                        raise NavigationError(
+                            f"Download connected to a private/loopback/link-local "
+                            f"peer ({peer_ip}) for {url} (post-connect rebinding guard)",
+                            url=url,
+                        )
                 # Final check: even if redirects were allowed, verify the final
                 # resolved URL passes the gate (defense-in-depth).
                 final_url = str(response.url)
@@ -313,12 +358,16 @@ class Downloader:
                 try:
                     with open(filepath, "wb") as f:
                         async for chunk in response.aiter_bytes(chunk_size=8192):
-                            f.write(chunk)
-                            total += len(chunk)
-                            if total > max_bytes:
+                            # v1.6.14 C-9: enforce the cap BEFORE writing so the
+                            # on-disk file can never exceed max_bytes. The prior
+                            # order wrote first, allowing a one-chunk overspill
+                            # past the limit before the guard fired.
+                            if total + len(chunk) > max_bytes:
                                 raise ValueError(
                                     f"File exceeds {self._config.download.max_file_size_mb}MB limit"
                                 )
+                            f.write(chunk)
+                            total += len(chunk)
                 except BaseException:
                     # Clean up partial file before re-raising (Phase D1)
                     if filepath.exists():

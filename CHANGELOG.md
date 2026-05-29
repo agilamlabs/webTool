@@ -2,6 +2,115 @@
 
 ## [1.6.14] - 2026-05-28
 
+### Review-hardening follow-up (2026-05-29)
+
+A second, deeper full-codebase brutal review (7 parallel
+`feature-dev:code-reviewer` agents over all 35 modules) surfaced **44
+findings** beyond the original 8 Criticals: 1 Critical, 10 High, 21
+Medium, 12 Low. All are addressed here and **folded into v1.6.14** (no
+version bump). Implementation used 5 parallel `general-purpose` agents on
+disjoint file clusters; results were reviewed, two over-reaching fixes were
+reverted (see "Reconciled"), and the slice was verified — **761 unit tests
+pass**, +26 new in `tests/test_v1614_review_hardening.py`, ruff + mypy
+strict clean, zero new regressions (the 6 remaining failures are
+pre-existing Windows persistent-profile/browser flakes, confirmed on clean
+`main`).
+
+**Security / SSRF**
+- **C-1 (Critical): DNS-rebinding defence.** `utils._resolve_host_addresses`
+  replaced its unbounded process-lifetime `lru_cache` with a 30s TTL cache
+  (bounds the rebinding window). Added post-connect peer-IP re-checks: the
+  Playwright path validates `response.server_addr()`, the httpx download path
+  validates the connected peer via httpcore's `network_stream` extension. A
+  host that resolved public at check-time but rebinds to an internal IP at
+  connect-time is now rejected. (`utils.py`, `web_fetcher.py`, `downloader.py`)
+- **C-7:** redirect re-validation also checks the navigation `response.url`
+  (server-side final URL), not only `page.url`. (`web_fetcher.py`)
+- **C-8:** obfuscated IPv4 literals (octal `0177.0.0.1`, decimal
+  `2130706433`, hex `0x7f.0.0.1`) are normalised via `inet_aton` before the
+  private-IP check. (`utils.py`)
+- **C-5:** the robots.txt fetch no longer follows redirects (a cross-host
+  3xx was an internal-probe lever). (`robots.py`)
+- **C-3:** the fetch cache key is namespaced by `session_id` so authenticated
+  HTML can't leak across sessions; the search cache key folds in
+  `safe_search`. (`web_fetcher.py`, `search_engine.py`)
+- **A-1:** the JS-eval gate is now self-enforced inside the `_do_evaluate`
+  and `_do_wait(target=FUNCTION)` handlers, so the public `execute_action` /
+  `execute_single_on_session` entry points can't bypass
+  `allow_js_evaluation=False`. (`browser_actions.py`)
+- **D-1:** `safe_mode` now also resets `allow_upload_outside_download_dir`
+  (previously left enabled despite the "force all allow_* to False"
+  contract). (`config.py`)
+- **E-5:** the debug-artifact path sanitises the (LLM-influenceable)
+  `correlation_id` before using it as a path component, closing an
+  arbitrary-write via `correlation_scope(cid="../..")`. (`debug.py`)
+- **F-6:** an absolute `workspace_dir` is rejected at consumption (it bypassed
+  `safe_join_path`). (`workspace.py`)
+- **B-5:** `save_results(output_path)` is confined to `output_dir`. (`agent.py`)
+- **B-2 / F-5:** the `replay_trace` containment check moved inside the audit
+  scope (rejected LFI attempts are now logged) and the resolved path is
+  passed to `load_entries`. (`agent.py`)
+- **B-8:** `fill`/`type` values are redacted in the serialized trace.
+  (`trace_recorder.py`)
+
+**DoS / resource**
+- **C-9:** the download size cap is checked *before* writing each chunk (no
+  one-chunk overspill). **C-6:** the binary-fetch timeout derived from
+  `navigation_timeout` is now bounded (≤120s). (`downloader.py`, `web_fetcher.py`)
+- **C-10:** per-host robots locks (a slow robots.txt no longer serialises
+  every host). (`robots.py`)
+- **E-3:** JSON-LD `@graph` accumulation capped (500) + `MemoryError` caught;
+  **E-6:** API-body content hard-capped at 512 KiB. (`content_extractor.py`)
+- **F-4:** MCP `max_results` / `max_pages` clamped to sane ceilings. (`mcp_server.py`)
+- **D-6 / D-7:** budget knobs gain `ge`/`gt` guards; negative
+  `rate_limit_per_host_rps` rejected (0 still disables). (`config.py`)
+- **E-1:** `parse_retry_after` no longer raises `OverflowError` on a
+  >308-digit header. **E-2:** `async_retry` validates that
+  `non_retryable_exceptions` are Exception subclasses. (`utils.py`)
+- **A-6:** infinite-scroll `evaluate` calls are bounded by `asyncio.wait_for`.
+  (`browser_actions.py`)
+
+**Correctness / lifecycle**
+- **A-2:** the dialog listener is removed for ALL pages in `finally` (was
+  leaking handlers on persistent tabs). **A-4:** response-body capture drains
+  pending tasks before snapshot/close. **A-5:** the network-timing map is
+  keyed by Request object, not URL (parallel same-URL requests no longer
+  clobber each other). **A-3:** the upload result surfaces basenames, not
+  absolute paths. (`browser_actions.py`, `network_collector.py`)
+- **F-3:** session close retains a context whose `close()` raised and retries
+  it on shutdown. **B-1:** `trace_dir` resolved once at construction.
+  **B-6:** trace writes moved off the event loop via `asyncio.to_thread`.
+  **F-2 / F-7:** tab-manager invariant documented; `list()` skips closed tabs.
+  (`session_manager.py`, `trace_recorder.py`, `tab_manager.py`)
+- **E-4:** `web_research` re-raises `asyncio.CancelledError` instead of
+  swallowing it as a fetch error. (`recipes.py`)
+
+**Config / API ergonomics**
+- **D-2:** `LocatorSpec.is_empty()` now considers `role_name`.
+- **D-8:** `retry_policy` is a `Literal["fast","balanced","paranoid"]`; **D-5**
+  invalid values raise `ConfigError`.
+- **D-3:** `launch_owned_cdp_browser` documented as a reserved no-op.
+- **D-9:** the skill-exception hierarchy moved to `web_agent.exceptions`
+  (re-exported from `domain_skills` for back-compat). **D-10:** `safe_search`
+  default documented.
+- **B-4:** the interaction-action models (`ClickInput`, `FillInput`,
+  `ScrollInput`, `SelectInput`, `KeyboardInput`, `WaitInput`, `DialogInput`,
+  `DialogResponse`, `MouseButton`, …) are now importable from the package root
+  and listed in `__all__`. (`__init__.py`)
+
+**Reconciled (reverted after review revealed they broke intended behaviour)**
+- **C-2 (SearXNG base_url):** the initial fix blocked a private/loopback
+  SearXNG `base_url`, breaking the recommended *self-hosted* deployment
+  (localhost). `base_url` is trusted operator config, so the hard block + the
+  config-time validator were reverted. Instead, SearXNG **result** URLs that
+  point at literal private/loopback/link-local IPs are dropped (a malicious
+  instance can't lure a fetch of an internal host), and result hostnames stay
+  gated downstream by `check_domain_allowed`. (`search_providers.py`, `config.py`)
+- **D-4 (`wss://` CDP):** the initial fix rejected `wss://` remote-CDP URLs on
+  an unverified "no TLS" claim; the existing suite intentionally accepts
+  `wss://` loopback and Playwright's `connect_over_cdp` documents no such
+  restriction, so this was reverted to accept `ws://` + `wss://`. (`config.py`)
+
 ### Hardening — 8 Critical fixes from the full-codebase audit
 
 A full-codebase brutal review (4 parallel `feature-dev:code-reviewer`

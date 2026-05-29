@@ -68,7 +68,7 @@ import frontmatter
 from loguru import logger
 
 from .config import AppConfig
-from .exceptions import WebAgentError
+from .exceptions import SkillError, SkillInputError, SkillNotFoundError, SkillNotRunnableError
 from .models import (
     DomainSkill,
     SkillApplicationResult,
@@ -86,22 +86,12 @@ if TYPE_CHECKING:
 # ----------------------------------------------------------------------
 # Exceptions
 # ----------------------------------------------------------------------
-
-
-class SkillError(WebAgentError):
-    """Base class for skill-related failures."""
-
-
-class SkillNotFoundError(SkillError):
-    """No skill registered for the requested (domain, name) tuple."""
-
-
-class SkillNotRunnableError(SkillError):
-    """Skill exists but is informational-only (no Python runner)."""
-
-
-class SkillInputError(SkillError):
-    """Caller-supplied inputs failed validation against the skill schema."""
+#
+# v1.6.14 (review D-9): the skill exception hierarchy now lives in the
+# central :mod:`web_agent.exceptions` module alongside every other
+# public exception. They are re-exported here (and via ``__all__``) so
+# existing ``from web_agent.domain_skills import SkillNotRunnableError``
+# imports keep working unchanged.
 
 
 # ----------------------------------------------------------------------

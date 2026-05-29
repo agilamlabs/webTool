@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import ipaddress
 import random
 import re
@@ -73,15 +72,50 @@ def async_retry(
 ) -> Callable:
     """Decorator that retries an async function with exponential backoff + jitter.
 
+    The base delay grows exponentially per attempt
+    (``min(base_delay * 2 ** (attempt - 1), max_delay)``). The actual sleep
+    is that base delay scaled by a **multiplicative** jitter factor drawn
+    uniformly from ``[0.5, 1.0]`` -- i.e. each retry waits between 50% and
+    100% of the computed backoff, never more. This is "equal jitter"-style
+    smoothing of the backoff, NOT AWS-style full jitter (which would draw
+    from ``[0, delay]``); the floor of ``0.5 * delay`` guarantees a
+    non-trivial minimum wait between attempts.
+
+    Args:
+        max_retries: Total attempts (must be ``>= 1``). The first attempt
+            is not a "retry"; there are ``max_retries - 1`` retries after it.
+        base_delay: Base backoff in seconds for the first retry.
+        max_delay: Upper bound (seconds) on the pre-jitter backoff.
+        non_retryable_exceptions: Exception types that are re-raised
+            immediately without retrying. Must contain only
+            :class:`Exception` subclasses (validated at decoration time) so
+            a stray :class:`BaseException` (e.g. ``KeyboardInterrupt``)
+            can't be silently swallowed by the retry loop.
+
     Raises:
         ValueError: If ``max_retries < 1``. Without at least one attempt
             the decorator's loop body never runs and the trailing
             ``raise last_exception`` would raise a bogus
             ``TypeError("exceptions must derive from BaseException")``
             because ``last_exception`` would be None.
+        TypeError: If ``non_retryable_exceptions`` contains an entry that
+            is not an :class:`Exception` subclass.
     """
     if max_retries < 1:
         raise ValueError(f"max_retries must be >= 1, got {max_retries}")
+    # Guard against ``BaseException`` (KeyboardInterrupt, SystemExit, ...)
+    # sneaking into the non-retryable tuple: the ``except`` clause below
+    # would then catch and re-raise them as "non-retryable", but more
+    # importantly a caller passing e.g. ``BaseException`` would widen the
+    # catch far beyond intent. Reject anything that is not an Exception
+    # subclass at decoration time so the error surfaces at import, not at
+    # the first interrupt.
+    for _exc_type in non_retryable_exceptions:
+        if not (isinstance(_exc_type, type) and issubclass(_exc_type, Exception)):
+            raise TypeError(
+                "non_retryable_exceptions must contain only Exception subclasses, "
+                f"got {_exc_type!r}"
+            )
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
@@ -191,9 +225,14 @@ def parse_retry_after(header_value: str | None) -> float | None:
         return None
     val = header_value.strip()
     # Try integer seconds first (most common server form).
+    # ``int(val)`` accepts arbitrarily long digit strings; ``float()`` on
+    # an int wider than ~308 decimal digits raises OverflowError. The
+    # contract promises this function never raises, so catch it here and
+    # fall through to the HTTP-date branch (which will also fail and
+    # return None for a giant integer literal).
     try:
         return max(0.0, float(int(val)))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         pass
     # Fall back to HTTP-date. ``parsedate_to_datetime`` raises on
     # malformed input (typeshed types it as returning a ``datetime``,
@@ -483,16 +522,35 @@ def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified)
 
 
-@functools.lru_cache(maxsize=2048)
+# v1.6.14 C-1: DNS resolution cache with a short TTL instead of an
+# unbounded process-lifetime ``lru_cache``. The prior cache never expired,
+# so a host that resolved public at check time could later rebind to an
+# internal address (DNS rebinding) and the cached "public" answer would
+# keep the SSRF gate open indefinitely. A ~30s TTL bounds that window to a
+# single short interval while still amortising resolution cost across the
+# burst of URL checks a single agent call performs. This is a *mitigation*,
+# not a full close: the authoritative defenses are the post-connect peer-IP
+# re-checks in web_fetcher / downloader (C-1b / C-1c).
+_DNS_CACHE_TTL_SECONDS: float = 30.0
+_DNS_CACHE_MAXSIZE: int = 2048
+# host -> (expiry_monotonic, resolved_addrs). Keyed by raw host string.
+_dns_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
+
+
 def _resolve_host_addresses(host: str) -> tuple[str, ...]:
-    """Resolve ``host`` to all addresses, cached for the process lifetime.
+    """Resolve ``host`` to all addresses, cached for a short TTL (~30s).
 
     Cached because ``check_domain_allowed`` calls :func:`is_private_address`
     for every URL when ``block_private_ips=True`` (default), and DNS
-    resolution is otherwise the dominant per-request cost. DNS rarely
-    changes within a single agent's lifetime, and even when it does the
-    LRU eviction (2048-entry cap) bounds staleness for long-running
-    processes.
+    resolution is otherwise the dominant per-request cost.
+
+    v1.6.14 C-1: the cache now expires entries after
+    :data:`_DNS_CACHE_TTL_SECONDS` (vs the prior never-expiring
+    ``lru_cache``). A stale "public" answer can no longer keep the
+    SSRF gate open across a DNS-rebinding attack for the whole process
+    lifetime -- the window is bounded to one TTL. The cache is still
+    size-bounded (oldest-expiry entries evicted past
+    :data:`_DNS_CACHE_MAXSIZE`).
 
     Returns an empty tuple on resolution failure -- callers treat that as
     "unknown / cannot prove private" and fall through.
@@ -501,14 +559,41 @@ def _resolve_host_addresses(host: str) -> tuple[str, ...]:
     (:func:`check_domain_allowed`); a future async refactor would
     propagate :class:`asyncio` through every URL gate. See the v1.7
     roadmap for that work.
+
+    The function exposes a ``cache_clear()`` attribute (mirroring the
+    old ``lru_cache`` API) for tests and long-running callers that want
+    to force re-resolution.
     """
+    now = time.monotonic()
+    cached = _dns_cache.get(host)
+    if cached is not None and cached[0] > now:
+        return cached[1]
+
     try:
         # info[4] is the sockaddr tuple; index 0 is the IP literal
         # (str for both IPv4 and IPv6). Stubs type it as Any, so we
         # narrow with str() to keep mypy strict-mode happy.
-        return tuple(str(info[4][0]) for info in socket.getaddrinfo(host, None))
+        addrs = tuple(str(info[4][0]) for info in socket.getaddrinfo(host, None))
     except (socket.gaierror, OSError):
-        return ()
+        addrs = ()
+
+    # Bound the cache: when full, drop the entry that expires soonest
+    # (closest to the present) so live entries survive a flood of misses.
+    if host not in _dns_cache and len(_dns_cache) >= _DNS_CACHE_MAXSIZE:
+        oldest = min(_dns_cache, key=lambda h: _dns_cache[h][0])
+        _dns_cache.pop(oldest, None)
+    _dns_cache[host] = (now + _DNS_CACHE_TTL_SECONDS, addrs)
+    return addrs
+
+
+def _resolve_host_addresses_cache_clear() -> None:
+    """Clear the DNS resolution cache (mirrors ``lru_cache.cache_clear``)."""
+    _dns_cache.clear()
+
+
+# Preserve the ``lru_cache``-compatible ``.cache_clear()`` entry point so
+# existing callers/tests keep working after the TTL-cache migration.
+_resolve_host_addresses.cache_clear = _resolve_host_addresses_cache_clear  # type: ignore[attr-defined]
 
 
 def is_private_address(host: str) -> bool:
@@ -537,6 +622,18 @@ def is_private_address(host: str) -> bool:
     except ValueError:
         # Not a literal IP -- try cached DNS resolution
         pass
+
+    # v1.6.14 C-8: catch obfuscated IPv4 literals that ``ip_address``
+    # rejects but the C resolver / browsers happily interpret as real
+    # (often internal) addresses -- octal ``0177.0.0.1``, decimal
+    # ``2130706433``, hex ``0x7f.0.0.1``. ``inet_aton`` mirrors that libc
+    # parsing, so normalise through it before falling back to DNS. It
+    # raises OSError for genuine hostnames (e.g. ``example.com``), so this
+    # branch only ever fires for numeric forms.
+    with contextlib.suppress(OSError, ValueError):
+        normalized = socket.inet_ntoa(socket.inet_aton(host))
+        if _is_private_ip(ipaddress.ip_address(normalized)):
+            return True
 
     for addr_str in _resolve_host_addresses(host):
         try:

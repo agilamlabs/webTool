@@ -72,6 +72,12 @@ class SessionManager:
         # initial pages, popups, and new_tab() all auto-attach.
         self._network_collector = network_collector
         self._lock = asyncio.Lock()
+        # v1.6.14 F-3: contexts whose close() raised. They've already been
+        # dropped from the public registries (so callers can't reuse them)
+        # but we retain the reference here so close_all() can retry on
+        # shutdown. Without this a failed ctx.close() leaks the Chromium
+        # context for the lifetime of the process.
+        self._pending_close: set[BrowserContext] = set()
 
     async def create(self, name: Optional[str] = None) -> str:
         """Create a new persistent session and return its ``session_id``.
@@ -149,7 +155,18 @@ class SessionManager:
         try:
             await ctx.close()
         except Exception as exc:
-            logger.warning("Error closing session {sid}: {e}", sid=session_id, e=exc)
+            # v1.6.14 F-3: the session is already gone from the registries
+            # above, so a raising close() would otherwise leak the context
+            # forever. Retain the reference in _pending_close so close_all()
+            # retries it on shutdown. Log loudly -- this is a resource leak
+            # until teardown.
+            logger.warning(
+                "Error closing session {sid}; retaining context for shutdown sweep: {e}",
+                sid=session_id,
+                e=exc,
+            )
+            self._pending_close.add(ctx)
+            return
 
         logger.info("Session closed: {sid}", sid=session_id)
 
@@ -169,6 +186,10 @@ class SessionManager:
 
         KeyError (session was already closed manually) is logged at DEBUG
         rather than WARNING so normal teardown stays quiet.
+
+        v1.6.14 F-3: after closing live sessions, sweep any contexts whose
+        earlier close() raised (retained in ``_pending_close``) and retry
+        closing them so they don't leak past shutdown.
         """
         async with self._lock:
             sids = list(self._sessions.keys())
@@ -180,6 +201,17 @@ class SessionManager:
                 logger.debug("Session {sid} already closed", sid=sid)
             except Exception as exc:
                 logger.warning("Error closing session {sid}: {e}", sid=sid, e=exc)
+
+        # v1.6.14 F-3: retry contexts whose close() previously failed.
+        # Snapshot under the lock, then drain outside it (close() awaits).
+        async with self._lock:
+            pending = list(self._pending_close)
+            self._pending_close.clear()
+        for ctx in pending:
+            try:
+                await ctx.close()
+            except Exception as exc:
+                logger.warning("Error closing retained context on shutdown: {e}", e=exc)
 
     def get(self, session_id: str) -> BrowserContext:
         """Return the live BrowserContext for ``session_id``.

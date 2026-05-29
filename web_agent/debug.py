@@ -12,6 +12,7 @@ the failure.
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,7 +44,18 @@ class DebugCapture:
 
     def _next_artifact_path(self, label: str, suffix: str) -> Path:
         """Build a unique path under ``debug_dir/{cid}/{timestamp}-{label}.{suffix}``."""
-        cid = get_correlation_id() or "no-cid"
+        raw_cid = get_correlation_id() or "no-cid"
+        # v1.6.14 E-5: the correlation id can be attacker-controlled via the
+        # public ``correlation_scope(cid=...)`` API (e.g. fed from an inbound
+        # X-Correlation-ID header) and is used here as a path component.
+        # Without sanitisation a cid like ``../../etc`` would redirect
+        # artifact writes outside debug_dir. Replace anything outside a safe
+        # charset with ``_`` (slashes/backslashes can no longer traverse);
+        # the only traversal forms left use the allowed ``.`` char, so reject
+        # bare ``.`` / ``..`` explicitly.
+        cid = re.sub(r"[^A-Za-z0-9._-]", "_", raw_cid)
+        if cid in {".", ".."} or not cid:
+            cid = "no-cid"
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
         out_dir = Path(self._config.debug.debug_dir) / cid
         out_dir.mkdir(parents=True, exist_ok=True)

@@ -52,7 +52,13 @@ class RobotsChecker:
         self._timeout = timeout_seconds
         # host -> (fetched_at, parser_or_None)
         self._cache: dict[str, tuple[float, RobotFileParser | None]] = {}
-        self._lock = asyncio.Lock()
+        # v1.6.14 C-10: per-host locks instead of one global lock. A
+        # single shared lock serialised the robots.txt fetch for EVERY
+        # host -- a slow robots.txt on host A blocked checks for unrelated
+        # hosts B, C, ... Per-host locks preserve the "fetch each host's
+        # robots.txt at most once" guarantee while letting different hosts
+        # proceed concurrently. Locks are created lazily on first use.
+        self._locks: dict[str, asyncio.Lock] = {}
 
     @property
     def user_agent(self) -> str:
@@ -75,7 +81,13 @@ class RobotsChecker:
             return True
 
         scheme = parsed.scheme or "https"
-        async with self._lock:
+        # v1.6.14 C-10: lock per-host so a slow robots.txt fetch on one
+        # host doesn't serialise checks for every other host. ``setdefault``
+        # is safe without an outer lock because lock creation is sync
+        # (no ``await`` between the get-or-create), so two coroutines for
+        # the same host still converge on the same Lock object.
+        lock = self._locks.setdefault(host, asyncio.Lock())
+        async with lock:
             cached_at, rp = self._cache.get(host, (0.0, None))
             if (time.monotonic() - cached_at) > self._ttl:
                 rp = await self._fetch_and_parse(scheme, host)
@@ -94,7 +106,12 @@ class RobotsChecker:
         """
         url = f"{scheme}://{host}/robots.txt"
         try:
-            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=True) as client:
+            # v1.6.14 C-5: do NOT follow redirects when fetching robots.txt.
+            # robots.txt is a fixed well-known path; a cross-host 3xx is a
+            # SSRF lever (a redirect to an internal host would otherwise be
+            # fetched). Any non-200 -- including a 3xx -- is treated as "no
+            # robots / allow-all" per the existing semantics below.
+            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=False) as client:
                 resp = await client.get(url, headers={"User-Agent": self._user_agent})
             if resp.status_code != 200:
                 logger.debug(

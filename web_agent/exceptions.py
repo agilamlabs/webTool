@@ -97,3 +97,19 @@ class SafeModeBlockedError(WebAgentError):
     def __init__(self, message: str, operation: str = "") -> None:
         self.operation = operation
         super().__init__(message)
+
+
+class SkillError(WebAgentError):
+    """Base class for domain-skill failures."""
+
+
+class SkillNotFoundError(SkillError):
+    """No skill registered for the requested (domain, name) tuple."""
+
+
+class SkillNotRunnableError(SkillError):
+    """Skill exists but is informational-only (no Python runner)."""
+
+
+class SkillInputError(SkillError):
+    """Caller-supplied inputs failed validation against the skill schema."""

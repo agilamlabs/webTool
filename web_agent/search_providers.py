@@ -21,6 +21,7 @@ Default chain (configurable via :class:`SearchConfig.providers`):
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from abc import ABC, abstractmethod
 from typing import ClassVar
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
@@ -99,6 +100,15 @@ class SearXNGProvider(SearchProvider):
             return SearchResponse(query=query)
 
         host = urlparse(self._base_url).hostname or ""
+
+        # NOTE (v1.6.14 review): ``searxng_base_url`` is operator-supplied,
+        # trusted configuration -- self-hosting SearXNG on loopback/RFC1918
+        # (e.g. http://localhost:8888) is the recommended deployment, so we
+        # deliberately do NOT block a private base_url here. The genuine SSRF
+        # surface is the RESULT urls below (which a malicious/compromised
+        # SearXNG could point at internal hosts); those are filtered for
+        # literal private IPs in the parse loop and re-validated by the
+        # downstream fetch gate (check_domain_allowed) before any fetch.
         if self._rate_limiter is not None and host:
             await self._rate_limiter.acquire(host)
 
@@ -116,6 +126,20 @@ class SearXNGProvider(SearchProvider):
         for idx, item in enumerate(data.get("results", [])[:max_results]):
             url = item.get("url", "")
             if not url or not url.startswith(("http://", "https://")):
+                continue
+            # v1.6.14 C-2: drop result URLs whose host is a LITERAL private/
+            # loopback/link-local IP. A compromised or malicious SearXNG
+            # instance could return internal-pointing results to lure the
+            # agent into fetching them; a literal internal IP is never a
+            # legitimate public search hit. Hostname results that resolve
+            # internally are still caught by the downstream fetch gate, so
+            # this check is literal-only (no DNS in the search hot path).
+            result_host = urlparse(url).hostname or ""
+            try:
+                _ip = ipaddress.ip_address(result_host)
+            except ValueError:
+                _ip = None
+            if _ip is not None and (_ip.is_private or _ip.is_loopback or _ip.is_link_local):
                 continue
             items.append(
                 SearchResultItem(

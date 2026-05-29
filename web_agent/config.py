@@ -314,9 +314,13 @@ class BrowserConfig(BaseSettings):
     launch_owned_cdp_browser: bool = Field(
         default=True,
         description=(
-            "When ``cdp_enabled=True``, controls whether webTool launches "
-            "its own browser. Always True today -- attaching to existing "
-            "browsers is explicitly disallowed (see ``attach_existing_browser``)."
+            "DEPRECATED / RESERVED (v1.6.14, review D-3): currently a no-op. "
+            "This field is never read by the launch path -- webTool ALWAYS "
+            "launches its own browser when ``cdp_enabled=True`` and never "
+            "attaches to an existing one (see ``attach_existing_browser``, "
+            "which is hard-rejected). Setting it to False does NOT change "
+            "behaviour. Retained as a forward-compat placeholder; do not "
+            "rely on it to gate launching."
         ),
     )
     attach_existing_browser: bool = Field(
@@ -486,7 +490,17 @@ class SearchConfig(BaseSettings):
     search_url: str = "https://www.google.com/search"
     language: str = "en"
     region: str = "us"
-    safe_search: bool = False
+    safe_search: bool = Field(
+        default=False,
+        description=(
+            "Whether to request the provider's family-safe / explicit-content "
+            "filter. Default **False** so research and OSINT workflows are not "
+            "silently scrubbed of legitimate results (adult-adjacent news, "
+            "security/malware analysis, medical topics). Set True to enable "
+            "the provider's safe-search filter (SearXNG ``safesearch=1``, "
+            "Google ``safe=active``) when results are surfaced to end users."
+        ),
+    )
 
     # Multi-provider chain (NEW in 1.4.0)
     providers: list[str] = Field(
@@ -534,7 +548,11 @@ class FetchConfig(BaseSettings):
     )
     wait_for_selector: Optional[str] = None
     extra_wait_ms: int = 0
-    retry_policy: str = "balanced"  # fast | balanced | paranoid
+    # v1.6.14 (review D-8): constrained to the named profiles so an invalid
+    # value is rejected by pydantic at field assignment (in addition to the
+    # defensive ConfigError wrap in ``_apply_retry_policy`` -- review D-5).
+    # Values mirror :class:`web_agent.utils.RetryPolicy`.
+    retry_policy: Literal["fast", "balanced", "paranoid"] = "balanced"
     max_retries: int = 3
     retry_base_delay: float = 1.0
     retry_max_delay: float = 30.0
@@ -554,9 +572,22 @@ class FetchConfig(BaseSettings):
 
         if not user_set_numeric and self.retry_policy != "balanced":
             # Lazy import to avoid circular dep
+            from .exceptions import ConfigError
             from .utils import get_retry_policy
 
-            kwargs = get_retry_policy(self.retry_policy)
+            try:
+                kwargs = get_retry_policy(self.retry_policy)
+            except ValueError as exc:
+                # v1.6.14 (review D-5): surface a typed ConfigError (matching
+                # the other config validators) instead of the bare ValueError
+                # ``get_retry_policy`` raises. The Literal field (D-8) should
+                # already block unknown values, so this is defense-in-depth
+                # against a future widening of the field.
+                raise ConfigError(
+                    f"FetchConfig.retry_policy={self.retry_policy!r} is not a "
+                    "valid retry policy. Choose from: 'fast', 'balanced', "
+                    "'paranoid'."
+                ) from exc
             self.max_retries = int(kwargs["max_retries"])
             self.retry_base_delay = float(kwargs["base_delay"])
             self.retry_max_delay = float(kwargs["max_delay"])
@@ -714,16 +745,25 @@ class SafetyConfig(BaseSettings):
             "to skip the probe and rely solely on URL extension."
         ),
     )
-    max_pages_per_call: int = 50
-    max_chars_per_call: int = 1_000_000
-    max_time_per_call_seconds: float = 300.0
+    # v1.6.14 (review D-6): budget knobs gate per-call cost. A negative (or
+    # zero) value would make the very first page/char/second trip the budget
+    # and raise BudgetExceededError immediately -- a self-inflicted DoS and a
+    # prompt-injection foot-gun. Require >= 1 so the smallest valid budget is
+    # "one unit".
+    max_pages_per_call: int = Field(default=50, ge=1)
+    max_chars_per_call: int = Field(default=1_000_000, ge=1)
+    max_time_per_call_seconds: float = Field(default=300.0, gt=0)
 
     # --- Politeness layer (rate limit + robots.txt) ---
     rate_limit_per_host_rps: float = Field(
         default=2.0,
+        ge=0,
         description=(
-            "Per-host rate cap in requests/second. Set to 0 to disable. "
-            "Applies to fetch, download, and search operations."
+            "Per-host rate cap in requests/second. ``0`` disables rate "
+            "limiting entirely (the documented sentinel). Negative values "
+            "are rejected (v1.6.14, review D-7) -- previously a negative rps "
+            "silently disabled limiting instead of erroring. Applies to "
+            "fetch, download, and search operations."
         ),
     )
     respect_robots_txt: bool = Field(
@@ -744,12 +784,23 @@ class SafetyConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_safe_mode(self) -> SafetyConfig:
-        """When safe_mode is True, force all allow_* flags to False."""
+        """When safe_mode is True, force all allow_* flags to False.
+
+        ``block_private_ips`` is intentionally NOT touched: it is a
+        hardening flag (True = protection on), so safe_mode must never
+        flip it off. Likewise ``probe_binary_urls`` is a behavioural
+        knob, not a capability escape-hatch.
+        """
         if self.safe_mode:
             self.allow_js_evaluation = False
             self.allow_downloads = False
             self.allow_form_submit = False
             self.allow_coordinate_clicks = False
+            # v1.6.14 (review D-1): the previous kill-switch missed this
+            # escape-hatch, so safe_mode left arbitrary-path uploads
+            # enabled despite the "force all allow_* flags to False"
+            # contract. Reset it too.
+            self.allow_upload_outside_download_dir = False
             # v1.6.10: also pin the unknown-policy. Defensive only --
             # allow_coordinate_clicks=False already blocks click_xy --
             # but a caller mutating allow_coordinate_clicks back to True
