@@ -1529,3 +1529,402 @@ class TestEC1HostnameConfinement:
         assert "https://ec.europa.eu/info/real" in urls
         assert "https://ec.europa.eu.evil.com/fake" not in urls
         assert out["count"] == "1"
+
+
+# ===========================================================================
+# Recipes egress + concurrency cluster (REC-1, REC-2)
+# ===========================================================================
+#
+# Finding -> test map:
+#   REC-1 : fill_form_and_extract repeats the WebFetcher.fetch SSRF re-checks
+#           after its raw page.goto -- a post-navigation redirect to a denied
+#           host OR a DNS-rebind to a private peer is blocked (returns
+#           extraction_method="none"), and never reaches the form-fill /
+#           extract steps. The legitimate (public, no-redirect) path still
+#           extracts content.
+#   REC-2 : web_research bounds its fetch_smart fan-out with the SAME
+#           per-session semaphore fetch_many uses
+#           (BrowserConfig.max_pages_per_session_fetch), so at most N
+#           navigations run concurrently on one session/context -- while all
+#           pages still complete and a single failure does not abort the run.
+
+
+def _form_recipes(
+    *,
+    page: Any,
+    config: AppConfig,
+    sessions: Any = None,
+) -> Any:
+    """Build a Recipes whose BrowserManager.new_page() yields ``page``.
+
+    Mirrors ``tests/test_v1614_pipeline.py::_make_recipes_with_mock_page`` --
+    a real ContentExtractor so the happy path traverses the actual
+    extraction chain; search/fetcher/downloader are stubbed since
+    fill_form_and_extract drives the page directly on the path under test.
+    """
+    from web_agent.content_extractor import ContentExtractor
+    from web_agent.recipes import Recipes
+
+    class _NewPageCM:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> Any:
+            return page
+
+        async def __aexit__(self, *a: Any) -> None:
+            return None
+
+    bm = MagicMock()
+    bm.new_page = MagicMock(side_effect=lambda *a, **k: _NewPageCM())
+
+    return Recipes(
+        search=MagicMock(),
+        fetcher=MagicMock(),
+        extractor=ContentExtractor(config),
+        downloader=MagicMock(),
+        config=config,
+        browser_manager=bm,
+        sessions=sessions,
+    )
+
+
+def _form_page(*, final_url: str, response_url: str, peer_ip: str | None = None) -> Any:
+    """A fake Playwright Page for fill_form_and_extract's _drive().
+
+    ``goto`` returns a Response whose ``.url`` is ``response_url`` and whose
+    ``server_addr()`` reports ``peer_ip`` (mirrors the real C-1(b) rebind
+    signal). ``page.url`` is a property (as on real Playwright pages).
+    """
+    response = MagicMock()
+    response.url = response_url
+    response.status = 200
+    if peer_ip is not None:
+        response.server_addr = AsyncMock(return_value={"ipAddress": peer_ip, "port": 443})
+    else:
+        response.server_addr = AsyncMock(return_value=None)
+
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=response)
+    page.wait_for_load_state = AsyncMock()
+    type(page).url = property(lambda _self: final_url)
+    return page
+
+
+# ---------------------------------------------------------------------------
+# REC-1: fill_form_and_extract repeats the post-goto SSRF re-checks
+# ---------------------------------------------------------------------------
+class TestREC1FillFormSSRFRecheck:
+    @pytest.mark.asyncio
+    async def test_redirect_to_denied_host_blocked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Entry URL passes the up-front gate, but the navigation lands on a
+        denied host (3xx / meta-refresh) -> extraction_method='none', and the
+        form-fill / extract steps are never reached."""
+        from web_agent import recipes as recipes_module
+        from web_agent.models import FormFilterSpec
+
+        entry = "https://good.example/form"
+        denied = "http://169.254.169.254/latest/meta-data"
+
+        # Up-front gate (recipes.py:823) allows the entry URL; the post-goto
+        # candidate (the redirect target) is denied.
+        def _gate(url: str, *a: Any, **k: Any) -> bool:
+            return "169.254" not in url
+
+        monkeypatch.setattr(recipes_module, "check_domain_allowed", _gate)
+
+        # safe_page_content / extractor must NEVER run on the blocked path.
+        def _boom_capture(*a: Any, **k: Any):
+            raise AssertionError("safe_page_content reached despite redirect block")
+
+        monkeypatch.setattr(recipes_module, "safe_page_content", _boom_capture)
+
+        page = _form_page(final_url=denied, response_url=denied, peer_ip="93.184.216.34")
+        recipes = _form_recipes(page=page, config=AppConfig(safety=SafetyConfig()))
+
+        result = await recipes.fill_form_and_extract(entry, FormFilterSpec())
+        assert result.extraction_method == "none"
+        assert result.url == entry
+
+    @pytest.mark.asyncio
+    async def test_private_peer_ip_blocked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Host gate passes (public final URL) but the actual connected peer
+        rebinds to a private/IMDS address -> blocked via the same
+        _response_peer_is_private helper WebFetcher.fetch uses."""
+        from web_agent import recipes as recipes_module
+        from web_agent.models import FormFilterSpec
+
+        entry = "https://good.example/form"
+
+        # Every URL passes the host gate; the block must come purely from the
+        # post-connect peer-IP check (real _response_peer_is_private helper).
+        monkeypatch.setattr(recipes_module, "check_domain_allowed", lambda *a, **k: True)
+
+        def _boom_capture(*a: Any, **k: Any):
+            raise AssertionError("safe_page_content reached despite private-peer block")
+
+        monkeypatch.setattr(recipes_module, "safe_page_content", _boom_capture)
+
+        # final_url == entry so the redirect loop is a no-op; only the peer IP
+        # (169.254.169.254 = AWS IMDS) trips the guard.
+        page = _form_page(final_url=entry, response_url=entry, peer_ip="169.254.169.254")
+        recipes = _form_recipes(
+            page=page, config=AppConfig(safety=SafetyConfig(block_private_ips=True))
+        )
+
+        result = await recipes.fill_form_and_extract(entry, FormFilterSpec())
+        assert result.extraction_method == "none"
+        assert result.url == entry
+
+    @pytest.mark.asyncio
+    async def test_block_private_ips_off_skips_peer_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Operator opt-out: with block_private_ips=False the peer-IP guard is
+        not consulted (mirrors WebFetcher.fetch), so a private peer on an
+        allow-listed, non-redirecting host still extracts."""
+        from web_agent import recipes as recipes_module
+        from web_agent.models import FormFilterSpec
+
+        entry = "https://good.example/results"
+        monkeypatch.setattr(recipes_module, "check_domain_allowed", lambda *a, **k: True)
+
+        real_html = (
+            "<html><head><title>Results</title></head><body><main>"
+            "<p>Post-submit content with sufficient length so the extraction "
+            "chain (trafilatura / bs4 / raw) returns a real method rather than "
+            "bailing on min_content_length. Several sentences ensure a "
+            "meaningful body is captured for the citation.</p>"
+            "<p>Second paragraph adds further body text for the extractor.</p>"
+            "</main></body></html>"
+        )
+
+        async def _capture(_page: Any, **_k: Any):
+            return (real_html, "content")
+
+        monkeypatch.setattr(recipes_module, "safe_page_content", _capture)
+
+        page = _form_page(final_url=entry, response_url=entry, peer_ip="169.254.169.254")
+        recipes = _form_recipes(
+            page=page, config=AppConfig(safety=SafetyConfig(block_private_ips=False))
+        )
+
+        result = await recipes.fill_form_and_extract(entry, FormFilterSpec())
+        # Not the SSRF short-circuit: a real extractor method + content.
+        assert result.extraction_method != "none"
+        assert result.content_length > 0
+
+    @pytest.mark.asyncio
+    async def test_public_no_redirect_extracts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression: a public host with no redirect and a public peer IP
+        extracts content normally (the REC-1 guard does not over-block)."""
+        from web_agent import recipes as recipes_module
+        from web_agent.models import FormFilterSpec
+
+        entry = "https://good.example/results"
+        monkeypatch.setattr(recipes_module, "check_domain_allowed", lambda *a, **k: True)
+
+        real_html = (
+            "<html><head><title>Results</title></head><body><main>"
+            "<p>This is the real post-submit content with enough text for the "
+            "extraction chain to succeed. We add multiple sentences so "
+            "trafilatura / bs4 / raw can pull a meaningful body out of the "
+            "markup instead of failing on the minimum content length.</p>"
+            "<p>Second paragraph contributes additional body text.</p>"
+            "</main></body></html>"
+        )
+
+        async def _capture(_page: Any, **_k: Any):
+            return (real_html, "content")
+
+        monkeypatch.setattr(recipes_module, "safe_page_content", _capture)
+
+        page = _form_page(final_url=entry, response_url=entry, peer_ip="93.184.216.34")
+        recipes = _form_recipes(
+            page=page, config=AppConfig(safety=SafetyConfig(block_private_ips=True))
+        )
+
+        result = await recipes.fill_form_and_extract(entry, FormFilterSpec())
+        assert result.extraction_method != "none"
+        assert result.content_length > 0
+
+
+# ---------------------------------------------------------------------------
+# REC-2: web_research bounds the fetch_smart fan-out by the session semaphore
+# ---------------------------------------------------------------------------
+class TestREC2WebResearchBoundedConcurrency:
+    @staticmethod
+    def _search_engine(urls: list[str]) -> Any:
+        """A fake SearchEngine.search returning the given URLs as results."""
+        from web_agent.models import SearchResponse, SearchResultItem
+
+        async def _search(query: str, max_results: int = 10, **_k: Any) -> SearchResponse:
+            items = [
+                SearchResultItem(position=i + 1, title=f"r{i}", url=u, provider="searxng")
+                for i, u in enumerate(urls)
+            ]
+            return SearchResponse(query=query, total_results=len(items), results=items)
+
+        eng = MagicMock()
+        eng.search = _search
+        return eng
+
+    @staticmethod
+    def _extractor() -> Any:
+        """A fake ContentExtractor.extract returning non-empty HTML content."""
+        from web_agent.models import ExtractionResult
+
+        def _extract(fr: Any) -> ExtractionResult:
+            return ExtractionResult(
+                url=fr.url,
+                title="t",
+                content="body text",
+                extraction_method="raw",
+                content_length=9,
+            )
+
+        ex = MagicMock()
+        ex.extract = MagicMock(side_effect=_extract)
+        return ex
+
+    def _recipes(self, urls: list[str], bound: int) -> Any:
+        from web_agent.config import BrowserConfig
+        from web_agent.recipes import Recipes
+
+        cfg = AppConfig(browser=BrowserConfig(max_pages_per_session_fetch=bound))
+        return Recipes(
+            search=self._search_engine(urls),
+            fetcher=MagicMock(),
+            extractor=self._extractor(),
+            downloader=MagicMock(),
+            config=cfg,
+            browser_manager=MagicMock(),
+            sessions=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_path_never_exceeds_bound(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An instrumented fetch_smart tracks live concurrency; with a
+        session_id the peak must never exceed max_pages_per_session_fetch,
+        and every target page must still complete."""
+        import asyncio
+
+        from web_agent import recipes as recipes_module
+        from web_agent.models import FetchResult, FetchStatus
+
+        bound = 3
+        n_pages = 12
+        urls = [f"https://host{i}.example/page" for i in range(n_pages)]
+
+        # All URLs pass the host gate (so all reach the fan-out, none filtered).
+        monkeypatch.setattr(recipes_module, "check_domain_allowed", lambda *a, **k: True)
+
+        live = 0
+        peak = 0
+        completed: list[str] = []
+        lock = asyncio.Lock()
+
+        async def _fake_fetch_smart(url: str, *, session_id: Any = None, **_k: Any) -> FetchResult:
+            nonlocal live, peak
+            async with lock:
+                live += 1
+                peak = max(peak, live)
+            try:
+                # Yield enough times for other gated tasks to pile up if the
+                # semaphore were missing.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
+                return FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.SUCCESS,
+                    html="<html><body>ok</body></html>",
+                )
+            finally:
+                async with lock:
+                    live -= 1
+                    completed.append(url)
+
+        recipes = self._recipes(urls, bound=bound)
+        recipes._fetcher.fetch_smart = _fake_fetch_smart
+
+        result = await recipes.web_research("q", max_pages=n_pages, session_id="sid")
+
+        assert peak <= bound, f"fan-out concurrency {peak} exceeded bound {bound}"
+        assert peak > 1, "test did not actually exercise concurrency"
+        # Every page completed and produced a citation (none dropped).
+        assert sorted(completed) == sorted(urls)
+        assert len(result.citations) == n_pages
+        assert result.pages_visited == n_pages
+
+    @pytest.mark.asyncio
+    async def test_single_failure_does_not_abort_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """return_exceptions=True is preserved: one fetch_smart raising must
+        not abort the whole research run -- the other pages still produce
+        citations and the failure is surfaced as a diagnostic."""
+        import asyncio
+
+        from web_agent import recipes as recipes_module
+        from web_agent.models import FetchResult, FetchStatus
+
+        urls = [f"https://host{i}.example/page" for i in range(4)]
+        monkeypatch.setattr(recipes_module, "check_domain_allowed", lambda *a, **k: True)
+
+        async def _fake_fetch_smart(url: str, *, session_id: Any = None, **_k: Any) -> FetchResult:
+            await asyncio.sleep(0)
+            if url.endswith("host1.example/page"):
+                raise RuntimeError("transient boom")
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status=FetchStatus.SUCCESS,
+                html="<html><body>ok</body></html>",
+            )
+
+        recipes = self._recipes(urls, bound=2)
+        recipes._fetcher.fetch_smart = _fake_fetch_smart
+
+        result = await recipes.web_research("q", max_pages=4, session_id="sid")
+
+        # 3 of 4 succeeded; the run was NOT aborted by the single failure.
+        assert len(result.citations) == 3
+        urls_seen = {c.url for c in result.citations}
+        assert "https://host1.example/page" not in urls_seen
+        # The failure is surfaced (a diagnostic / warning, not a crash).
+        assert any("host1.example" in w for w in result.warnings)
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_path_unbounded_gather_still_completes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No session_id -> the ephemeral path (bounded by max_contexts in
+        BrowserManager) is left as-is; all pages still complete. Confirms the
+        REC-2 gate only wraps the session path, matching fetch_many."""
+        import asyncio
+
+        from web_agent import recipes as recipes_module
+        from web_agent.models import FetchResult, FetchStatus
+
+        urls = [f"https://host{i}.example/page" for i in range(6)]
+        monkeypatch.setattr(recipes_module, "check_domain_allowed", lambda *a, **k: True)
+
+        seen_session_ids: list[Any] = []
+
+        async def _fake_fetch_smart(url: str, *, session_id: Any = None, **_k: Any) -> FetchResult:
+            seen_session_ids.append(session_id)
+            await asyncio.sleep(0)
+            return FetchResult(
+                url=url,
+                final_url=url,
+                status=FetchStatus.SUCCESS,
+                html="<html><body>ok</body></html>",
+            )
+
+        recipes = self._recipes(urls, bound=2)
+        recipes._fetcher.fetch_smart = _fake_fetch_smart
+
+        result = await recipes.web_research("q", max_pages=6, session_id=None)
+
+        assert len(result.citations) == 6
+        assert all(sid is None for sid in seen_session_ids)
