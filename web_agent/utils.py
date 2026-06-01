@@ -23,6 +23,7 @@ from . import correlation as _correlation  # noqa: F401
 from .models import HtmlCaptureSource
 
 if TYPE_CHECKING:
+    import httpx
     from playwright.async_api import Page
 
     from .config import SafetyConfig
@@ -494,6 +495,25 @@ def _normalize_host(url: str) -> str:
         return ""
 
 
+def _host_is_encodable(host: str) -> bool:
+    """Return True if ``host`` can be encoded for name resolution.
+
+    v1.6.16 UT-1: ``socket.getaddrinfo`` idna-encodes the host and raises
+    ``UnicodeError`` for hosts containing surrogate or over-long-label
+    characters. Such a host can never resolve to a real address, so it
+    cannot be validated as public/private. This mirrors what the resolver
+    will attempt (an ascii/idna encode) and returns False when it fails,
+    letting :func:`check_domain_allowed` fail closed on un-encodable hosts.
+    """
+    if not host:
+        return False
+    try:
+        host.encode("idna")
+        return True
+    except (UnicodeError, ValueError):
+        return False
+
+
 def _matches_domain(host: str, pattern: str) -> bool:
     """Return True if ``host`` equals ``pattern`` or is a subdomain of it.
 
@@ -574,7 +594,16 @@ def _resolve_host_addresses(host: str) -> tuple[str, ...]:
         # (str for both IPv4 and IPv6). Stubs type it as Any, so we
         # narrow with str() to keep mypy strict-mode happy.
         addrs = tuple(str(info[4][0]) for info in socket.getaddrinfo(host, None))
-    except (socket.gaierror, OSError):
+    except (socket.gaierror, OSError, UnicodeError):
+        # v1.6.16 UT-1: ``getaddrinfo`` idna-encodes the host and raises
+        # ``UnicodeError`` (a ``ValueError`` subclass, NOT an ``OSError``)
+        # for hosts with surrogate / over-long-label characters (e.g.
+        # ``'\udce9xample.com'`` or a 300-char label). Without catching it,
+        # the exception escapes ``is_private_address`` -> ``check_domain_allowed``
+        # and crashes the SSRF gate instead of failing closed. Treating an
+        # un-encodable host as "unresolvable" (empty tuple) keeps the gate
+        # fail-closed: an unresolvable host can't be proven public, and the
+        # caller's host-level gate then blocks it cleanly.
         addrs = ()
 
     # Bound the cache: when full, drop the entry that expires soonest
@@ -644,6 +673,35 @@ def is_private_address(host: str) -> bool:
     return False
 
 
+def httpx_peer_ip(response: httpx.Response) -> str:
+    """Best-effort actual peer IP of an httpx streaming response.
+
+    Reads httpcore's ``network_stream`` extension (httpx >= 0.20 /
+    httpcore >= 1.0) and its ``server_addr`` extra-info -- the concrete
+    socket peer the request actually connected to. Returns ``""`` when the
+    peer can't be determined (a transport without the extension, or a mock
+    transport in tests); the caller then relies on the host-level SSRF
+    gate. Logs at debug when unavailable so a skipped guard stays
+    observable rather than failing open invisibly.
+
+    v1.6.16 FB-1/FC-1: shared between the downloader (``_download_httpx``)
+    and the fetcher (``fetch_binary`` / ``classify_url``) so every httpx
+    egress path performs the SAME post-connect DNS-rebinding peer-IP
+    re-check and the helper can't drift between call sites.
+    """
+    try:
+        stream = response.extensions.get("network_stream")
+        if stream is None:
+            logger.debug("httpx peer-IP unavailable: no network_stream extension")
+            return ""
+        server_addr = stream.get_extra_info("server_addr")
+        if not server_addr:
+            return ""
+        return str(server_addr[0])
+    except Exception:  # pragma: no cover -- defensive
+        return ""
+
+
 def check_domain_allowed(url: str, safety: SafetyConfig, *, strict: bool = False) -> bool:
     """Return True if ``url``'s host is permitted by safety allow/deny lists.
 
@@ -682,8 +740,18 @@ def check_domain_allowed(url: str, safety: SafetyConfig, *, strict: bool = False
 
     # Private-IP / SSRF protection (when enabled in config).
     block_private = getattr(safety, "block_private_ips", False)
-    if block_private and is_private_address(host):
-        return _reject(f"private/loopback/link-local IP: {host}")
+    if block_private:
+        # v1.6.16 UT-1: a host with surrogate / over-long-label characters
+        # cannot be idna-encoded, so it cannot be resolved or validated.
+        # ``is_private_address`` now fails closed to "unresolvable" for such
+        # a host (returns False), which would otherwise let it slip past the
+        # private-IP gate. When SSRF protection is on, treat an un-encodable
+        # host as un-validatable and reject it (fail-closed) rather than
+        # allowing an address we cannot prove is public.
+        if not _host_is_encodable(host):
+            return _reject(f"host is not idna-encodable: {host!r}")
+        if is_private_address(host):
+            return _reject(f"private/loopback/link-local IP: {host}")
 
     for pattern in safety.denied_domains:
         if _matches_domain(host, pattern):

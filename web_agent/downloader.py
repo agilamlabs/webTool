@@ -41,6 +41,7 @@ from .session_manager import SessionManager
 from .utils import (
     check_domain_allowed,
     get_random_user_agent,
+    httpx_peer_ip,
     is_private_address,
     safe_join_path,
     safe_page_content,
@@ -95,30 +96,6 @@ def _is_web_page_url(url: str) -> bool:
         return True
     # No extension at all usually means a web page
     return not ext
-
-
-def _httpx_peer_ip(response: httpx.Response) -> str:
-    """Best-effort actual peer IP of an httpx streaming response.
-
-    Reads httpcore's ``network_stream`` extension (httpx >= 0.20 /
-    httpcore >= 1.0) and its ``server_addr`` extra-info -- the concrete
-    socket peer the request actually connected to. Returns ``""`` when the
-    peer can't be determined (a transport without the extension, or a mock
-    transport in tests); the caller then relies on the host-level SSRF
-    gate. Logs at debug when unavailable so a skipped guard stays
-    observable rather than failing open invisibly.
-    """
-    try:
-        stream = response.extensions.get("network_stream")
-        if stream is None:
-            logger.debug("httpx peer-IP unavailable: no network_stream extension")
-            return ""
-        server_addr = stream.get_extra_info("server_addr")
-        if not server_addr:
-            return ""
-        return str(server_addr[0])
-    except Exception:  # pragma: no cover -- defensive
-        return ""
 
 
 class Downloader:
@@ -179,6 +156,8 @@ class Downloader:
         Returns:
             DownloadResult with file path, size, and status.
         """
+        from .exceptions import DomainNotAllowedError, NavigationError
+
         cid = get_correlation_id()
 
         # Domain allow/deny gate
@@ -203,21 +182,6 @@ class Downloader:
                 error_message=(
                     "File downloads blocked: safety.allow_downloads=False "
                     "(set allow_downloads=True or disable safe_mode to opt in)"
-                ),
-                correlation_id=cid,
-            )
-
-        # Validate extension if a non-empty allowlist is configured
-        ext = _get_url_extension(url)
-        allowed_exts = self._config.download.allowed_extensions
-        if ext and allowed_exts and ext not in allowed_exts:
-            return DownloadResult(
-                url=url,
-                filepath="",
-                filename="",
-                status=FetchStatus.BLOCKED,
-                error_message=(
-                    f"Extension {ext} not in allowed_extensions. Allowed: {sorted(allowed_exts)}"
                 ),
                 correlation_id=cid,
             )
@@ -260,11 +224,64 @@ class Downloader:
                 correlation_id=cid,
             )
 
+        # v1.6.16 DL-2: validate the extension of the ACTUAL saved filename,
+        # not the URL's. The prior check inspected ``_get_url_extension(url)``
+        # and only fired ``if ext`` -- so an extensionless URL
+        # (``https://host/download``, common for content-disposition
+        # downloads) skipped the allowlist entirely, and ``download(
+        # url='x/a.pdf', filename='payload.exe')`` passed on ``.pdf`` while
+        # writing ``payload.exe``. We now check ``filepath.suffix`` (the
+        # resolved on-disk name). When the allowlist is non-empty, an empty
+        # or disallowed final extension is BLOCKED rather than silently
+        # allowed -- closing the extensionless-bypass hole.
+        allowed_exts = self._config.download.allowed_extensions
+        if allowed_exts:
+            saved_ext = filepath.suffix.lower()
+            if saved_ext not in allowed_exts:
+                detail = (
+                    f"Extension {saved_ext!r}" if saved_ext else "Missing/extensionless filename"
+                )
+                return DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename=filepath.name,
+                    status=FetchStatus.BLOCKED,
+                    error_message=(
+                        f"{detail} not in allowed_extensions. Allowed: {sorted(allowed_exts)}"
+                    ),
+                    correlation_id=cid,
+                )
+
         # Strategy 1: Try httpx streaming (fastest)
         try:
             result = await self._download_httpx(url, filepath)
             result.correlation_id = cid
             return result
+        except (NavigationError, DomainNotAllowedError) as e:
+            # v1.6.16 DL-1: a security block raised inside _download_httpx --
+            # a redirect to a denied/private host, a post-connect private
+            # peer IP (DNS-rebinding guard, C-1c), or a denied final URL --
+            # is a HARD stop, NOT a transport failure. The prior code let
+            # the broad ``except Exception`` below swallow it and fall
+            # through to the Playwright strategies, which would re-navigate
+            # to the SAME hostile target and actually connect before their
+            # own post-hoc gate fired (fail-open). Return BLOCKED here so
+            # the block short-circuits and no other strategy re-attempts it.
+            logger.warning(
+                "httpx download blocked by safety policy for {url}: {e}",
+                url=url,
+                e=e,
+            )
+            if self._debug.enabled:
+                self._debug.capture_no_page(e, "httpx_download", context={"url": url})
+            return DownloadResult(
+                url=url,
+                filepath="",
+                filename=filepath.name,
+                status=FetchStatus.BLOCKED,
+                error_message=str(e),
+                correlation_id=cid,
+            )
         except httpx.HTTPStatusError as e:
             logger.info(
                 "httpx got HTTP {code} for {url}, trying Playwright browser",
@@ -337,7 +354,7 @@ class Downloader:
                 # private/loopback/link-local. Mirrors the Playwright
                 # ``server_addr`` guard (C-1b) in web_fetcher.
                 if getattr(safety, "block_private_ips", False):
-                    peer_ip = _httpx_peer_ip(response)
+                    peer_ip = httpx_peer_ip(response)
                     if peer_ip and is_private_address(peer_ip):
                         raise NavigationError(
                             f"Download connected to a private/loopback/link-local "
@@ -477,6 +494,45 @@ class Downloader:
                         ),
                         content_type=content_type,
                     )
+
+        # v1.6.16 DL-3: bound memory BEFORE materializing the full DOM into
+        # the Python process. ``safe_page_content`` calls ``page.content()``
+        # which returns the entire document as one Python string -- a server
+        # that omits Content-Length (trivial) and returns a multi-GB body
+        # would otherwise force the whole document into the Python heap
+        # before the post-capture byte check at the bottom could fire.
+        # Probe just the rendered length (an int crosses the bridge, not the
+        # body) and abort early when it already exceeds the cap. Each JS
+        # string unit is >= 1 UTF-8 byte, so ``length > max_bytes`` is a safe
+        # lower-bound gate against the pathological case; the precise
+        # post-capture byte check below still guards the boundary exactly.
+        # Best-effort: a probe failure (navigation race, non-DOM page) falls
+        # through to capture, where the existing byte check still applies.
+        try:
+            probed_len = await page.evaluate(
+                "() => (document && document.documentElement "
+                "&& document.documentElement.outerHTML.length) || 0"
+            )
+            if isinstance(probed_len, (int, float)) and probed_len > max_bytes:
+                return DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename=filepath.name,
+                    status=FetchStatus.HTTP_ERROR,
+                    error_message=(
+                        f"Rendered page ~{int(probed_len)} chars exceeds "
+                        f"{self._config.download.max_file_size_mb} MB cap "
+                        f"(aborted before materializing the DOM)"
+                    ),
+                    content_type=content_type,
+                )
+        except Exception as exc:  # pragma: no cover -- defensive
+            logger.debug(
+                "save_page: DOM size probe failed for {url}: {e}; "
+                "falling through to bounded capture",
+                url=url,
+                e=exc,
+            )
 
         # v1.6.13: 3-tier capture so a mid-navigation race doesn't crash
         # the page-save path. ``html_source`` is logged when degraded so

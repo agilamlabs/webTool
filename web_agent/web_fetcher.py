@@ -40,6 +40,7 @@ from .utils import (
     async_retry,
     check_domain_allowed,
     get_random_user_agent,
+    httpx_peer_ip,
     is_private_address,
     parse_retry_after,
     safe_page_content,
@@ -488,10 +489,16 @@ class WebFetcher:
                 cached["from_cache"] = True
                 return FetchResult(**cached)
 
-        # Politeness layer: per-host rate limit (may sleep)
-        if self._rate_limiter is not None:
-            await self._rate_limiter.acquire(urlparse(url).hostname or "")
-
+        # Politeness layer: per-host rate limit (may sleep).
+        #
+        # v1.6.16 FE-1: the acquire moved INTO the retry loop
+        # (``_do_fetch`` -> ``_fetch_with_retry``) so it is re-acquired on
+        # every attempt. Previously it ran once here, before the retry
+        # loop, so a 429's ``notify_429`` extension of ``_next_allowed`` was
+        # ignored by in-loop retries (they waited only async_retry's jitter,
+        # not Retry-After). Re-acquiring per attempt honours the extended
+        # deadline. The cache lookup above still short-circuits before
+        # ``_do_fetch``, so a cache hit never burns a per-host token.
         timer = Timer()
         try:
             with timer:
@@ -572,6 +579,14 @@ class WebFetcher:
             non_retryable_exceptions=(NonRetryableHTTPError, _DownloadStartedError),
         )
         async def _fetch_with_retry() -> FetchResult:
+            # v1.6.16 FE-1: acquire the per-host token on EVERY attempt so a
+            # 429's ``notify_429`` extension of ``_next_allowed`` (set inside
+            # ``_navigate_and_extract`` via ``_signal_429``) is honoured by
+            # the next retry. ``acquire`` re-reads ``_next_allowed`` after
+            # each sleep, so the extended Retry-After deadline now actually
+            # delays the retry instead of being ignored.
+            if self._rate_limiter is not None:
+                await self._rate_limiter.acquire(urlparse(url).hostname or "")
             page: Page
             if session_id and self._sessions is not None:
                 ctx = self._sessions.get(session_id)
@@ -912,6 +927,26 @@ class WebFetcher:
         # disallowed host that would never have passed the entry gate;
         # treating that as 'unknown' avoids using the probe to leak that
         # the redirect target exists, and keeps SSRF mitigations honest.
+        #
+        # v1.6.16 FC-1: also validate EACH redirect hop's Location and the
+        # actual connected peer IP, mirroring ``fetch_binary`` /
+        # ``downloader._download_httpx``. Checking only the final URL let a
+        # whitelisted host 302 through an internal hop, and a rebinding host
+        # connect to a private peer, before the benign final URL was seen.
+        from .exceptions import NavigationError
+
+        safety = self._config.safety
+
+        async def _check_redirect(response: httpx.Response) -> None:
+            if 300 <= response.status_code < 400:
+                next_url = response.headers.get("location", "")
+                if next_url and not check_domain_allowed(next_url, safety):
+                    raise NavigationError(
+                        f"HEAD probe redirect to disallowed URL blocked: {next_url}",
+                        url=next_url,
+                        status_code=response.status_code,
+                    )
+
         try:
             cookie_jar = await self._cookies_for_session(session_id, url)
             async with httpx.AsyncClient(
@@ -919,8 +954,20 @@ class WebFetcher:
                 timeout=10.0,
                 headers={"User-Agent": get_random_user_agent()},
                 cookies=cookie_jar,
+                event_hooks={"response": [_check_redirect]},
             ) as client:
                 resp = await client.head(url)
+                # v1.6.16 FC-1: post-connect peer-IP re-check (DNS rebinding).
+                if getattr(safety, "block_private_ips", False):
+                    peer_ip = httpx_peer_ip(resp)
+                    if peer_ip and is_private_address(peer_ip):
+                        logger.debug(
+                            "HEAD probe connected to private peer {ip} for {url}; "
+                            "treating as 'unknown'",
+                            ip=peer_ip,
+                            url=url,
+                        )
+                        return "unknown"
                 final_url = str(resp.url)
                 if final_url != url and not check_domain_allowed(final_url, self._config.safety):
                     logger.debug(
@@ -1063,8 +1110,28 @@ class WebFetcher:
         if self._rate_limiter is not None:
             await self._rate_limiter.acquire(urlparse(url).hostname or "")
 
+        from .exceptions import NavigationError
+
         max_bytes = max(1, self._config.download.max_file_size_mb) * 1024 * 1024
         cookie_jar = await self._cookies_for_session(session_id, url)
+        safety = self._config.safety
+
+        # v1.6.16 FB-1: per-redirect Location validation. ``fetch_binary``
+        # follows redirects, so a whitelisted host could 302 through an
+        # internal hop (169.254.169.254 / RFC1918 / loopback) before the
+        # benign final URL is reached. Re-validate EACH 3xx Location against
+        # the safety policy -- mirrors ``downloader._download_httpx``'s
+        # ``_check_redirect`` hook (C-1c). The raised ``NavigationError`` is
+        # caught below and surfaced as ``FetchStatus.BLOCKED``.
+        async def _check_redirect(response: httpx.Response) -> None:
+            if 300 <= response.status_code < 400:
+                next_url = response.headers.get("location", "")
+                if next_url and not check_domain_allowed(next_url, safety):
+                    raise NavigationError(
+                        f"Redirect to disallowed URL blocked: {next_url}",
+                        url=next_url,
+                        status_code=response.status_code,
+                    )
 
         timer = Timer()
         try:
@@ -1084,8 +1151,32 @@ class WebFetcher:
                     timeout=binary_timeout_s,
                     headers={"User-Agent": get_random_user_agent()},
                     cookies=cookie_jar,
+                    event_hooks={"response": [_check_redirect]},
                 ) as client:
                     async with client.stream("GET", url) as resp:
+                        # v1.6.16 FB-1: post-connect peer-IP re-check (DNS
+                        # rebinding). ``check_domain_allowed`` validated the
+                        # host against cached DNS, but httpx re-resolves at
+                        # connect time, so a rebind to an internal address
+                        # could otherwise slip through. Inspect the actual
+                        # connected peer and refuse if it is private. Mirrors
+                        # the Playwright ``server_addr`` guard (C-1b) in
+                        # ``fetch`` and the httpx guard (C-1c) in the downloader.
+                        if getattr(safety, "block_private_ips", False):
+                            peer_ip = httpx_peer_ip(resp)
+                            if peer_ip and is_private_address(peer_ip):
+                                return FetchResult(
+                                    url=url,
+                                    final_url=str(resp.url),
+                                    status=FetchStatus.BLOCKED,
+                                    error_message=(
+                                        f"Binary fetch connected to a private/loopback/"
+                                        f"link-local peer ({peer_ip}) for {url} "
+                                        f"(post-connect DNS-rebinding guard)"
+                                    ),
+                                    response_time_ms=timer.elapsed_ms,
+                                    correlation_id=cid,
+                                )
                         final_url = str(resp.url)
                         if final_url != url and not check_domain_allowed(
                             final_url, self._config.safety
@@ -1165,6 +1256,19 @@ class WebFetcher:
                             response_time_ms=timer.elapsed_ms,
                             correlation_id=cid,
                         )
+        except NavigationError as exc:
+            # v1.6.16 FB-1: a redirect to a disallowed/private host raised
+            # by the ``_check_redirect`` event hook above is a security stop,
+            # not a transport failure -- surface it as BLOCKED (matching the
+            # final-URL / peer-IP guards) rather than NETWORK_ERROR.
+            return FetchResult(
+                url=url,
+                final_url=getattr(exc, "url", "") or url,
+                status=FetchStatus.BLOCKED,
+                error_message=str(exc),
+                response_time_ms=timer.elapsed_ms,
+                correlation_id=cid,
+            )
         except httpx.TimeoutException:
             return FetchResult(
                 url=url,
