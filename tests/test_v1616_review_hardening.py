@@ -1928,3 +1928,506 @@ class TestREC2WebResearchBoundedConcurrency:
 
         assert len(result.citations) == 6
         assert all(sid is None for sid in seen_session_ids)
+
+
+# ===========================================================================
+# Redaction / replay-fidelity / audit cluster (AG-1, AG-2, AG-3/TRACE-2,
+# TRACE-1, TRACE-3)
+# ===========================================================================
+#
+# Finding -> test map:
+#   AG-1     : a CancelledError raised during the search_and_extract HEAD
+#              probe gather PROPAGATES (is re-raised), not swallowed as
+#              "default to HTML". A generic Exception still defaults to HTML.
+#   AG-2     : apply_domain_skill redacts sensitive skill `inputs`
+#              (password/token/...) in the audit record; non-sensitive keys
+#              and the value handed to the skill runner are untouched.
+#   AG-3 +   : replay_trace detects the ***REDACTED*** sentinel: with no
+#   TRACE-2    override it SKIPS the action (+ logger.warning) instead of
+#              typing the sentinel; a supplied ``secrets`` mapping re-injects
+#              the real value. End-to-end record->replay confirmed.
+#   TRACE-1  : an ``action.evaluate`` expression is redacted in the trace
+#              (was previously written verbatim).
+#   TRACE-3  : the per-session ``_counters`` map is FIFO-bounded.
+
+
+def _agent(tmp_path: Path, **cfg_overrides: Any) -> Any:
+    """Construct a real Agent (no browser launched) for unit tests.
+
+    Mirrors ``tests/test_v168_trace_replay.py`` -- the Agent is built but
+    ``__aenter__`` is never called, so no Playwright process starts. Callers
+    stub the specific collaborator they exercise (``_actions``,
+    ``_fetcher``, ``_search``, ``_skills``).
+    """
+    from web_agent import Agent
+
+    cfg = AppConfig(base_dir=str(tmp_path), **cfg_overrides)
+    return Agent(cfg)
+
+
+# ---------------------------------------------------------------------------
+# AG-1: search_and_extract HEAD-probe gather re-raises CancelledError
+# ---------------------------------------------------------------------------
+class TestAG1ProbeCancellationPropagates:
+    @staticmethod
+    def _search_engine_one(url: str) -> Any:
+        """Fake SearchEngine.search returning a single extensionless URL.
+
+        An extensionless URL classifies as 'unknown' -> lands in
+        ``unknown_items`` -> enters the probe_binary_urls gather branch.
+        """
+        from web_agent.models import SearchResponse, SearchResultItem
+
+        async def _search(query: str, max_results: Any = None, **_k: Any) -> SearchResponse:
+            item = SearchResultItem(position=1, title="r", url=url, provider="searxng")
+            return SearchResponse(query=query, total_results=1, results=[item])
+
+        eng = MagicMock()
+        eng.search = _search
+        return eng
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A child probe task cancelled mid-gather must propagate out of
+        search_and_extract -- not be absorbed as 'probe failed -> HTML'."""
+        import asyncio
+
+        from web_agent import agent as agent_module
+
+        url = "https://good.example/doc"  # extensionless -> unknown -> probe
+        agent = _agent(tmp_path)
+        agent._search = self._search_engine_one(url)
+        # All hosts pass the gate so the URL reaches the probe branch.
+        monkeypatch.setattr(agent_module, "check_domain_allowed", lambda *a, **k: True)
+
+        async def _cancelled(*a: Any, **k: Any) -> Any:
+            raise asyncio.CancelledError()
+
+        agent._fetcher.classify_url = _cancelled
+        # Sentinel: if cancellation were swallowed, the pipeline would
+        # proceed to fetch_many. It must NOT be reached.
+        agent._fetcher.fetch_many = AsyncMock(
+            side_effect=AssertionError("pipeline continued after cancellation")
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.search_and_extract("q")
+        agent._fetcher.fetch_many.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generic_probe_exception_still_defaults_to_html(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: an ordinary (non-Cancelled) probe failure is still
+        swallowed and the URL defaults to the HTML path (reaches fetch_many),
+        exactly as before -- the AG-1 fix only re-raises CancelledError."""
+        from web_agent import agent as agent_module
+        from web_agent.models import AgentResult
+
+        url = "https://good.example/doc"
+        agent = _agent(tmp_path)
+        agent._search = self._search_engine_one(url)
+        monkeypatch.setattr(agent_module, "check_domain_allowed", lambda *a, **k: True)
+
+        async def _boom(*a: Any, **k: Any) -> Any:
+            raise RuntimeError("transient probe failure")
+
+        agent._fetcher.classify_url = _boom
+        # The swallowed-then-HTML path lands the item in fetch_many; stub it
+        # so we can assert it WAS reached (no exception escapes).
+        reached = {"n": 0}
+
+        async def _fetch_many(items: Any, **_k: Any) -> list[Any]:
+            reached["n"] = len(list(items))
+            return []
+
+        agent._fetcher.fetch_many = _fetch_many
+
+        result = await agent.search_and_extract("q")
+        assert isinstance(result, AgentResult)
+        assert reached["n"] == 1, "generic probe failure should default the URL to HTML/fetch_many"
+
+
+# ---------------------------------------------------------------------------
+# AG-2: apply_domain_skill redacts sensitive skill inputs in the audit log
+# ---------------------------------------------------------------------------
+class TestAG2SkillInputsRedactedInAudit:
+    @pytest.mark.asyncio
+    async def test_sensitive_inputs_redacted_in_audit_record(self, tmp_path: Path) -> None:
+        """A skill input named password/token/api_key is written to the audit
+        log as the redaction sentinel; benign keys survive; the UN-redacted
+        dict still reaches the skill runner."""
+        import json as _json
+
+        from web_agent.config import AuditConfig
+        from web_agent.models import SkillApplicationResult
+        from web_agent.trace_recorder import _REDACTED
+
+        agent = _agent(tmp_path, audit=AuditConfig(enabled=True))
+        assert agent._audit.enabled is True
+
+        # Stub the runner so no real skill is required; capture what it sees.
+        seen: dict[str, Any] = {}
+
+        async def _apply(_self: Any, url: str, name: str, inputs: dict[str, Any]) -> Any:
+            seen["inputs"] = inputs
+            return SkillApplicationResult(
+                skill_name=name, domain="sec.gov", url=url, succeeded=True
+            )
+
+        agent._skills.apply = _apply  # type: ignore[assignment]
+
+        raw_inputs = {
+            "username": "alice",
+            "password": "hunter2",
+            "api_token": "tok_abc",
+            "AUTHORIZATION": "Bearer xyz",
+            "page": 3,
+        }
+        await agent.apply_domain_skill("https://sec.gov", "filing_search", raw_inputs)
+
+        # The runner received the REAL, un-redacted values.
+        assert seen["inputs"] == raw_inputs
+        assert seen["inputs"]["password"] == "hunter2"
+
+        # The audit record redacted exactly the sensitive values.
+        line = agent._audit.path.read_text(encoding="utf-8").strip().splitlines()[0]
+        entry = _json.loads(line)
+        assert entry["method"] == "apply_domain_skill"
+        logged = entry["args"]["inputs"]
+        assert logged["username"] == "alice"  # benign preserved
+        assert logged["page"] == 3
+        assert logged["password"] == _REDACTED
+        assert logged["api_token"] == _REDACTED
+        assert logged["AUTHORIZATION"] == _REDACTED  # case-insensitive key match
+        # The plaintext secret must not appear anywhere in the line.
+        assert "hunter2" not in line
+        assert "tok_abc" not in line
+
+    @pytest.mark.asyncio
+    async def test_none_inputs_logged_as_empty_dict(self, tmp_path: Path) -> None:
+        import json as _json
+
+        from web_agent.config import AuditConfig
+        from web_agent.models import SkillApplicationResult
+
+        agent = _agent(tmp_path, audit=AuditConfig(enabled=True))
+
+        async def _apply(_self: Any, url: str, name: str, inputs: dict[str, Any]) -> Any:
+            return SkillApplicationResult(
+                skill_name=name, domain="sec.gov", url=url, succeeded=True
+            )
+
+        agent._skills.apply = _apply  # type: ignore[assignment]
+
+        await agent.apply_domain_skill("https://sec.gov", "filing_search", None)
+        entry = _json.loads(agent._audit.path.read_text(encoding="utf-8").strip().splitlines()[0])
+        # None -> {} (shape preserved, no crash).
+        assert entry["args"]["inputs"] == {}
+
+
+# ---------------------------------------------------------------------------
+# AG-3 + TRACE-2: replay_trace handles the redaction sentinel
+# ---------------------------------------------------------------------------
+def _replay_agent(tmp_path: Path) -> tuple[Any, Path]:
+    """Agent + its trace dir, with execute_sequence stubbed to echo actions.
+
+    ``execute_sequence`` is replaced with an AsyncMock so we can inspect the
+    exact Action list handed to it without launching a browser.
+    """
+    from web_agent.config import DiagnosticsConfig
+
+    agent = _agent(
+        tmp_path,
+        diagnostics=DiagnosticsConfig(trace_enabled=True, trace_dir=str(tmp_path / "traces")),
+    )
+    agent._actions.execute_sequence = AsyncMock(name="execute_sequence")
+    trace_dir = Path(agent._config.diagnostics.trace_dir)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    return agent, trace_dir
+
+
+def _write_trace(trace_dir: Path, sid: str, entries: list[dict[str, Any]]) -> Path:
+    import json as _json
+
+    f = trace_dir / f"{sid}.jsonl"
+    f.write_text("\n".join(_json.dumps(e) for e in entries), encoding="utf-8")
+    return f
+
+
+class TestAG3ReplayRedactedValue:
+    @staticmethod
+    def _login_trace_entries() -> list[dict[str, Any]]:
+        from web_agent.trace_recorder import _REDACTED
+
+        # A realistic recorded login: click, fill(redacted password), click.
+        return [
+            {
+                "method": "action.fill",
+                "args": {"selector": "#user", "value": "alice"},
+                "url": "https://example.com/login",
+                "status": "success",
+                "elapsed_ms": 1,
+            },
+            {
+                "method": "action.fill",
+                "args": {"selector": "#pass", "value": _REDACTED},
+                "status": "success",
+                "elapsed_ms": 1,
+            },
+            {
+                "method": "action.click",
+                "args": {"selector": "#submit"},
+                "status": "success",
+                "elapsed_ms": 1,
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_redacted_value_skipped_not_typed(self, tmp_path: Path) -> None:
+        """With no override, the redacted fill is SKIPPED -- the sentinel is
+        never handed to execute_sequence."""
+        agent, trace_dir = _replay_agent(tmp_path)
+        f = _write_trace(trace_dir, "login", self._login_trace_entries())
+
+        await agent.replay_trace(f)
+
+        actions = agent._actions.execute_sequence.await_args.args[1]
+        # 3 recorded -> 2 replayed (the redacted password fill dropped).
+        kinds = [(a.action, getattr(a, "value", None)) for a in actions]
+        assert ("fill", "alice") in kinds  # benign fill kept
+        assert ("click", None) in kinds
+        # No action carries the sentinel value.
+        from web_agent.trace_recorder import _REDACTED
+
+        assert all(getattr(a, "value", None) != _REDACTED for a in actions)
+        assert len(actions) == 2
+
+    @pytest.mark.asyncio
+    async def test_warning_emitted_for_skipped_redacted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A logger.warning is emitted naming the skipped redacted action."""
+        from web_agent import agent as agent_module
+
+        agent, trace_dir = _replay_agent(tmp_path)
+        f = _write_trace(trace_dir, "login", self._login_trace_entries())
+
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            agent_module.logger,
+            "warning",
+            lambda msg, *a, **k: warnings.append(msg),
+        )
+        await agent.replay_trace(f)
+        assert any("skipping redacted" in w for w in warnings)
+
+    @pytest.mark.asyncio
+    async def test_secrets_override_reinjects_real_value(self, tmp_path: Path) -> None:
+        """Supplying ``secrets={index: value}`` re-injects the real value so
+        the action replays faithfully (the sentinel is replaced)."""
+        agent, trace_dir = _replay_agent(tmp_path)
+        f = _write_trace(trace_dir, "login", self._login_trace_entries())
+
+        # The redacted fill is at index 1 in the replayable action list.
+        await agent.replay_trace(f, secrets={1: "hunter2"})
+
+        actions = agent._actions.execute_sequence.await_args.args[1]
+        assert len(actions) == 3  # nothing skipped
+        pass_fill = next(a for a in actions if getattr(a, "selector", None) == "#pass")
+        assert pass_fill.value == "hunter2"
+
+    @pytest.mark.asyncio
+    async def test_all_actions_redacted_no_override_raises(self, tmp_path: Path) -> None:
+        """If every replayable action is redacted and none is overridden, a
+        clear ValueError is raised rather than calling execute_sequence with
+        an empty list."""
+        from web_agent.trace_recorder import _REDACTED
+
+        agent, trace_dir = _replay_agent(tmp_path)
+        entries = [
+            {
+                "method": "action.fill",
+                "args": {"selector": "#pass", "value": _REDACTED},
+                "url": "https://example.com/login",
+                "status": "success",
+                "elapsed_ms": 1,
+            }
+        ]
+        f = _write_trace(trace_dir, "allsecret", entries)
+        with pytest.raises(ValueError, match="all were redacted"):
+            await agent.replay_trace(f)
+        agent._actions.execute_sequence.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_redacted_trace_unaffected(self, tmp_path: Path) -> None:
+        """Regression: a trace with no redacted values replays every action
+        (back-compat with the existing replay behaviour)."""
+        agent, trace_dir = _replay_agent(tmp_path)
+        entries = [
+            {
+                "method": "action.fill",
+                "args": {"selector": "#q", "value": "search term"},
+                "url": "https://example.com/",
+                "status": "success",
+                "elapsed_ms": 1,
+            },
+            {
+                "method": "action.click",
+                "args": {"selector": "#go"},
+                "status": "success",
+                "elapsed_ms": 1,
+            },
+        ]
+        f = _write_trace(trace_dir, "plain", entries)
+        await agent.replay_trace(f)
+        actions = agent._actions.execute_sequence.await_args.args[1]
+        assert len(actions) == 2
+        assert actions[0].value == "search term"
+
+    @pytest.mark.asyncio
+    async def test_record_then_replay_end_to_end(self, tmp_path: Path) -> None:
+        """Full loop: a real fill secret recorded via SessionTraceRecorder is
+        persisted as the sentinel, and replay_trace skips it (does NOT type
+        the sentinel) -- the exact AG-3/TRACE-2 footgun, now closed."""
+        from web_agent.config import DiagnosticsConfig
+        from web_agent.trace_recorder import _REDACTED, SessionTraceRecorder
+
+        diag = DiagnosticsConfig(trace_enabled=True, trace_dir=str(tmp_path / "traces"))
+        rec = SessionTraceRecorder(diag, base_dir=str(tmp_path))
+        # Record a fill carrying a real password + a benign click.
+        await rec.record(
+            session_id="s1",
+            method="action.fill",
+            args={"selector": "#pass", "value": "s3cr3t-pw"},
+            status="success",
+            elapsed_ms=1,
+            url="https://example.com/login",
+        )
+        await rec.record(
+            session_id="s1",
+            method="action.click",
+            args={"selector": "#submit"},
+            status="success",
+            elapsed_ms=1,
+        )
+        f = rec.path_for("s1")
+        # The persisted secret is the sentinel, never the plaintext.
+        raw = f.read_text(encoding="utf-8")
+        assert "s3cr3t-pw" not in raw
+        assert _REDACTED in raw
+
+        agent, _ = _replay_agent(tmp_path)
+        # Point the agent's recorder at the same dir (already shared via cfg).
+        await agent.replay_trace(f)
+        actions = agent._actions.execute_sequence.await_args.args[1]
+        # Redacted fill skipped; only the benign click replays.
+        assert [a.action for a in actions] == ["click"]
+
+
+# ---------------------------------------------------------------------------
+# TRACE-1: action.evaluate expression is redacted in the trace
+# ---------------------------------------------------------------------------
+def _trace_recorder(tmp_path: Path) -> Any:
+    from web_agent.config import DiagnosticsConfig
+    from web_agent.trace_recorder import SessionTraceRecorder
+
+    diag = DiagnosticsConfig(trace_enabled=True, trace_dir=str(tmp_path / "traces"))
+    return SessionTraceRecorder(diag, base_dir=str(tmp_path))
+
+
+class TestTRACE1EvaluateRedacted:
+    @pytest.mark.asyncio
+    async def test_evaluate_expression_redacted(self, tmp_path: Path) -> None:
+        import json as _json
+
+        from web_agent.trace_recorder import _REDACTED
+
+        rec = _trace_recorder(tmp_path)
+        secret_js = "localStorage.setItem('access_token', 'eyJhbGciOi.SECRET')"
+        await rec.record(
+            session_id="s1",
+            method="action.evaluate",
+            args={"expression": secret_js},
+            status="success",
+            elapsed_ms=1,
+        )
+        line = rec.path_for("s1").read_text(encoding="utf-8").strip()
+        entry = _json.loads(line)
+        assert entry["args"]["expression"] == _REDACTED
+        # The token must not have been written verbatim.
+        assert "access_token" not in line
+        assert "SECRET" not in line
+
+    @pytest.mark.asyncio
+    async def test_redaction_helper_includes_evaluate(self) -> None:
+        # Unit-level: the map gained action.evaluate (and kept fill/type).
+        from web_agent.trace_recorder import _redact_args
+
+        out = _redact_args("action.evaluate", {"expression": "fetch('/x')"})
+        assert out["expression"] == "***REDACTED***"
+        # fill/type unchanged behaviour.
+        assert _redact_args("action.fill", {"value": "pw"})["value"] == "***REDACTED***"
+        # A non-secret action is returned unchanged (same object).
+        clk = {"selector": "#x"}
+        assert _redact_args("action.click", clk) is clk
+
+    @pytest.mark.asyncio
+    async def test_record_does_not_mutate_caller_args(self, tmp_path: Path) -> None:
+        """The live action dict the caller passes must NOT be mutated by the
+        redaction (only the serialized copy is redacted)."""
+        rec = _trace_recorder(tmp_path)
+        live = {"expression": "real_js_with_token('abc')"}
+        await rec.record(
+            session_id="s1", method="action.evaluate", args=live, status="success", elapsed_ms=1
+        )
+        assert live["expression"] == "real_js_with_token('abc')"
+
+
+# ---------------------------------------------------------------------------
+# TRACE-3: per-session _counters map is FIFO-bounded
+# ---------------------------------------------------------------------------
+class TestTRACE3CountersBounded:
+    @pytest.mark.asyncio
+    async def test_counters_evict_past_bound(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from web_agent import trace_recorder as tr_module
+
+        monkeypatch.setattr(tr_module, "_COUNTERS_MAXSIZE", 3)
+        rec = _trace_recorder(tmp_path)
+        for i in range(10):
+            await rec.record(
+                session_id=f"sid{i}",
+                method="action.click",
+                args={},
+                status="success",
+                elapsed_ms=1,
+            )
+        # Never exceeds the cap; the oldest sessions were evicted FIFO.
+        assert len(rec._counters) <= 3
+        assert "sid9" in rec._counters  # most recent kept
+        assert "sid0" not in rec._counters  # oldest evicted
+
+    @pytest.mark.asyncio
+    async def test_repeated_same_session_does_not_grow_map(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Re-recording an existing session increments its ordinal without
+        adding map entries or triggering eviction of itself."""
+        from web_agent import trace_recorder as tr_module
+
+        monkeypatch.setattr(tr_module, "_COUNTERS_MAXSIZE", 3)
+        rec = _trace_recorder(tmp_path)
+        for _ in range(20):
+            await rec.record(
+                session_id="stable",
+                method="action.click",
+                args={},
+                status="success",
+                elapsed_ms=1,
+            )
+        assert len(rec._counters) == 1
+        assert rec._counters["stable"] == 20

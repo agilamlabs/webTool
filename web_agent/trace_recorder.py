@@ -56,18 +56,105 @@ if TYPE_CHECKING:  # pragma: no cover -- types only
 # even though session_ids are minted internally (defense in depth).
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._\-]+$")
 
+# v1.6.16 TRACE-3: bound the per-session ordinal map so a long-lived MCP
+# server that mints many session_ids does not leak one permanent dict
+# entry per session. Mirrors the bounded DNS cache (_DNS_CACHE_MAXSIZE)
+# and robots lock dict (_ROBOTS_CACHE_MAXSIZE). FIFO eviction: when full,
+# drop the oldest-inserted session's counter. The only consequence of
+# evicting a still-live session is that its ordinal restarts at 0 -- the
+# JSONL append order is unaffected, and ordinal is documented as a
+# gap-detection convenience, not a correctness invariant.
+_COUNTERS_MAXSIZE: int = 4096
+
 _REDACTED = "***REDACTED***"
 
-# v1.6.14 B-8: action methods whose args carry user-typed secrets
-# (passwords, tokens). Maps ``method`` -> the arg key holding the secret.
-# ``action.fill`` -> FillInput.value; ``action.type`` -> TypeInput.text;
-# ``action.type_text`` -> TypeTextInput.text. The recorded value is
-# replaced with a placeholder in the SERIALIZED copy only.
+# v1.6.14 B-8 / v1.6.16 TRACE-1: action methods whose args carry secrets
+# (passwords, tokens, JS embedding credentials). Maps ``method`` -> the
+# arg key holding the secret. The recorded value is replaced with a
+# placeholder in the SERIALIZED copy only.
+#
+# IMPORTANT -- redaction is ONE-WAY and intentionally NOT reversible. The
+# real value is never written to disk, so a trace containing any of these
+# actions cannot be replayed faithfully from the trace alone:
+# ``Agent.replay_trace`` detects the :data:`_REDACTED` sentinel and either
+# re-supplies the value from a caller-provided ``secrets`` mapping or
+# SKIPS the action with a warning (see ``Agent.replay_trace`` / v1.6.16
+# AG-3). See also the matching note there.
+#
+#   ``action.fill``      -> FillInput.value
+#   ``action.type``      -> TypeInput.text
+#   ``action.type_text`` -> TypeTextInput.text
+#   ``action.evaluate``  -> EvaluateInput.expression (arbitrary JS that
+#                           routinely embeds tokens, e.g.
+#                           ``localStorage.setItem('access_token', '...')``)
+#
+# ``action.wait`` (WaitInput.value) was considered but deliberately left
+# OUT: that field is dual-use -- it overwhelmingly holds a benign selector
+# / URL pattern / load-state string and only rarely a JS function body, so
+# blanket-redacting it would mask non-secret values and needlessly break
+# replay of ordinary waits. ``evaluate`` is the unambiguous JS/secret
+# channel TRACE-1 targets.
 _SENSITIVE_ARG_BY_METHOD: dict[str, str] = {
     "action.fill": "value",
     "action.type": "text",
     "action.type_text": "text",
+    "action.evaluate": "expression",
 }
+
+# Substrings that mark a mapping KEY as sensitive (case-insensitive).
+# Used by :func:`redact_sensitive_mapping` to scrub free-form input dicts
+# (e.g. skill ``inputs``) before they reach an audit/trace sink. Mirrors
+# the per-action redaction above but keyed by name rather than by method,
+# since free-form dicts have no fixed schema.
+_SENSITIVE_KEY_MARKERS: tuple[str, ...] = (
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "key",
+    "credential",
+    "authorization",
+    "auth",
+    "cookie",
+    "session",
+    "bearer",
+    "api_key",
+    "apikey",
+    "access",
+    "private",
+)
+
+
+def _key_is_sensitive(key: str) -> bool:
+    """Return True if *key* looks like it names a secret (case-insensitive)."""
+    low = key.lower()
+    return any(marker in low for marker in _SENSITIVE_KEY_MARKERS)
+
+
+def is_redacted(value: Any) -> bool:
+    """Return True if *value* is the redaction sentinel written to a trace.
+
+    Used on the replay side (``Agent.replay_trace``) so a redacted
+    fill/type/evaluate value is detected instead of being typed verbatim.
+    """
+    return isinstance(value, str) and value == _REDACTED
+
+
+def redact_sensitive_mapping(mapping: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a copy of *mapping* with sensitive VALUES masked by key name.
+
+    A value is masked (replaced with :data:`_REDACTED`) when its key
+    matches :func:`_key_is_sensitive` (password/token/secret/key/...).
+    Non-sensitive values are preserved verbatim so the record stays useful
+    for debugging. ``None`` maps to an empty dict. Never mutates the input.
+
+    This is the audit-path analogue of :func:`_redact_args`: the trace sink
+    redacts by action schema; free-form dicts (e.g. domain-skill ``inputs``)
+    are redacted here by key name (v1.6.16 AG-2).
+    """
+    if not mapping:
+        return {}
+    return {k: (_REDACTED if _key_is_sensitive(k) else v) for k, v in mapping.items()}
 
 
 def _redact_args(method: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -76,6 +163,10 @@ def _redact_args(method: str, args: dict[str, Any]) -> dict[str, Any]:
     Returns the original dict unchanged (no copy) when there's nothing to
     redact, so the common path stays allocation-free. Never mutates the
     caller's dict -- it makes a shallow copy only when a redaction applies.
+
+    NOTE: redaction is one-way (see :data:`_SENSITIVE_ARG_BY_METHOD`). A
+    redacted value cannot be recovered from the trace; ``replay_trace``
+    must be supplied the real value to replay such an action.
     """
     key = _SENSITIVE_ARG_BY_METHOD.get(method)
     if key is None or key not in args:
@@ -157,6 +248,13 @@ class SessionTraceRecorder:
         if not self.enabled:
             return
         async with self._lock:
+            # v1.6.16 TRACE-3: FIFO-evict the oldest counter when at capacity
+            # before inserting a brand-new session, so the map stays bounded
+            # over a long-lived process. ``self._lock`` already serializes
+            # record() per recorder, so this needs no extra synchronization.
+            if session_id not in self._counters and len(self._counters) >= _COUNTERS_MAXSIZE:
+                oldest = next(iter(self._counters))
+                self._counters.pop(oldest, None)
             ordinal = self._counters.get(session_id, 0)
             self._counters[session_id] = ordinal + 1
             try:
@@ -264,4 +362,4 @@ class SessionTraceRecorder:
         return entries
 
 
-__all__ = ["SessionTraceRecorder"]
+__all__ = ["SessionTraceRecorder", "is_redacted", "redact_sensitive_mapping"]
