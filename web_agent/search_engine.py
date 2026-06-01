@@ -79,6 +79,26 @@ class SearchEngine:
         self._providers: list[SearchProvider] = [
             catalog[name] for name in config.search.providers if name in catalog
         ]
+        # v1.6.15: report configured-but-unavailable providers ONCE here, at
+        # construction, instead of re-logging on every ``search()`` call. The
+        # common case is SearXNG sitting in the default chain with no
+        # ``search.searxng_base_url`` set -- that previously emitted
+        # "Skipping unavailable provider: searxng" on EVERY search (loguru
+        # surfaces DEBUG by default), which read as a recurring error rather
+        # than the benign "SearXNG isn't configured" that it is. The search
+        # loop now skips unavailable providers silently.
+        unavailable = [p.name for p in self._providers if not p.is_available]
+        if unavailable:
+            hint = (
+                " (SearXNG needs search.searxng_base_url, e.g. http://localhost:8888)"
+                if "searxng" in unavailable
+                else ""
+            )
+            logger.debug(
+                "Search providers configured but unavailable, skipped: {u}{hint}",
+                u=unavailable,
+                hint=hint,
+            )
 
     @property
     def providers(self) -> list[SearchProvider]:
@@ -132,7 +152,10 @@ class SearchEngine:
         last_response = SearchResponse(query=query)
         for provider in self._providers:
             if not provider.is_available:
-                logger.debug("Skipping unavailable provider: {p}", p=provider.name)
+                # Unavailable providers are reported once at construction
+                # (see __init__); skip silently here so an optional provider
+                # that isn't set up (e.g. SearXNG with no base_url) doesn't
+                # spam DEBUG on every search.
                 continue
             try:
                 response = await provider.search(query, max_r)
