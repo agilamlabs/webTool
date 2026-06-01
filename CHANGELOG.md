@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.6.15] - 2026-05-29
+
+### Fixed — SearXNG "unavailable provider" log spam
+
+`SearchEngine` logged `Skipping unavailable provider: searxng` at DEBUG on
+**every** `search()` call whenever SearXNG sat in the default provider chain
+(`["searxng", "ddgs", "playwright"]`) without a `search.searxng_base_url`
+set — which is the out-of-the-box default. Because loguru surfaces DEBUG by
+default, this read as a recurring error on every search, despite the config
+field doc promising the provider was "silently skipped".
+
+- `SearchEngine.__init__` now reports configured-but-unavailable providers
+  **once**, at construction (DEBUG), with an actionable hint for the common
+  case (`SearXNG needs search.searxng_base_url, e.g. http://localhost:8888`).
+- `SearchEngine.search()` skips unavailable providers **silently** — the
+  per-iteration log line is removed, so a missing optional provider no longer
+  spams the log on every call.
+- No behaviour change: SearXNG still auto-enables when
+  `search.searxng_base_url` is set; the configured provider chain
+  (`SearchEngine.providers`) and the strict-mode "attempted providers" error
+  are unchanged.
+
+3 new tests in `tests/test_v1615_search_provider_logging.py`.
+
 ## [1.6.14] - 2026-05-28
 
 ### Review-hardening follow-up (2026-05-29)

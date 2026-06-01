@@ -10,6 +10,13 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
+> **What's new in 1.6.15** — *Log hygiene.* `SearchEngine` no longer
+> logs `Skipping unavailable provider: searxng` on every search when
+> SearXNG sits in the default chain without a `search.searxng_base_url`
+> — it's now reported once at construction (with a hint) and skipped
+> silently thereafter. No behaviour change; SearXNG still auto-enables
+> when `search.searxng_base_url` is set.
+>
 > **What's new in 1.6.14** — *Hardening slice — 8 Critical fixes
 > from a brutal full-codebase audit, plus a deeper review-hardening
 > follow-up (44 more findings: 1 Critical / 10 High / 21 Medium / 12
