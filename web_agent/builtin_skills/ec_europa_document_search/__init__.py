@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from web_agent.utils import _matches_domain, _normalize_host
+
 if TYPE_CHECKING:
     from web_agent.agent import Agent
 
@@ -33,8 +35,13 @@ async def run(agent: Agent, url: str, inputs: dict[str, Any]) -> dict[str, Any]:
 
     docs: list[dict[str, str]] = []
     for item in results.pages:
-        # Drop non-EC hosts that may slip past site: operators
-        if not any(host in item.url for host in _EC_HOSTS):
+        # Drop non-EC hosts that may slip past site: operators. Match on
+        # the *parsed hostname* at label boundaries (exact host or a
+        # subdomain), not a substring of the raw URL -- otherwise
+        # ``https://ec.europa.eu.evil.com/`` or
+        # ``https://evil.com/?x=ec.europa.eu`` would falsely pass.
+        host = _normalize_host(item.url)
+        if not host or not any(_matches_domain(host, d) for d in _EC_HOSTS):
             continue
         docs.append(
             {

@@ -1127,3 +1127,405 @@ class TestMO1ModelInvariants:
 
     def test_screenshot_quality_none_default(self) -> None:
         assert ScreenshotInput().quality is None
+
+
+# ===========================================================================
+# Arbitrary-write + skill-scope cluster (MC-1, GH-1, WS-1, EC-1)
+# ===========================================================================
+#
+# Finding -> test map:
+#   MC-1 : web_print_page_as_pdf contains output_path to screenshot_dir --
+#          absolute / '..' paths rejected; a normal relative name still works
+#          and reaches the page.pdf() write inside screenshot_dir.
+#   GH-1 : the github_release_download sanitizer actually strips ``site:``
+#          (and other field operators) + standalone boolean OR; ordinary
+#          query text survives.
+#   WS-1 : markdown_skills_only gate validates the NORMALIZED path, so a
+#          ``..`` escape is blocked while legitimate domain-skills/ writes
+#          are allowed.
+#   EC-1 : EC host confinement matches the parsed hostname at label
+#          boundaries -- ``ec.europa.eu.evil.com`` and
+#          ``evil.com/?x=ec.europa.eu`` rejected; real EC host + subdomain
+#          accepted.
+
+
+# ---------------------------------------------------------------------------
+# MC-1: web_print_page_as_pdf contains an LLM-controlled output_path
+# ---------------------------------------------------------------------------
+class TestMC1PdfOutputPathContained:
+    """The MCP boundary must contain ``output_path`` to the screenshot dir.
+
+    The underlying ``BrowserActions.print_page_as_pdf`` honours an absolute
+    ``output_path`` verbatim (arbitrary file write). The fix validates +
+    rewrites the path at the ``web_print_page_as_pdf`` MCP tool before
+    calling down.
+    """
+
+    def _ctx_and_agent(self, tmp_path: Path):
+        """Return (ctx, agent_mock, shot_dir) wired like FastMCP's lifespan."""
+        from web_agent.models import ActionStatus, ScreenshotFormat, ScreenshotResult
+
+        agent = MagicMock()
+        agent._config = AppConfig(base_dir=str(tmp_path))
+        # The PDF write lands in automation.screenshot_dir.
+        shot_dir = Path(agent._config.automation.screenshot_dir)
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        agent.print_page_as_pdf = AsyncMock(
+            return_value=ScreenshotResult(
+                url="https://example.com/",
+                path=str(shot_dir / "ok.pdf"),
+                format=ScreenshotFormat.PNG,
+                status=ActionStatus.SUCCESS,
+            )
+        )
+        ctx = MagicMock()
+        ctx.request_context.lifespan_context = {"agent": agent}
+        return ctx, agent, shot_dir
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_path",
+        [
+            "/etc/cron.d/evil.pdf",  # POSIX absolute
+            r"C:\Users\me\Startup\evil.pdf",  # Windows drive-rooted
+            r"\\server\share\evil.pdf",  # UNC
+            "../../escape.pdf",  # parent traversal
+            "domain/../../../escape.pdf",  # nested traversal escape
+        ],
+    )
+    async def test_absolute_or_traversal_rejected(self, tmp_path: Path, bad_path: str) -> None:
+        from web_agent.mcp_server import web_print_page_as_pdf
+
+        ctx, agent, _shot = self._ctx_and_agent(tmp_path)
+        out = await web_print_page_as_pdf(ctx, url="https://example.com/", output_path=bad_path)
+        # Rejected at the boundary: FAILED, and the underlying write was
+        # NEVER reached (so nothing could be written outside the dir).
+        assert out["status"] == "failed"
+        assert "output_path" in (out.get("error_message") or "")
+        agent.print_page_as_pdf.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_relative_name_passes_contained(self, tmp_path: Path) -> None:
+        from web_agent.mcp_server import web_print_page_as_pdf
+
+        ctx, agent, shot_dir = self._ctx_and_agent(tmp_path)
+        out = await web_print_page_as_pdf(ctx, url="https://example.com/", output_path="report.pdf")
+        assert out["status"] == "success"
+        agent.print_page_as_pdf.assert_awaited_once()
+        # The path handed down is relative (never absolute) and re-anchors
+        # inside the screenshot dir, so it cannot hit the absolute bypass.
+        kwargs = agent.print_page_as_pdf.await_args.kwargs
+        passed = kwargs["output_path"]
+        assert not Path(passed).is_absolute()
+        assert utils.safe_join_path(shot_dir, passed).parent == shot_dir.resolve()
+
+    @pytest.mark.asyncio
+    async def test_none_output_path_passes_through(self, tmp_path: Path) -> None:
+        from web_agent.mcp_server import web_print_page_as_pdf
+
+        ctx, agent, _shot = self._ctx_and_agent(tmp_path)
+        out = await web_print_page_as_pdf(ctx, url="https://example.com/")
+        assert out["status"] == "success"
+        # output_path stays None -- downstream picks its own contained name.
+        assert agent.print_page_as_pdf.await_args.kwargs["output_path"] is None
+
+    @pytest.mark.asyncio
+    async def test_relative_name_writes_inside_screenshot_dir_end_to_end(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end: the rewritten relative path reaches the real
+        BrowserActions.print_page_as_pdf and Chromium's page.pdf() write
+        target lands INSIDE screenshot_dir (the absolute bypass is never
+        triggered)."""
+        from web_agent.browser_actions import BrowserActions
+        from web_agent.mcp_server import web_print_page_as_pdf
+
+        cfg = AppConfig(base_dir=str(tmp_path))
+        shot_dir = Path(cfg.automation.screenshot_dir)
+
+        # Real BrowserActions with a faked session page.
+        page = MagicMock()
+        page.pdf = AsyncMock()
+        type(page).url = property(lambda _self: "https://example.com/")
+        fake_tab_mgr = MagicMock()
+        fake_tab_mgr.get_or_current = MagicMock(return_value=page)
+        fake_sessions = MagicMock()
+        fake_sessions.get_tab_manager = MagicMock(return_value=fake_tab_mgr)
+        fake_sessions.touch = MagicMock()
+        ba = BrowserActions(MagicMock(), cfg, sessions=fake_sessions)
+
+        agent = MagicMock()
+        agent._config = cfg
+        agent.print_page_as_pdf = ba.print_page_as_pdf  # real impl
+        ctx = MagicMock()
+        ctx.request_context.lifespan_context = {"agent": agent}
+
+        out = await web_print_page_as_pdf(ctx, output_path="sub/report.pdf", session_id="sid")
+        assert out["status"] == "success"
+        page.pdf.assert_awaited_once()
+        written = Path(page.pdf.await_args.kwargs["path"])
+        assert shot_dir.resolve() in written.parents
+        assert written.name == "report.pdf"
+
+    @pytest.mark.asyncio
+    async def test_absolute_output_path_never_reaches_real_write(self, tmp_path: Path) -> None:
+        """The pre-fix arbitrary-write vector: an absolute output_path must
+        NOT cause the real page.pdf() to be invoked with that absolute
+        target."""
+        from web_agent.browser_actions import BrowserActions
+        from web_agent.mcp_server import web_print_page_as_pdf
+
+        cfg = AppConfig(base_dir=str(tmp_path))
+        page = MagicMock()
+        page.pdf = AsyncMock()
+        type(page).url = property(lambda _self: "https://example.com/")
+        fake_tab_mgr = MagicMock()
+        fake_tab_mgr.get_or_current = MagicMock(return_value=page)
+        fake_sessions = MagicMock()
+        fake_sessions.get_tab_manager = MagicMock(return_value=fake_tab_mgr)
+        fake_sessions.touch = MagicMock()
+        ba = BrowserActions(MagicMock(), cfg, sessions=fake_sessions)
+
+        agent = MagicMock()
+        agent._config = cfg
+        agent.print_page_as_pdf = ba.print_page_as_pdf
+        ctx = MagicMock()
+        ctx.request_context.lifespan_context = {"agent": agent}
+
+        evil = str(tmp_path / "outside" / "evil.pdf")
+        out = await web_print_page_as_pdf(ctx, output_path=evil, session_id="sid")
+        assert out["status"] == "failed"
+        page.pdf.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# GH-1: github_release_download query sanitizer actually strips site: + OR
+# ---------------------------------------------------------------------------
+class TestGH1QuerySanitizer:
+    def _sanitize(self):
+        from web_agent.builtin_skills.github_release_download import _sanitize_query_term
+
+        return _sanitize_query_term
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "winx64 site:evil.com",
+            "x OR site:evil.com",
+            '" OR site:evil.com"',
+            "SITE:evil.com",  # case-insensitive
+            "site : evil.com",  # whitespace around colon
+            "(a | b) site:evil.com",
+        ],
+    )
+    def test_site_operator_stripped(self, payload: str) -> None:
+        out = self._sanitize()(payload)
+        # The ``site:`` operator token must be gone (no re-scoping left).
+        assert "site:" not in out.lower()
+        assert "site :" not in out.lower()
+
+    @pytest.mark.parametrize(
+        "payload",
+        ["x OR y", "a AND b", "foo NOT bar", "OR OR OR"],
+    )
+    def test_boolean_operators_stripped(self, payload: str) -> None:
+        out = self._sanitize()(payload)
+        tokens = out.split()
+        assert "OR" not in tokens
+        assert "AND" not in tokens
+        assert "NOT" not in tokens
+
+    def test_field_operators_other_than_site_stripped(self) -> None:
+        out = self._sanitize()("inurl:evil filetype:exe intitle:secret")
+        low = out.lower()
+        assert "inurl:" not in low
+        assert "filetype:" not in low
+        assert "intitle:" not in low
+
+    @pytest.mark.parametrize(
+        "ok",
+        [
+            "owner/name v1.2.3",
+            "normal-string_v1.0",
+            "orchestra transformer",  # contains 'or'/'and' as substrings
+            "windows x64 release",
+            "scaffolding",  # contains 'fold' / 'and'? no -- guards substrings
+        ],
+    )
+    def test_legitimate_text_preserved(self, ok: str) -> None:
+        # Ordinary words (incl. ones that merely contain 'or'/'and') survive,
+        # modulo whitespace collapsing.
+        out = self._sanitize()(ok)
+        assert out == " ".join(ok.split())
+
+    def test_scope_escape_payload_collapses_to_bare_text(self) -> None:
+        # The end-to-end intent: a prompt-injected scope escape leaves only
+        # harmless plain text -- no operator the engine would honour.
+        out = self._sanitize()('" OR site:evil.com"')
+        assert out == "evil.com"
+
+    def test_empty_string(self) -> None:
+        assert self._sanitize()("") == ""
+
+
+# ---------------------------------------------------------------------------
+# WS-1: markdown_skills_only gate validates the NORMALIZED path
+# ---------------------------------------------------------------------------
+class TestWS1MarkdownSkillsOnlyNormalizedGate:
+    def _ws(self, tmp_path: Path, mode: str = "markdown_skills_only"):
+        from web_agent.config import WorkspaceConfig
+        from web_agent.workspace import Workspace
+
+        cfg = AppConfig(
+            base_dir=str(tmp_path),
+            workspace=WorkspaceConfig(enabled=True, mode=mode),
+        )
+        return Workspace(cfg)
+
+    @pytest.mark.parametrize(
+        "escape_path",
+        [
+            "domain-skills/../notes/x.md",
+            "domain-skills/../evil.md",
+            "domain-skills/sub/../../notes/y.md",
+        ],
+    )
+    def test_dotdot_escape_blocked(self, tmp_path: Path, escape_path: str) -> None:
+        from web_agent.workspace import WorkspaceError
+
+        ws = self._ws(tmp_path)
+        with pytest.raises(WorkspaceError):
+            ws.write_file(escape_path, "x")
+
+    def test_write_skill_dotdot_escape_blocked(self, tmp_path: Path) -> None:
+        # write_skill('../notes/x') -> write_file('domain-skills/../notes/x.md')
+        from web_agent.workspace import WorkspaceError
+
+        ws = self._ws(tmp_path)
+        with pytest.raises(WorkspaceError):
+            ws.write_skill("../notes/x", "x")
+
+    def test_legitimate_skill_path_allowed(self, tmp_path: Path) -> None:
+        ws = self._ws(tmp_path)
+        p = ws.write_skill("sec.gov/filing_search", "# skill")
+        assert p.is_file()
+        # Landed under domain-skills/ as documented.
+        from web_agent.workspace import SKILLS_DIR
+
+        rel = p.relative_to(ws.root())
+        assert rel.parts[0] == SKILLS_DIR
+        assert rel.suffix == ".md"
+
+    def test_plain_md_under_skills_dir_allowed(self, tmp_path: Path) -> None:
+        ws = self._ws(tmp_path)
+        p = ws.write_file("domain-skills/note.md", "# x")
+        assert p.is_file()
+
+    def test_non_md_still_blocked(self, tmp_path: Path) -> None:
+        from web_agent.workspace import WorkspaceError
+
+        ws = self._ws(tmp_path)
+        with pytest.raises(WorkspaceError):
+            ws.write_file("domain-skills/x.py", "x")
+
+    def test_md_outside_skills_dir_still_blocked(self, tmp_path: Path) -> None:
+        from web_agent.workspace import WorkspaceError
+
+        ws = self._ws(tmp_path)
+        with pytest.raises(WorkspaceError):
+            ws.write_file("notes/x.md", "x")
+
+    def test_reviewed_helpers_normalized_dotdot_helpers_py_blocked(self, tmp_path: Path) -> None:
+        # The reviewed_python_helpers gate must also see the normalized path:
+        # 'domain-skills/../helpers.py' resolves to root helpers.py, but a
+        # normalized 'sub/../helpers.py' equally must not smuggle a non-root
+        # .py past the gate. Confirm a normalized non-root .py is blocked.
+        from web_agent.workspace import WorkspaceError
+
+        ws = self._ws(tmp_path, mode="reviewed_python_helpers")
+        with pytest.raises(WorkspaceError):
+            ws.write_file("notes/../sub/helpers.py", "x")
+
+    def test_reviewed_helpers_root_helpers_py_allowed(self, tmp_path: Path) -> None:
+        ws = self._ws(tmp_path, mode="reviewed_python_helpers")
+        p = ws.write_file("helpers.py", "x = 1")
+        assert p.is_file() and p.name == "helpers.py"
+
+
+# ---------------------------------------------------------------------------
+# EC-1: EC host confinement matches the parsed hostname at label boundaries
+# ---------------------------------------------------------------------------
+class TestEC1HostnameConfinement:
+    def _filter(self):
+        """Return a predicate mirroring the skill's in-loop host gate."""
+        from web_agent.builtin_skills.ec_europa_document_search import _EC_HOSTS
+        from web_agent.utils import _matches_domain, _normalize_host
+
+        def accepted(url: str) -> bool:
+            host = _normalize_host(url)
+            return bool(host) and any(_matches_domain(host, d) for d in _EC_HOSTS)
+
+        return accepted
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ec.europa.eu.evil.com/x",  # suffix-spoof
+            "https://evil.com/?x=ec.europa.eu",  # query-string substring
+            "https://attacker.com/ec.europa.eu",  # path substring
+            "https://notec.europa.eu.evil/",  # label-boundary spoof
+            "https://evil.com/#ec.europa.eu",  # fragment substring
+            "not a url",
+        ],
+    )
+    def test_spoofed_hosts_rejected(self, url: str) -> None:
+        assert self._filter()(url) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://ec.europa.eu/info/doc",
+            "https://finance.ec.europa.eu/policy",  # subdomain of ec.europa.eu
+            "https://eur-lex.europa.eu/legal-content/x",
+            "https://sub.eur-lex.europa.eu/x",  # subdomain of allowed host
+            "http://EC.EUROPA.EU/x",  # case-insensitive
+        ],
+    )
+    def test_real_ec_hosts_and_subdomains_accepted(self, url: str) -> None:
+        assert self._filter()(url) is True
+
+    @pytest.mark.asyncio
+    async def test_run_drops_spoofed_and_keeps_real(self, monkeypatch) -> None:
+        """End-to-end through run(): a spoofed host in the result set is
+        dropped; only the genuine EC host survives into the output."""
+        from web_agent.builtin_skills import ec_europa_document_search as ec
+        from web_agent.models import AgentResult, ExtractionResult, SearchResponse
+
+        real = ExtractionResult(
+            url="https://ec.europa.eu/info/real",
+            title="Real EC doc",
+            content="body",
+            extraction_method="trafilatura",
+        )
+        spoof = ExtractionResult(
+            url="https://ec.europa.eu.evil.com/fake",
+            title="Spoofed",
+            content="evil",
+            extraction_method="trafilatura",
+        )
+
+        agent = MagicMock()
+        agent.search_and_extract = AsyncMock(
+            return_value=AgentResult(
+                query="q", search=SearchResponse(query="q"), pages=[spoof, real]
+            )
+        )
+
+        out = await ec.run(agent, "https://ec.europa.eu", {"query": "policy"})
+        import json as _json
+
+        docs = _json.loads(out["documents"])
+        urls = [d["url"] for d in docs]
+        assert "https://ec.europa.eu/info/real" in urls
+        assert "https://ec.europa.eu.evil.com/fake" not in urls
+        assert out["count"] == "1"
