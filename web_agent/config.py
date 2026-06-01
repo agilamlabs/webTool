@@ -20,6 +20,7 @@ Supports three configuration methods (in priority order):
 from __future__ import annotations
 
 import ipaddress
+import socket
 from pathlib import Path
 from typing import Any, Literal, Optional
 from urllib.parse import urlparse
@@ -38,6 +39,17 @@ def _is_loopback_host(host: str | None) -> bool:
     else is the strict default we want for the ``remote_cdp_url`` gate;
     DNS-resolving private addresses (10/8, 192.168/16, etc.) is NOT
     loopback and remote_cdp must not accept them.
+
+    v1.6.16 (review CO-8): obfuscated IPv4 loopback literals that the
+    C resolver / Chromium happily dial -- octal ``0177.0.0.1``, decimal
+    ``2130706433``, hex ``0x7f.0.0.1``, short-form ``127.1`` -- are
+    rejected by ``ipaddress.ip_address`` but accepted by ``inet_aton``.
+    The SSRF gate (``utils.is_private_address``) already normalises them
+    through ``inet_aton``; reuse the SAME normalisation here so a remote
+    CDP URL that points at loopback via an obfuscated literal is
+    classified as loopback consistently (it would otherwise be rejected
+    by the gate as "not loopback", which is the safe direction but
+    diverges from how the rest of the toolkit treats these literals).
     """
     if not host:
         return False
@@ -48,9 +60,21 @@ def _is_loopback_host(host: str | None) -> bool:
     h = host.strip("[]")
     try:
         ip = ipaddress.ip_address(h)
+        return bool(ip.is_loopback)
+    except ValueError:
+        pass
+    # v1.6.16 (review CO-8): normalise obfuscated IPv4 literals through
+    # ``inet_aton`` (octal / decimal / hex / short-form), mirroring the
+    # ``is_private_address`` path. ``inet_aton`` raises OSError for real
+    # hostnames, so this branch only fires for numeric forms.
+    try:
+        normalized = socket.inet_ntoa(socket.inet_aton(h))
+    except OSError:
+        return False
+    try:
+        return bool(ipaddress.ip_address(normalized).is_loopback)
     except ValueError:
         return False
-    return bool(ip.is_loopback)
 
 
 def _normalize_domain_patterns(value: Any) -> Any:
@@ -79,6 +103,18 @@ def _normalize_domain_patterns(value: Any) -> Any:
             if sep in s:
                 s = s.split(sep, 1)[0]
         s = s.strip().lstrip(".")
+        # v1.6.16 (review CO-2): strip the port and IPv6 brackets the SAME
+        # way the match-time comparator does. ``check_domain_allowed`` ->
+        # ``utils._normalize_host`` runs ``urlparse(url).hostname``, which
+        # is port-stripped and bracket-stripped. Without mirroring that
+        # here, a natural deny entry like ``evil.com:8443`` or ``[::1]``
+        # would keep its port/brackets and silently never match the bare
+        # host the comparator produces (fail-open). Feed a synthetic
+        # ``//host`` through urlparse so .hostname applies the identical
+        # normalisation (lowercases, drops the port, unwraps ``[...]``).
+        if s:
+            hostname = urlparse(f"//{s}").hostname
+            s = (hostname or s).strip().lstrip(".")
         if s:
             out.append(s)
     return out
@@ -103,10 +139,19 @@ class BrowserConfig(BaseSettings):
     """
 
     headless: bool = True
-    slow_mo: int = 0
-    default_timeout: int = 30000
-    navigation_timeout: int = 45000
-    max_contexts: int = 3
+    # v1.6.16 (review CO-7): throughput/timeout ints. ``slow_mo`` and the
+    # timeouts are milliseconds and must not go negative (a negative
+    # Playwright timeout is undefined behaviour); ``ge=0`` allows the
+    # documented "0 = no artificial delay / use Playwright default" sentinel.
+    slow_mo: int = Field(default=0, ge=0)
+    default_timeout: int = Field(default=30000, ge=0)
+    navigation_timeout: int = Field(default=45000, ge=0)
+    # v1.6.16 (review CO-3): ``max_contexts`` feeds
+    # ``asyncio.Semaphore(max_contexts)`` in BrowserManager. ``0`` builds a
+    # zero-permit semaphore that deadlocks every ephemeral fetch forever;
+    # a negative value raises a deep asyncio ValueError at construction.
+    # ``ge=1`` turns both into a clean pydantic ConfigError at config time.
+    max_contexts: int = Field(default=3, ge=1)
     # v1.6.14 C-4: cap on concurrent ``ctx.new_page()`` calls inside a
     # single :meth:`WebFetcher.fetch_many` invocation when a
     # ``session_id`` is supplied. The ephemeral path (no session_id) is
@@ -141,8 +186,10 @@ class BrowserConfig(BaseSettings):
             "are set, ``profile_dir`` wins."
         ),
     )
-    viewport_width: int = 1920
-    viewport_height: int = 1080
+    # v1.6.16 (review CO-7): a viewport dimension <= 0 is rejected by
+    # Chromium at launch; surface it as a clean config error instead.
+    viewport_width: int = Field(default=1920, gt=0)
+    viewport_height: int = Field(default=1080, gt=0)
 
     # --- v1.6.6: Isolation profile launcher -----------------------------
     isolation_mode: bool = Field(
@@ -467,6 +514,16 @@ class BrowserConfig(BaseSettings):
 
         return self
 
+    # v1.6.16 (review CO-1): scope env-var lookup to the WEB_AGENT_BROWSER__
+    # namespace AppConfig already uses for nesting. Without this, a
+    # standalone ``BrowserConfig()`` -- and, because AppConfig builds every
+    # sub-config via ``default_factory``, even a default ``AppConfig()`` --
+    # would read BARE unprefixed env vars (e.g. ``HEADLESS``), letting a
+    # stray shell/CI var silently flip settings. Mirrors the
+    # SkillsConfig/WorkspaceConfig fix (review I-2). The nested
+    # ``WEB_AGENT_BROWSER__<FIELD>`` path via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_BROWSER__"}
+
 
 class SearchConfig(BaseSettings):
     """Web search parameters and multi-provider chain configuration.
@@ -486,7 +543,10 @@ class SearchConfig(BaseSettings):
     To skip Playwright entirely: ``providers=["searxng", "ddgs"]``.
     """
 
-    max_results: int = 10
+    # v1.6.16 (review CO-7): ``max_results`` flows into provider slices and
+    # Google's ``num=`` query param. A value <= 0 silently yields no results
+    # (and a negative value is a nonsensical slice bound). Require >= 1.
+    max_results: int = Field(default=10, ge=1)
     search_url: str = "https://www.google.com/search"
     language: str = "en"
     region: str = "us"
@@ -519,8 +579,19 @@ class SearchConfig(BaseSettings):
     )
     searxng_timeout: float = Field(
         default=10.0,
-        description="HTTP timeout (seconds) for SearXNG JSON API calls.",
+        gt=0,
+        description=(
+            "HTTP timeout (seconds) for SearXNG JSON API calls. v1.6.16 "
+            "(review CO-7): must be > 0 -- a zero/negative timeout is "
+            "rejected by httpx / disables the timeout."
+        ),
     )
+
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_SEARCH__ so a
+    # bare ``REGION`` / ``LANGUAGE`` / ``MAX_RESULTS`` env var can't override
+    # search settings. Nested ``WEB_AGENT_SEARCH__<FIELD>`` via AppConfig
+    # still works.
+    model_config = {"env_prefix": "WEB_AGENT_SEARCH__"}
 
 
 class FetchConfig(BaseSettings):
@@ -562,43 +633,74 @@ class FetchConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_retry_policy(self) -> FetchConfig:
-        """Apply named retry policy unless user explicitly set numeric fields."""
-        # Default policy values (matches BALANCED). If any numeric retry field
-        # was explicitly set to something different, that means the user
-        # provided it -- skip policy application to preserve their choice.
+        """Layer an explicit numeric override on top of the NAMED policy.
+
+        v1.6.16 (review CO-5): the previous implementation was all-or-
+        nothing -- setting ANY one numeric retry field skipped the entire
+        policy block, so the OTHER two silently kept their class-level
+        defaults (1.0 / 30.0), which equal BALANCED and NOT the requested
+        policy. ``FetchConfig(retry_policy='paranoid', max_retries=9)`` thus
+        produced paranoid's retry COUNT but balanced's BACKOFF -- the
+        opposite of the 'paranoid' intent. Fix: resolve the named policy as
+        the baseline, then overlay ONLY the numeric fields the caller
+        explicitly set, so 'paranoid + my max_retries' = paranoid delays
+        with the caller's retry count.
+        """
+        if self.retry_policy == "balanced":
+            # BALANCED equals the class-level defaults, so there is nothing
+            # to layer -- any user-set field already holds the intended
+            # value and unset fields already hold the balanced default.
+            return self
+
         explicit = self.model_fields_set
-        numeric_keys = {"max_retries", "retry_base_delay", "retry_max_delay"}
-        user_set_numeric = bool(explicit & numeric_keys)
 
-        if not user_set_numeric and self.retry_policy != "balanced":
-            # Lazy import to avoid circular dep
-            from .exceptions import ConfigError
-            from .utils import get_retry_policy
+        # Lazy import to avoid circular dep
+        from .exceptions import ConfigError
+        from .utils import get_retry_policy
 
-            try:
-                kwargs = get_retry_policy(self.retry_policy)
-            except ValueError as exc:
-                # v1.6.14 (review D-5): surface a typed ConfigError (matching
-                # the other config validators) instead of the bare ValueError
-                # ``get_retry_policy`` raises. The Literal field (D-8) should
-                # already block unknown values, so this is defense-in-depth
-                # against a future widening of the field.
-                raise ConfigError(
-                    f"FetchConfig.retry_policy={self.retry_policy!r} is not a "
-                    "valid retry policy. Choose from: 'fast', 'balanced', "
-                    "'paranoid'."
-                ) from exc
+        try:
+            kwargs = get_retry_policy(self.retry_policy)
+        except ValueError as exc:
+            # v1.6.14 (review D-5): surface a typed ConfigError (matching
+            # the other config validators) instead of the bare ValueError
+            # ``get_retry_policy`` raises. The Literal field (D-8) should
+            # already block unknown values, so this is defense-in-depth
+            # against a future widening of the field.
+            raise ConfigError(
+                f"FetchConfig.retry_policy={self.retry_policy!r} is not a "
+                "valid retry policy. Choose from: 'fast', 'balanced', "
+                "'paranoid'."
+            ) from exc
+
+        # Apply the named policy's value for every numeric field the caller
+        # did NOT explicitly set; leave caller-set fields untouched.
+        if "max_retries" not in explicit:
             self.max_retries = int(kwargs["max_retries"])
+        if "retry_base_delay" not in explicit:
             self.retry_base_delay = float(kwargs["base_delay"])
+        if "retry_max_delay" not in explicit:
             self.retry_max_delay = float(kwargs["max_delay"])
         return self
+
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_FETCH__ so a
+    # bare ``MAX_RETRIES`` / ``WAIT_UNTIL`` env var can't override fetch
+    # settings. Nested ``WEB_AGENT_FETCH__<FIELD>`` via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_FETCH__"}
 
 
 class DownloadConfig(BaseSettings):
     """File download settings including size limits and allowed types."""
 
     download_dir: str = "./downloads"
-    max_file_size_mb: int = 100
+    # v1.6.16 (review CO-4): the streaming downloader computes
+    # ``max_bytes = max_file_size_mb * 1024 * 1024`` raw (downloader.py).
+    # A negative or zero value makes ``max_bytes`` <= 0, so the chunk guard
+    # ``total + len(chunk) > max_bytes`` trips on the first byte and every
+    # download is aborted (and the post-save guard deletes every file as
+    # "oversize"). ``ge=1`` (the field is in MiB) rejects that at config
+    # time. ``web_fetcher.py`` had a ``max(1, ...)`` band-aid at one call
+    # site only; this is the single source of truth.
+    max_file_size_mb: int = Field(default=100, ge=1)
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [
             ".pdf",
@@ -626,6 +728,12 @@ class DownloadConfig(BaseSettings):
         ]
     )
 
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_DOWNLOAD__ so
+    # a bare ``MAX_FILE_SIZE_MB`` / ``DOWNLOAD_DIR`` / ``ALLOWED_EXTENSIONS``
+    # env var can't override download settings. Nested
+    # ``WEB_AGENT_DOWNLOAD__<FIELD>`` via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_DOWNLOAD__"}
+
 
 class ExtractionConfig(BaseSettings):
     """Content extraction settings for the trafilatura/BS4/raw fallback chain."""
@@ -635,24 +743,46 @@ class ExtractionConfig(BaseSettings):
     include_tables: bool = True
     include_links: bool = False
     include_comments: bool = False
-    min_content_length: int = 50
+    # v1.6.16 (review CO-7): minimum extracted-content length threshold in
+    # chars. A negative threshold is meaningless (every result passes);
+    # ``ge=0`` keeps the "accept any non-empty content" sentinel (0) valid.
+    min_content_length: int = Field(default=50, ge=0)
+
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_EXTRACTION__
+    # so bare ``INCLUDE_TABLES`` / ``FAVOR_RECALL`` env vars can't override
+    # extraction settings. Nested ``WEB_AGENT_EXTRACTION__<FIELD>`` via
+    # AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_EXTRACTION__"}
 
 
 class AutomationConfig(BaseSettings):
     """Browser automation action settings."""
 
-    default_action_timeout: int = 10000
+    # v1.6.16 (review CO-7): action timeout in ms; a negative timeout is
+    # undefined behaviour in Playwright. ``ge=0`` keeps the "0 = no timeout"
+    # sentinel valid.
+    default_action_timeout: int = Field(default=10000, ge=0)
     screenshot_dir: str = "./screenshots"
     screenshot_format: str = "png"
-    screenshot_quality: int = 80
+    # v1.6.16 (review CO-7): JPEG quality is a 0-100 percentage (ignored for
+    # PNG). Constrain to that range so an out-of-band value can't reach
+    # Playwright's ``page.screenshot(quality=...)``.
+    screenshot_quality: int = Field(default=80, ge=0, le=100)
     stop_on_error: bool = True
-    slow_mo_actions: int = 0
+    # v1.6.16 (review CO-7): per-action slow-mo delay in ms; never negative.
+    slow_mo_actions: int = Field(default=0, ge=0)
     # v1.6.6: when False (default), session-owned ``execute_sequence`` calls
     # reuse the session's current tab (preserving scroll / viewport / cookies
     # across calls). Set True to restore v1.6.5 behavior where each
     # ``interact(url, ...)`` call against the same session_id opens a fresh
     # page within the session's BrowserContext.
     fresh_tab_per_call: bool = False
+
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_AUTOMATION__
+    # so bare ``SCREENSHOT_DIR`` / ``STOP_ON_ERROR`` env vars can't override
+    # automation settings. Nested ``WEB_AGENT_AUTOMATION__<FIELD>`` via
+    # AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_AUTOMATION__"}
 
 
 class SafetyConfig(BaseSettings):
@@ -808,6 +938,17 @@ class SafetyConfig(BaseSettings):
             self.coordinate_click_unknown_policy = "block"
         return self
 
+    # v1.6.16 (review CO-1): THE scariest case in the report. Without an
+    # explicit prefix, a default ``AppConfig()`` (the documented
+    # ``async with Agent() as agent:`` path) builds SafetyConfig via
+    # ``default_factory``, which then reads BARE env vars: a stray
+    # ``BLOCK_PRIVATE_IPS=false`` silently disabled SSRF protection and
+    # ``ALLOW_UPLOAD_OUTSIDE_DOWNLOAD_DIR=true`` dropped the file-exfil
+    # fence -- no error, no log. Scope lookup to the WEB_AGENT_SAFETY__
+    # namespace AppConfig already uses for nesting; the nested
+    # ``WEB_AGENT_SAFETY__<FIELD>`` path via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_SAFETY__"}
+
 
 class DebugConfig(BaseSettings):
     """Auto-capture HTML/screenshot/error context on failures for debugging.
@@ -821,7 +962,13 @@ class DebugConfig(BaseSettings):
     debug_dir: str = "./debug"
     capture_html: bool = True
     capture_screenshot: bool = True
-    max_artifacts_per_call: int = 5
+    # v1.6.16 (review CO-7): per-call artifact cap; never negative.
+    max_artifacts_per_call: int = Field(default=5, ge=0)
+
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_DEBUG__ so a
+    # bare ``ENABLED`` / ``DEBUG_DIR`` env var can't override debug settings.
+    # Nested ``WEB_AGENT_DEBUG__<FIELD>`` via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_DEBUG__"}
 
 
 class AuditConfig(BaseSettings):
@@ -834,6 +981,11 @@ class AuditConfig(BaseSettings):
 
     enabled: bool = False
     audit_log_path: str = "./audit.jsonl"
+
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_AUDIT__ so a
+    # bare ``ENABLED`` env var can't silently enable/disable the audit log.
+    # Nested ``WEB_AGENT_AUDIT__<FIELD>`` via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_AUDIT__"}
 
 
 class CacheConfig(BaseSettings):
@@ -852,8 +1004,16 @@ class CacheConfig(BaseSettings):
 
     enabled: bool = False
     cache_dir: str = "./cache"
-    ttl_seconds: float = 3600.0
-    max_cache_mb: int = 100
+    # v1.6.16 (review CO-7): TTL seconds must be positive; max cache size in
+    # MiB must be >= 1 (a non-positive cap would evict everything / make the
+    # cache unusable).
+    ttl_seconds: float = Field(default=3600.0, gt=0)
+    max_cache_mb: int = Field(default=100, ge=1)
+
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_CACHE__ so a
+    # bare ``ENABLED`` / ``CACHE_DIR`` env var can't override cache settings.
+    # Nested ``WEB_AGENT_CACHE__<FIELD>`` via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_CACHE__"}
 
 
 class SkillsConfig(BaseSettings):
@@ -999,6 +1159,15 @@ class WorkspaceConfig(BaseSettings):
         ),
     )
 
+    # v1.6.16 (review CO-1): a prior pass renamed ``path`` -> ``workspace_dir``
+    # to dodge the always-set ``PATH`` env var, but the other fields still
+    # read BARE env vars -- e.g. a stray ``EXECUTE_HELPERS=true`` would
+    # silently enable Python-helper execution on a default ``AppConfig()``.
+    # Scope lookup to the WEB_AGENT_WORKSPACE__ namespace AppConfig uses for
+    # nesting, matching the other sub-configs. Nested
+    # ``WEB_AGENT_WORKSPACE__<FIELD>`` via AppConfig still works.
+    model_config = {"env_prefix": "WEB_AGENT_WORKSPACE__"}
+
 
 class DiagnosticsConfig(BaseSettings):
     """v1.6.8: Network capture, download-intent capture, post-action
@@ -1130,6 +1299,12 @@ class DiagnosticsConfig(BaseSettings):
         ),
     )
 
+    # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_DIAGNOSTICS__
+    # so bare env vars can't override diagnostics settings. Nested
+    # ``WEB_AGENT_DIAGNOSTICS__<FIELD>`` via AppConfig still works (see
+    # tests/test_v168_diagnostics_config.py).
+    model_config = {"env_prefix": "WEB_AGENT_DIAGNOSTICS__"}
+
 
 class AppConfig(BaseSettings):
     """Top-level configuration for the web_agent toolkit.
@@ -1210,12 +1385,20 @@ class AppConfig(BaseSettings):
     @model_validator(mode="after")
     def _resolve_paths(self) -> AppConfig:
         """Resolve relative paths against base_dir to produce absolute paths."""
+        # v1.6.16 (review CO-9): use the cross-platform absolute-path
+        # predicate the rest of the toolkit uses (``safe_join_path`` etc.)
+        # instead of ``Path.is_absolute()``, which is host-OS dependent --
+        # on a Linux host ``PurePosixPath('C:/x').is_absolute()`` is False,
+        # so a Windows-rooted config path would be wrongly joined under
+        # base_dir. ``_is_cross_platform_absolute`` recognises POSIX,
+        # Windows-drive, and UNC absolutes regardless of the running OS.
+        from .utils import _is_cross_platform_absolute
+
         base = Path(self.base_dir).resolve()
 
         def _resolve(p: str) -> str:
-            path = Path(p)
-            if not path.is_absolute():
-                return str(base / path)
+            if not _is_cross_platform_absolute(p):
+                return str(base / Path(p))
             return p
 
         self.output_dir = _resolve(self.output_dir)

@@ -25,14 +25,37 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import pydantic
 import pytest
 from web_agent import robots as robots_module
 from web_agent import utils
-from web_agent.config import AppConfig, DownloadConfig, SafetyConfig
+from web_agent.config import (
+    AppConfig,
+    AutomationConfig,
+    BrowserConfig,
+    DownloadConfig,
+    ExtractionConfig,
+    FetchConfig,
+    SafetyConfig,
+    SearchConfig,
+    WorkspaceConfig,
+    _is_loopback_host,
+)
 from web_agent.exceptions import DomainNotAllowedError, NavigationError
-from web_agent.models import FetchStatus
+from web_agent.models import (
+    FetchResult,
+    FetchStatus,
+    KeyboardInput,
+    ScreenshotInput,
+    ScrollInput,
+)
 from web_agent.robots import RobotsChecker
-from web_agent.utils import check_domain_allowed, httpx_peer_ip, is_private_address
+from web_agent.utils import (
+    _matches_domain,
+    check_domain_allowed,
+    httpx_peer_ip,
+    is_private_address,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -749,3 +772,358 @@ class TestRobots3FirstLookupFetchesRegardlessOfUptime:
         # Within TTL -> served from cache, no second fetch.
         await rc.is_allowed("https://example.com/b")
         assert calls["n"] == 1
+
+
+# ===========================================================================
+# Config / validation cluster (CO-1..CO-9, BR-3, BR-4, MO-1)
+# ===========================================================================
+#
+# Finding -> test map:
+#   CO-1 : bare unprefixed env vars do NOT disable fences on AppConfig();
+#          correctly-prefixed nested vars still work.
+#   CO-2 : deny-list entries with port / IPv6 brackets actually match.
+#   CO-3 : max_contexts=0 (and negative) rejected.
+#   CO-4 : negative / zero max_file_size_mb rejected.
+#   CO-5 : partial retry override keeps the NAMED policy's other delays.
+#   CO-7 : assorted security/throughput ints reject negative/zero.
+#   CO-8 : _is_loopback_host recognises obfuscated loopback literals.
+#   CO-9 : _resolve_paths uses the cross-platform absolute predicate.
+#   BR-3 : KeyboardInput.repeat out-of-range rejected; in-range accepted.
+#   BR-4 : ScrollInput.infinite_scroll_max out-of-range rejected.
+#   MO-1 : FetchResult html/binary mutual-exclusivity; quality range.
+
+
+# ---------------------------------------------------------------------------
+# CO-1: bare env vars must NOT flip security fences; nested vars still work
+# ---------------------------------------------------------------------------
+class TestCO1EnvPrefixIsolation:
+    def test_bare_block_private_ips_does_not_disable_fence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The scariest case in the report: a stray bare env var must not
+        # silently disable SSRF protection on the documented default path.
+        monkeypatch.setenv("BLOCK_PRIVATE_IPS", "false")
+        assert AppConfig().safety.block_private_ips is True
+        # standalone instantiation is equally protected.
+        assert SafetyConfig().block_private_ips is True
+
+    def test_bare_allow_upload_outside_download_dir_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ALLOW_UPLOAD_OUTSIDE_DOWNLOAD_DIR", "true")
+        assert AppConfig().safety.allow_upload_outside_download_dir is False
+
+    def test_bare_headless_and_safe_mode_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HEADLESS", "false")
+        monkeypatch.setenv("SAFE_MODE", "true")
+        cfg = AppConfig()
+        assert cfg.browser.headless is True
+        assert cfg.safety.safe_mode is False
+
+    def test_bare_execute_helpers_does_not_enable_python(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # WorkspaceConfig dodged the PATH foot-gun via a field rename but
+        # still read other bare vars: a stray EXECUTE_HELPERS=true would
+        # silently enable Python-helper execution on a default AppConfig().
+        # (NB: we deliberately do not set a bare ``ENABLED`` here -- that
+        # name collides with SkillsConfig's deprecated ``enabled`` alias,
+        # an orthogonal concern. EXECUTE_HELPERS is the WorkspaceConfig-
+        # specific security knob this fix is about.)
+        monkeypatch.setenv("EXECUTE_HELPERS", "true")
+        cfg = AppConfig()
+        assert cfg.workspace.execute_helpers is False
+        # standalone instantiation is equally protected.
+        assert WorkspaceConfig().execute_helpers is False
+
+    def test_nested_prefixed_workspace_var_still_works(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WEB_AGENT_WORKSPACE__EXECUTE_HELPERS", "true")
+        assert AppConfig().workspace.execute_helpers is True
+
+    def test_nested_prefixed_safety_var_still_works(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The correctly-namespaced nested var MUST still take effect via
+        # AppConfig's env_nested_delimiter path.
+        monkeypatch.setenv("WEB_AGENT_SAFETY__BLOCK_PRIVATE_IPS", "false")
+        assert AppConfig().safety.block_private_ips is False
+
+    def test_nested_prefixed_vars_across_sections(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WEB_AGENT_BROWSER__HEADLESS", "false")
+        monkeypatch.setenv("WEB_AGENT_DOWNLOAD__MAX_FILE_SIZE_MB", "7")
+        monkeypatch.setenv("WEB_AGENT_DIAGNOSTICS__CAPTURE_NETWORK", "true")
+        monkeypatch.setenv("WEB_AGENT_LOG_LEVEL", "DEBUG")
+        cfg = AppConfig()
+        assert cfg.browser.headless is False
+        assert cfg.download.max_file_size_mb == 7
+        assert cfg.diagnostics.capture_network is True
+        assert cfg.log_level == "DEBUG"
+
+    def test_standalone_subconfig_reads_its_own_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A standalone sub-config reads ONLY its WEB_AGENT_<SECTION>__ vars.
+        monkeypatch.setenv("WEB_AGENT_SAFETY__ALLOW_DOWNLOADS", "false")
+        assert SafetyConfig().allow_downloads is False
+        # ...and ignores the bare name.
+        monkeypatch.delenv("WEB_AGENT_SAFETY__ALLOW_DOWNLOADS", raising=False)
+        monkeypatch.setenv("ALLOW_DOWNLOADS", "false")
+        assert SafetyConfig().allow_downloads is True
+
+
+# ---------------------------------------------------------------------------
+# CO-2: deny-list entries with port / IPv6 brackets must actually match
+# ---------------------------------------------------------------------------
+class TestCO2DenyListPortAndBracketNormalization:
+    @pytest.mark.parametrize(
+        "raw, host",
+        [
+            ("evil.com:8443", "evil.com"),
+            ("[::1]", "::1"),
+            ("http://[2001:db8::1]:9999/x", "2001:db8::1"),
+            ("localhost:8888", "localhost"),
+            ("internal.svc:8080", "internal.svc"),
+        ],
+    )
+    def test_denied_entry_matches_bare_host(self, raw: str, host: str) -> None:
+        cfg = SafetyConfig(denied_domains=[raw])
+        # exactly one normalized pattern, and it matches the bare host the
+        # match-time comparator (_normalize_host) produces.
+        assert len(cfg.denied_domains) == 1
+        assert _matches_domain(host, cfg.denied_domains[0]) is True
+
+    def test_subdomain_of_ported_deny_entry_matches(self) -> None:
+        cfg = SafetyConfig(denied_domains=["evil.com:8443"])
+        assert _matches_domain("api.evil.com", cfg.denied_domains[0]) is True
+
+    def test_allowed_entry_with_port_normalized_too(self) -> None:
+        cfg = SafetyConfig(allowed_domains=["good.com:443"])
+        assert cfg.allowed_domains == ["good.com"]
+
+
+# ---------------------------------------------------------------------------
+# CO-3: max_contexts lower bound
+# ---------------------------------------------------------------------------
+class TestCO3MaxContextsLowerBound:
+    @pytest.mark.parametrize("bad", [0, -1, -5])
+    def test_non_positive_rejected(self, bad: int) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            BrowserConfig(max_contexts=bad)
+
+    def test_one_accepted(self) -> None:
+        assert BrowserConfig(max_contexts=1).max_contexts == 1
+
+
+# ---------------------------------------------------------------------------
+# CO-4: max_file_size_mb lower bound
+# ---------------------------------------------------------------------------
+class TestCO4MaxFileSizeLowerBound:
+    @pytest.mark.parametrize("bad", [0, -1, -100])
+    def test_non_positive_rejected(self, bad: int) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            DownloadConfig(max_file_size_mb=bad)
+
+    def test_one_mb_accepted(self) -> None:
+        assert DownloadConfig(max_file_size_mb=1).max_file_size_mb == 1
+
+
+# ---------------------------------------------------------------------------
+# CO-5: partial retry override keeps the NAMED policy's other delays
+# ---------------------------------------------------------------------------
+class TestCO5RetryPolicyPartialOverride:
+    def test_paranoid_plus_max_retries_keeps_paranoid_delays(self) -> None:
+        # paranoid = 5 / 2.0 / 60.0; overriding only max_retries must keep
+        # paranoid's base/max delays (NOT balanced's 1.0/30.0).
+        f = FetchConfig(retry_policy="paranoid", max_retries=9)
+        assert f.max_retries == 9
+        assert f.retry_base_delay == 2.0
+        assert f.retry_max_delay == 60.0
+
+    def test_fast_plus_base_delay_keeps_fast_other_fields(self) -> None:
+        # fast = 1 / 0.5 / 5.0; overriding only base_delay keeps fast's
+        # max_retries and max_delay.
+        f = FetchConfig(retry_policy="fast", retry_base_delay=0.1)
+        assert f.max_retries == 1
+        assert f.retry_base_delay == 0.1
+        assert f.retry_max_delay == 5.0
+
+    def test_full_named_policy_applied_when_no_override(self) -> None:
+        f = FetchConfig(retry_policy="paranoid")
+        assert (f.max_retries, f.retry_base_delay, f.retry_max_delay) == (5, 2.0, 60.0)
+
+    def test_balanced_with_partial_override_keeps_balanced_defaults(self) -> None:
+        f = FetchConfig(retry_policy="balanced", max_retries=7)
+        assert (f.max_retries, f.retry_base_delay, f.retry_max_delay) == (7, 1.0, 30.0)
+
+    def test_all_three_overridden_under_named_policy(self) -> None:
+        f = FetchConfig(
+            retry_policy="paranoid",
+            max_retries=2,
+            retry_base_delay=0.25,
+            retry_max_delay=3.0,
+        )
+        assert (f.max_retries, f.retry_base_delay, f.retry_max_delay) == (2, 0.25, 3.0)
+
+
+# ---------------------------------------------------------------------------
+# CO-7: assorted security/throughput int lower bounds
+# ---------------------------------------------------------------------------
+class TestCO7IntLowerBounds:
+    def test_search_max_results_rejects_non_positive(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            SearchConfig(max_results=0)
+
+    def test_search_timeout_rejects_non_positive(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            SearchConfig(searxng_timeout=0)
+
+    def test_browser_viewport_rejects_non_positive(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            BrowserConfig(viewport_width=0)
+        with pytest.raises(pydantic.ValidationError):
+            BrowserConfig(viewport_height=-1)
+
+    def test_browser_timeouts_reject_negative(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            BrowserConfig(default_timeout=-1)
+        with pytest.raises(pydantic.ValidationError):
+            BrowserConfig(slow_mo=-1)
+
+    def test_extraction_min_content_length_rejects_negative(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            ExtractionConfig(min_content_length=-1)
+        # zero remains a valid "accept any non-empty content" sentinel.
+        assert ExtractionConfig(min_content_length=0).min_content_length == 0
+
+    def test_automation_screenshot_quality_range(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            AutomationConfig(screenshot_quality=101)
+        with pytest.raises(pydantic.ValidationError):
+            AutomationConfig(screenshot_quality=-1)
+        assert AutomationConfig(screenshot_quality=100).screenshot_quality == 100
+
+
+# ---------------------------------------------------------------------------
+# CO-8: _is_loopback_host recognises obfuscated loopback literals
+# ---------------------------------------------------------------------------
+class TestCO8LoopbackObfuscatedLiterals:
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.255.255.254",
+            "::1",
+            "[::1]",
+            "localhost",
+            "2130706433",  # decimal 127.0.0.1
+            "0177.0.0.1",  # octal first octet
+            "0x7f.0.0.1",  # hex first octet
+            "127.1",  # short-form
+        ],
+    )
+    def test_loopback_literals_recognised(self, host: str) -> None:
+        assert _is_loopback_host(host) is True
+
+    @pytest.mark.parametrize(
+        "host",
+        ["8.8.8.8", "10.0.0.1", "169.254.169.254", "example.com", "", None],
+    )
+    def test_non_loopback_rejected(self, host: str | None) -> None:
+        assert _is_loopback_host(host) is False
+
+
+# ---------------------------------------------------------------------------
+# CO-9: _resolve_paths uses the cross-platform absolute predicate
+# ---------------------------------------------------------------------------
+class TestCO9CrossPlatformAbsolutePaths:
+    def test_windows_absolute_output_dir_not_rejoined(self) -> None:
+        # A Windows drive-rooted absolute path must be treated as absolute
+        # regardless of the host OS (Path.is_absolute() would miss it on
+        # POSIX), so it is NOT re-joined under base_dir.
+        cfg = AppConfig(base_dir="/tmp/base", output_dir="C:/abs/out")
+        assert cfg.output_dir == "C:/abs/out"
+
+    def test_unc_path_not_rejoined(self) -> None:
+        cfg = AppConfig(base_dir="/tmp/base", output_dir=r"\\server\share\out")
+        assert cfg.output_dir == r"\\server\share\out"
+
+    def test_relative_path_still_resolved_under_base(self) -> None:
+        cfg = AppConfig(base_dir="/tmp/base", download=DownloadConfig(download_dir="rel/dl"))
+        # Resolved to an absolute path anchored at the resolved base_dir.
+        assert cfg.download.download_dir.endswith(str(Path("rel") / "dl"))
+        assert Path(cfg.download.download_dir).is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# BR-3: KeyboardInput.repeat bounds
+# ---------------------------------------------------------------------------
+class TestBR3KeyboardRepeatBounds:
+    @pytest.mark.parametrize("bad", [0, -1, 101, 100_000_000])
+    def test_out_of_range_rejected(self, bad: int) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            KeyboardInput(key="Enter", repeat=bad)
+
+    @pytest.mark.parametrize("ok", [1, 50, 100])
+    def test_in_range_accepted(self, ok: int) -> None:
+        assert KeyboardInput(key="Enter", repeat=ok).repeat == ok
+
+    def test_default_is_one(self) -> None:
+        assert KeyboardInput(key="Enter").repeat == 1
+
+
+# ---------------------------------------------------------------------------
+# BR-4: ScrollInput.infinite_scroll_max bounds
+# ---------------------------------------------------------------------------
+class TestBR4InfiniteScrollMaxBounds:
+    @pytest.mark.parametrize("bad", [0, -1, 1001, 10_000_000])
+    def test_out_of_range_rejected(self, bad: int) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            ScrollInput(infinite_scroll_max=bad)
+
+    @pytest.mark.parametrize("ok", [1, 10, 1000])
+    def test_in_range_accepted(self, ok: int) -> None:
+        assert ScrollInput(infinite_scroll_max=ok).infinite_scroll_max == ok
+
+    def test_negative_delay_rejected(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            ScrollInput(infinite_scroll_delay_ms=-1)
+
+
+# ---------------------------------------------------------------------------
+# MO-1: FetchResult html/binary exclusivity + ScreenshotInput.quality range
+# ---------------------------------------------------------------------------
+class TestMO1ModelInvariants:
+    def test_html_only_accepted(self) -> None:
+        fr = FetchResult(url="u", final_url="u", status=FetchStatus.SUCCESS, html="<p>")
+        assert fr.html is not None and fr.binary is None
+
+    def test_binary_only_accepted(self) -> None:
+        fr = FetchResult(url="u", final_url="u", status=FetchStatus.SUCCESS, binary=b"PDF")
+        assert fr.binary is not None and fr.html is None
+
+    def test_both_none_accepted_for_blocked(self) -> None:
+        fr = FetchResult(url="u", final_url="u", status=FetchStatus.BLOCKED)
+        assert fr.html is None and fr.binary is None
+
+    def test_both_set_rejected(self) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            FetchResult(
+                url="u",
+                final_url="u",
+                status=FetchStatus.SUCCESS,
+                html="<p>",
+                binary=b"PDF",
+            )
+
+    @pytest.mark.parametrize("bad", [-1, 101, 200])
+    def test_screenshot_quality_out_of_range_rejected(self, bad: int) -> None:
+        with pytest.raises(pydantic.ValidationError):
+            ScreenshotInput(quality=bad)
+
+    @pytest.mark.parametrize("ok", [0, 50, 100])
+    def test_screenshot_quality_in_range_accepted(self, ok: int) -> None:
+        assert ScreenshotInput(quality=ok).quality == ok
+
+    def test_screenshot_quality_none_default(self) -> None:
+        assert ScreenshotInput().quality is None
