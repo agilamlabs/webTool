@@ -538,3 +538,90 @@ class TestAG4SaveResultsFilenameSafety:
         path = await agent.save_results(self._result_obj("Quarterly Report 2025"))
         assert path.name == "Quarterly_Report_2025.json"
         assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Cluster C advisories (folded into v1.6.16):
+#   BR-2 : _NoCloseContextProxy can be a WeakKeyDictionary key (__weakref__).
+#   SP-1 : private-IP result URLs dropped for EVERY provider at the
+#          SearchEngine choke point (_result_host_is_private helper).
+#   SE-1 : a search cache hit does NOT mutate the dict the backend returned.
+#   EC-2 : a negative/garbage max_results falls back to the default (not 1).
+#   DS-1 : float skill inputs reject NaN / +-inf.
+#   BR-3 / SM-2 / BR-4 : verified by inspection (route-teardown suppress; UA
+#          probe moved outside the session lock; close() no-op is the proxy's
+#          documented, DEBUG-logged purpose -> left as-is).
+# ---------------------------------------------------------------------------
+class TestBR2ProxyWeakReferenceable:
+    def test_proxy_can_be_weakkeydict_key(self) -> None:
+        import weakref
+
+        from web_agent.browser_manager import _NoCloseContextProxy
+
+        proxy = _NoCloseContextProxy(MagicMock())
+        wkd = weakref.WeakKeyDictionary()
+        # Without __weakref__ in __slots__ this raises TypeError.
+        wkd[proxy] = "v"
+        assert wkd[proxy] == "v"
+
+
+class TestSP1ResultHostPrivateFilter:
+    def test_helper_flags_literal_private_ips(self) -> None:
+        from web_agent.search_engine import _result_host_is_private
+
+        assert _result_host_is_private("http://127.0.0.1/x") is True
+        assert _result_host_is_private("http://169.254.169.254/latest/meta-data") is True
+        assert _result_host_is_private("http://10.0.0.5/internal") is True
+        assert _result_host_is_private("https://example.com/x") is False
+        assert _result_host_is_private("not a url") is False
+
+
+class TestSE1CacheHitNoMutation:
+    @pytest.mark.asyncio
+    async def test_cache_hit_does_not_mutate_backend_dict(self) -> None:
+        from web_agent.search_engine import SearchEngine
+
+        cached_payload = {"query": "q", "total_results": 0, "results": []}
+        cache = MagicMock()
+        cache.get = AsyncMock(return_value=cached_payload)
+        engine = SearchEngine(browser_manager=MagicMock(), config=AppConfig())
+        engine._cache = cache
+        resp = await engine.search("q")
+        assert resp.from_cache is True
+        # SE-1: the backend's stored dict must be left untouched.
+        assert "from_cache" not in cached_payload
+
+
+class TestEC2NegativeMaxResultsDefaults:
+    @pytest.mark.asyncio
+    async def test_negative_max_results_falls_back_to_default(self) -> None:
+        from web_agent.builtin_skills.ec_europa_document_search import run
+
+        captured: dict = {}
+
+        async def _search_and_extract(query: str, max_results: int) -> object:
+            captured["max_results"] = max_results
+            result = MagicMock()
+            result.pages = []
+            return result
+
+        agent = MagicMock()
+        agent.search_and_extract = _search_and_extract
+        await run(agent, "https://ec.europa.eu", {"query": "x", "max_results": -5})
+        assert captured["max_results"] == 5  # negative -> default, not a silent 1
+
+
+class TestDS1FloatRejectsNonFinite:
+    def test_float_input_rejects_inf_and_nan(self) -> None:
+        from web_agent.domain_skills import _coerce_input
+        from web_agent.exceptions import SkillInputError
+
+        class _Spec:
+            type = "float"
+            name = "ratio"
+
+        spec = _Spec()
+        assert _coerce_input("1.5", spec) == 1.5
+        for bad in ("inf", "-inf", "nan"):
+            with pytest.raises(SkillInputError):
+                _coerce_input(bad, spec)

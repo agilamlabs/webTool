@@ -103,7 +103,9 @@ class _NoCloseContextProxy:
     behave as if they always saw one context.
     """
 
-    __slots__ = ("_ctx",)
+    # v1.6.16 BR-2: include __weakref__ so the proxy can be used as a
+    # WeakKeyDictionary key (a bare __slots__ class is unweakreferenceable).
+    __slots__ = ("__weakref__", "_ctx")
 
     def __init__(self, ctx: BrowserContext) -> None:
         object.__setattr__(self, "_ctx", ctx)
@@ -414,10 +416,15 @@ class BrowserManager:
                     if blocked:
 
                         async def _block_resources(route: Route) -> None:
-                            if route.request.resource_type in blocked:
-                                await route.abort()
-                            else:
-                                await route.continue_()
+                            # v1.6.16 BR-3: on context/page teardown the route
+                            # may already be gone; abort()/continue_() then raise
+                            # into Playwright's dispatcher. A routing decision on
+                            # a dying page is moot -- suppress.
+                            with suppress(Exception):
+                                if route.request.resource_type in blocked:
+                                    await route.abort()
+                                else:
+                                    await route.continue_()
 
                         await self._persistent_context.route("**/*", _block_resources)
                     # The persistent context exposes its parent browser

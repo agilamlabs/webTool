@@ -21,7 +21,9 @@ e.g. ``providers=["playwright"]`` to use only browser-based search.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Optional
+from urllib.parse import urlparse
 
 from loguru import logger
 
@@ -36,6 +38,25 @@ from .search_providers import (
     SearchProvider,
     SearXNGProvider,
 )
+
+
+def _result_host_is_private(url: str) -> bool:
+    """True if ``url``'s host is a LITERAL private/loopback/link-local IP.
+
+    v1.6.16 SP-1: a literal internal IP is never a legitimate public search
+    hit; a malicious/compromised provider could return one to lure the agent
+    into fetching an internal address. Applied uniformly to EVERY provider's
+    results at the choke point (SearXNG already filtered inline since v1.6.14
+    C-2; DDGS/Playwright did not). Literal-only -- no DNS in the search hot
+    path; hostname results that resolve internally are still caught by the
+    downstream fetch gate.
+    """
+    host = urlparse(url).hostname or ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
 class SearchEngine:
@@ -127,6 +148,10 @@ class SearchEngine:
                 exhausted without producing any results.
         """
         max_r = max_results or self._config.search.max_results
+        # v1.6.16 SP-2: clamp at the choke point so an unbounded max_results
+        # can't flow into Google's ``num=`` or a provider slice. The MCP layer
+        # clamps too, but a direct API caller bypasses that.
+        max_r = max(1, min(int(max_r), 100))
 
         # Cache lookup -- key includes max_results so different result
         # counts for the same query don't collide.
@@ -146,8 +171,10 @@ class SearchEngine:
                 # so callers doing time-diff math see an honest
                 # timestamp; ``from_cache=True`` is the source of truth
                 # for staleness, not the timestamp.
-                cached["from_cache"] = True
-                return SearchResponse(**cached)
+                # v1.6.16 SE-1: copy before mutating -- an in-memory cache
+                # backend may hand back a reference to its stored dict, so
+                # mutating ``cached`` in place would corrupt the cached entry.
+                return SearchResponse(**{**cached, "from_cache": True})
 
         last_response = SearchResponse(query=query)
         for provider in self._providers:
@@ -162,6 +189,15 @@ class SearchEngine:
             except Exception as exc:
                 logger.warning("Provider {p} raised: {e}", p=provider.name, e=exc)
                 continue
+
+            # v1.6.16 SP-1: drop any result whose host is a literal private IP,
+            # for EVERY provider (defense-in-depth at the choke point). An
+            # all-private result set then falls through as "empty".
+            if response.results:
+                filtered = [r for r in response.results if not _result_host_is_private(r.url)]
+                if len(filtered) != len(response.results):
+                    response.results = filtered
+                    response.total_results = len(filtered)
 
             if response.results:
                 logger.info(

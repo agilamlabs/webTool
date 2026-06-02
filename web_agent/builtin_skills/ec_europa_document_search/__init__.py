@@ -26,7 +26,17 @@ _EC_HOSTS = (
 async def run(agent: Agent, url: str, inputs: dict[str, Any]) -> dict[str, Any]:
     """Search EC subdomains for policy documents matching ``query``."""
     query = inputs.get("query", "")
-    max_results = int(inputs.get("max_results") or 5)
+    # v1.6.16 EC-2: a negative/zero/garbage max_results previously slipped
+    # through and made the ``len(docs) >= max_results`` break fire after the
+    # first doc (silently truncating to a single result). Coerce defensively,
+    # fall back to the default for nonsensical values, and cap to a ceiling.
+    try:
+        max_results = int(inputs.get("max_results") or 5)
+    except (TypeError, ValueError):
+        max_results = 5
+    if max_results < 1:
+        max_results = 5
+    max_results = min(max_results, 50)
 
     # Site-restrict to the EC domains we care about.
     composed_query = f"({' OR '.join(f'site:{h}' for h in _EC_HOSTS)}) {query}"

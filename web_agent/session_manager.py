@@ -100,9 +100,12 @@ class SessionManager:
         token = secrets.token_urlsafe(8)
         session_id = f"{name}-{token}" if name else token
 
-        # Hold the lock across the entire creation: build context, probe UA,
-        # register TabManager + dicts. Prevents the visible-but-unowned context
-        # that would result from a partial creation racing with close_all().
+        # v1.6.16 SM-2: hold the lock across context creation + registration
+        # (leak-safety, see SM-1 below), but probe the User-Agent AFTER
+        # releasing it -- a slow page.evaluate round-trip must not serialize
+        # every other session op behind this one.
+        info: SessionInfo | None = None
+        initial_page = None
         async with self._lock:
             ctx = await self._bm.create_persistent_context(block_resources=False)
             # v1.6.16 SM-1: from here until the context is registered in the
@@ -119,19 +122,13 @@ class SessionManager:
                 # v1.6.8: hand the NetworkCollector to TabManager so popups
                 # and new_tab() pages get capture wired automatically.
                 tab_mgr = TabManager(ctx, network_collector=self._network_collector)
+                initial_page = await ctx.new_page()
+                # Register the initial page as the "main" tab. It stays open
+                # for the lifetime of the session and is reused by subsequent
+                # actions targeting this session.
+                await tab_mgr.register_initial_page(initial_page, INITIAL_TAB_ID)
 
-                ua = None
-                try:
-                    initial_page = await ctx.new_page()
-                    # Register the initial page as the "main" tab. It stays
-                    # open for the lifetime of the session and is reused by
-                    # subsequent actions targeting this session.
-                    await tab_mgr.register_initial_page(initial_page, INITIAL_TAB_ID)
-                    ua = await initial_page.evaluate("() => navigator.userAgent")
-                except Exception:
-                    ua = None
-
-                info = SessionInfo(session_id=session_id, name=name, user_agent=ua)
+                info = SessionInfo(session_id=session_id, name=name, user_agent=None)
                 self._sessions[session_id] = ctx
                 self._info[session_id] = info
                 self._tabs[session_id] = tab_mgr
@@ -139,6 +136,14 @@ class SessionManager:
                 with suppress(Exception):
                     await ctx.close()
                 raise
+
+        # UA probe OUTSIDE the lock; informational only, so a failure (e.g. the
+        # page was closed by a concurrent close_all) just leaves it None.
+        if info is not None and initial_page is not None:
+            with suppress(Exception):
+                ua = await initial_page.evaluate("() => navigator.userAgent")
+                if ua:
+                    info.user_agent = ua
 
         logger.info(
             "Session created: {sid} (name={name})",
