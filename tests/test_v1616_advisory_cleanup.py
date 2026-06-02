@@ -625,3 +625,59 @@ class TestDS1FloatRejectsNonFinite:
         for bad in ("inf", "-inf", "nan"):
             with pytest.raises(SkillInputError):
                 _coerce_input(bad, spec)
+
+
+# ---------------------------------------------------------------------------
+# Cluster D advisories (folded into v1.6.16):
+#   AUDIT-1 : the audit scope redacts top-level sensitive kwargs.
+#   OWN-1   : ownership token is written via os.open(0o600) (round-trips).
+#   DEBUG-2 : debug artifact filenames carry a monotonic uniqueness counter.
+#   MAIN-1  : run_interact bounds the actions-file size + handles parse errors
+#             (verified by inspection -- driving the CLI launches an Agent).
+#   DEBUG-1 : capture_page reserves slots before its awaits (inspection;
+#             capture_no_page is synchronous so it never raced).
+#   TRACE-4 : SKIPPED -- per-session trace locks are a delicate refactor on an
+#             opt-in, off-by-default feature; the global lock preserves the
+#             ordinal + append ordering (same call as the v1.6.16 main pass).
+#   CORR-1  : SKIPPED -- the import-time loguru patcher is intentional (cid in
+#             logs); loguru allows one patcher and exposes no compose API, so a
+#             non-clobbering fix would be a behaviour change.
+# ---------------------------------------------------------------------------
+class TestAUDIT1ArgsRedacted:
+    @pytest.mark.asyncio
+    async def test_sensitive_args_redacted_in_audit_entry(self, tmp_path: Path) -> None:
+        import json as _json
+
+        from web_agent.audit import AuditLogger
+        from web_agent.trace_recorder import is_redacted
+
+        audit = AuditLogger(path=str(tmp_path / "audit.jsonl"), enabled=True)
+        async with audit.scope("login", {"password": "hunter2", "user": "bob"}):
+            pass
+        lines = (tmp_path / "audit.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        entry = _json.loads(lines[-1])
+        assert is_redacted(entry["args"]["password"])  # AUDIT-1: secret masked
+        assert entry["args"]["user"] == "bob"  # benign field preserved
+
+
+class TestOWN1TokenFileRoundTrip:
+    def test_issue_then_read_round_trips(self, tmp_path: Path) -> None:
+        from web_agent.ownership import OwnershipToken
+
+        token = OwnershipToken.issue(tmp_path)
+        assert token and len(token) == 64  # 32 bytes hex
+        assert OwnershipToken.read(tmp_path) == token
+        # re-issue (file already exists) overwrites cleanly via the new os.open path
+        token2 = OwnershipToken.issue(tmp_path)
+        assert token2 != token
+        assert OwnershipToken.read(tmp_path) == token2
+
+
+class TestDEBUG2UniqueArtifactFilenames:
+    def test_consecutive_paths_are_unique(self, tmp_path: Path) -> None:
+        from web_agent.debug import DebugCapture
+
+        dc = DebugCapture(AppConfig(debug={"enabled": True, "debug_dir": str(tmp_path)}))
+        p1 = dc._next_artifact_path("fetch", "html")
+        p2 = dc._next_artifact_path("fetch", "html")
+        assert p1 != p2  # monotonic seq guarantees uniqueness within a microsecond

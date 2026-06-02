@@ -79,8 +79,10 @@ class AuditLogger:
         result_count) which will be persisted alongside the standard
         fields.
         """
-        # Local import to avoid circular: correlation imports utils which imports config
+        # Local imports to avoid circular: correlation imports utils which
+        # imports config; trace_recorder hosts the shared redaction helper.
         from .correlation import get_correlation_id
+        from .trace_recorder import redact_sensitive_mapping
 
         if not self._enabled:
             yield {}
@@ -91,7 +93,12 @@ class AuditLogger:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "correlation_id": get_correlation_id(),
             "method": method,
-            "args": dict(args) if args else {},
+            # v1.6.16 AUDIT-1: scrub top-level sensitive kwargs (password /
+            # token / secret / ...) before they hit the audit sink. Shallow
+            # by key name -- nested dicts are not recursed (callers that pass
+            # secret-bearing nested structures, e.g. skill inputs, redact at
+            # their own call site, cf. AG-2).
+            "args": redact_sensitive_mapping(dict(args)) if args else {},
             "status": "started",
         }
         try:
