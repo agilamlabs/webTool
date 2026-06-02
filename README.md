@@ -10,6 +10,17 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
+> **What's new in 1.6.16** — *Review-hardening — 32 findings from a
+> full-codebase brutal review, adversarially verified.* Closes SSRF holes in
+> the secondary egress paths (`fetch_binary`, `classify_url`, the downloader
+> fall-through, `fill_form_and_extract`); a config fail-open where a **bare**
+> unprefixed env var (e.g. `BLOCK_PRIVATE_IPS=false`) could silently disable a
+> security fence — every sub-config now carries a `WEB_AGENT_<SECTION>__`
+> prefix; an arbitrary-file-write via `web_print_page_as_pdf`; a no-op query
+> sanitizer in the GitHub skill; plus validation bounds, redaction/replay
+> fixes, and unbounded-growth guards. See `CHANGELOG.md`. **Behaviour change:**
+> bare unprefixed env vars are no longer read — use `WEB_AGENT_<SECTION>__<FIELD>`.
+>
 > **What's new in 1.6.15** — *Log hygiene.* `SearchEngine` no longer
 > logs `Skipping unavailable provider: searxng` on every search when
 > SearXNG sits in the default chain without a `search.searxng_base_url`

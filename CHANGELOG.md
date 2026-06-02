@@ -1,5 +1,85 @@
 # Changelog
 
+## [1.6.16] - 2026-06-02
+
+### Review-hardening: 32 confirmed findings from a full-codebase brutal review
+
+A full-codebase brutal review (8 file-disjoint reviewer agents over all 34
+modules / ~14k LOC, then an adversarial *refute* pass on every critical/high/
+medium finding) surfaced 73 raw findings; after verification **32 were confirmed
+real** (0 Critical, 6 High, 15 Medium, 11 Low) — plus 7 refuted and 34 low
+advisories. All 32 confirmed are fixed here, plus `ROBOTS-3` (a latent
+robots.txt bug found during verification) and `CACHE-2`. Recurring theme: prior
+hardening was applied to the path *named* in each finding but not its siblings,
+so this pass fixes each **bug-class across all call sites**. +110 tests in
+`tests/test_v1616_review_hardening.py`; ruff + mypy strict clean; fixes landed
+as 6 file-disjoint commits via parallel `general-purpose` agents.
+
+**SSRF egress completeness**
+- **FB-1 (High):** `fetch_binary` now performs the post-connect peer-IP re-check
+  and per-redirect `Location` validation the HTML/download paths already had.
+- **FC-1:** `classify_url` HEAD probe gets the same guards.
+- **DL-1:** an SSRF/domain block raised in `_download_httpx` propagates as
+  `BLOCKED` instead of being swallowed and falling through to Playwright.
+- **UT-1:** `getaddrinfo` `UnicodeError` (idna) now fails the SSRF gate **closed**
+  instead of crashing it.
+- **ROBOTS-2:** the robots.txt fetch skips private/internal hosts (blind-SSRF
+  lever); **ROBOTS-3:** robots.txt was never fetched while process uptime was
+  below the TTL (a `0.0` sentinel + `>ttl` check) — the first lookup now always
+  fetches.
+- **REC-1 (High):** `fill_form_and_extract` re-checks the redirect host + peer IP
+  after navigation instead of bypassing `fetch`'s SSRF guards.
+
+**Config fail-open + validation bounds**
+- **CO-1 (High):** every nested `BaseSettings` sub-config now declares an
+  `env_prefix`, so a **bare unprefixed env var** (e.g. `BLOCK_PRIVATE_IPS=false`,
+  `EXECUTE_HELPERS=true`) can no longer silently disable a security fence on a
+  default `AppConfig()`. **Behaviour change:** bare unprefixed env vars are no
+  longer read — use `WEB_AGENT_<SECTION>__<FIELD>`.
+- **CO-2:** deny-list normalization strips port + IPv6 brackets (was fail-open).
+- **CO-3 / CO-4 / CO-7:** missing numeric lower bounds added (`max_contexts` ge=1,
+  `max_file_size_mb` ge=1, timeouts/viewport/cache/ttl/etc.).
+- **CO-5:** a partial `FetchConfig` retry override layers on the **named** policy
+  instead of reverting the other delays to BALANCED.
+- **CO-8:** `_is_loopback_host` normalizes obfuscated IPv4 literals; **CO-9:**
+  `_resolve_paths` uses the cross-platform absolute-path helper.
+- **BR-3 / BR-4:** `KeyboardInput.repeat` and `ScrollInput.infinite_scroll_max`
+  bounded (were unbounded → event-loop pin / attacker-controlled wall-clock).
+- **MO-1:** `FetchResult` html/binary mutual-exclusivity + `ScreenshotInput.quality` range.
+
+**Arbitrary-write + skill scope**
+- **MC-1 (High):** `web_print_page_as_pdf` contains the LLM-supplied `output_path`
+  (no absolute / `..` escape) — the class `save_results` was hardened against (B-5).
+- **GH-1 (High):** the `github_release_download` query sanitizer now actually
+  strips `site:`/`OR`/`AND`/`NOT` operators (the prior regex stripped none), so a
+  prompt-injected term can't escape the search scope.
+- **WS-1:** the workspace markdown-skills-only gate resolves the path before the
+  containment check (`..` can't escape `domain-skills/`).
+- **EC-1:** EC document-search host confinement matches the parsed hostname, not a
+  substring of the raw URL.
+
+**Concurrency, redaction, cancellation, hygiene**
+- **REC-2 (High):** `web_research` uses the same bounded semaphore `fetch_many`
+  adopted in v1.6.14 (was an unbounded `gather`).
+- **AG-1:** `search_and_extract`'s HEAD probe re-raises `CancelledError` (no longer
+  swallowed as "default to HTML").
+- **AG-2:** `apply_domain_skill` redacts sensitive skill inputs in the audit log.
+- **AG-3 / TRACE-2:** `replay_trace` no longer types the literal `***REDACTED***`
+  back into fields — it skips+warns or re-injects via an optional `secrets` map.
+- **TRACE-1:** `action.evaluate` added to the trace redaction map.
+- **TRACE-3 / RL-1 / ROBOTS-1:** per-host / per-session dicts FIFO-bounded.
+- **CE-1:** extractor output capped on the binary/HTML paths, not just `api_json`.
+- **CACHE-1:** `DiskCache` filesystem I/O offloaded to threads; **CACHE-2:** writes
+  are atomic (temp + `os.replace`).
+- **SM-1:** `SessionManager.create()` closes a half-built context on error.
+- **BR-2:** a *concurrent* `execute_sequence` against one session tab is refused
+  rather than clobbering the shared single-slot dialog state (sequential reuse
+  unaffected).
+
+Deferred to a follow-up: the 34 low advisories from the review, and TRACE-4
+(per-session trace locking). The `web_replay_trace` MCP tool intentionally does
+**not** expose the new `secrets` param (safe skip+warn default for MCP/LLM callers).
+
 ## [1.6.15] - 2026-05-29
 
 ### Fixed — SearXNG "unavailable provider" log spam
