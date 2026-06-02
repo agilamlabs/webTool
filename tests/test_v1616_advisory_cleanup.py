@@ -411,6 +411,102 @@ class TestREC3FindAndDownloadFileKindMatch:
 
 
 # ---------------------------------------------------------------------------
+# Cluster B advisories (folded into v1.6.16):
+#   FC-2 : Secure-flagged cookies are NOT forwarded over plaintext http://.
+#   CE-3 : prefer_api scores candidates (same-origin + JSON-root preferred,
+#          analytics/telemetry URLs deprioritised) instead of taking the
+#          largest body.
+#   MC-4 : web_search / web_research docstrings now match the actual clamps
+#          (doc-only -- verified by inspection).
+#   MC-3 : lifespan removes only its own loguru handler (verified by
+#          inspection; lifespan launches a real Agent, not unit-tested).
+#   NC-1 : SKIPPED -- _capture_response_body already swallows closed-page
+#          errors and its task is tracked + auto-discarded (already mitigated).
+# ---------------------------------------------------------------------------
+def _fetcher_with_session_cookies(cookies: list[dict]) -> object:
+    from web_agent.web_fetcher import WebFetcher
+
+    ctx = MagicMock()
+    ctx.cookies = AsyncMock(return_value=cookies)
+    sessions = MagicMock()
+    sessions.get = MagicMock(return_value=ctx)
+    fetcher = WebFetcher(MagicMock(), AppConfig())
+    fetcher._sessions = sessions
+    return fetcher
+
+
+_FC2_COOKIES = [
+    {"name": "sid", "value": "secret", "domain": "example.com", "secure": True},
+    {"name": "pref", "value": "x", "domain": "example.com", "secure": False},
+]
+
+
+class TestFC2SecureCookiesNotSentOverHttp:
+    @pytest.mark.asyncio
+    async def test_secure_cookie_dropped_over_http(self) -> None:
+        fetcher = _fetcher_with_session_cookies(_FC2_COOKIES)
+        jar = await fetcher._cookies_for_session("s", "http://example.com/file.pdf")
+        names = {c.name for c in jar.jar}
+        assert "sid" not in names  # Secure cookie withheld over plaintext http
+        assert "pref" in names
+
+    @pytest.mark.asyncio
+    async def test_secure_cookie_kept_over_https(self) -> None:
+        fetcher = _fetcher_with_session_cookies(_FC2_COOKIES)
+        jar = await fetcher._cookies_for_session("s", "https://example.com/file.pdf")
+        names = {c.name for c in jar.jar}
+        assert "sid" in names  # https target -> Secure cookie forwarded
+        assert "pref" in names
+
+
+class TestCE3PreferApiScoring:
+    def test_same_origin_api_beats_larger_analytics_blob(self) -> None:
+        import json
+
+        from web_agent.content_extractor import ContentExtractor
+        from web_agent.models import FetchResult, FetchStatus, NetworkEvent
+
+        analytics_body = json.dumps({"events": [{"e": i} for i in range(200)]})
+        api_body = json.dumps({"product_id": 42, "title": "Real API Payload"})
+        assert len(analytics_body) > len(api_body)  # the analytics blob is larger
+
+        events = [
+            NetworkEvent(
+                event_type="response",
+                url="https://metrics.example.com/collect",
+                method="POST",
+                resource_type="xhr",
+                status_code=200,
+                content_type="application/json",
+                body_text=analytics_body,
+            ),
+            NetworkEvent(
+                event_type="response",
+                url="https://example.com/api/data",
+                method="GET",
+                resource_type="fetch",
+                status_code=200,
+                content_type="application/json",
+                body_text=api_body,
+            ),
+        ]
+        fr = FetchResult(
+            url="https://example.com/page",
+            final_url="https://example.com/page",
+            status=FetchStatus.SUCCESS,
+            html="<html></html>",
+            network_events=events,
+        )
+        res = ContentExtractor(AppConfig())._extract_from_api_candidates(
+            fr, "https://example.com/page"
+        )
+        assert res is not None
+        # the smaller SAME-ORIGIN API body wins over the larger analytics blob
+        assert "product_id" in (res.content or "")
+        assert "events" not in (res.content or "")
+
+
+# ---------------------------------------------------------------------------
 # AG-4: save_results never yields a dotfile / empty filename
 # ---------------------------------------------------------------------------
 class TestAG4SaveResultsFilenameSafety:

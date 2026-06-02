@@ -47,7 +47,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Optional
 
@@ -123,15 +123,25 @@ def _load_mcp_config() -> AppConfig:
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     """Initialize the web_agent Agent once and share it across all tool calls."""
-    logger.remove()
-    logger.add(sys.stderr, level="INFO")
+    # v1.6.16 MC-3: do NOT call the blanket ``logger.remove()`` -- it wiped
+    # every loguru handler an embedding host process had configured. Drop only
+    # loguru's built-in default sink (id 0) if still present, add our own
+    # stderr sink, and on shutdown remove ONLY the handler we added so the
+    # host's logging is left intact.
+    with suppress(ValueError):
+        logger.remove(0)
+    handler_id = logger.add(sys.stderr, level="INFO")
 
     logger.info("Starting web_agent MCP server...")
     config = _load_mcp_config()
-    async with Agent(config) as agent:
-        logger.info("web_agent MCP server ready")
-        yield {"agent": agent}
-    logger.info("web_agent MCP server stopped")
+    try:
+        async with Agent(config) as agent:
+            logger.info("web_agent MCP server ready")
+            yield {"agent": agent}
+        logger.info("web_agent MCP server stopped")
+    finally:
+        with suppress(ValueError):
+            logger.remove(handler_id)
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +186,7 @@ async def web_search(
     Args:
         query: The search query string. May also be a search-engine SERP
             URL (Google/Bing/DDG/Brave/SearX) -- it will be unwrapped.
-        max_results: Maximum number of results to process (default 10, max ~20).
+        max_results: Maximum number of results to process (default 10; clamped to 1..50).
         session_id: Optional persistent browser session for the page fetches.
         extract_files: If True, route PDF/XLSX/DOCX/CSV results through the
             binary extractor inline instead of surfacing them in
@@ -424,8 +434,10 @@ async def web_research(
 
     Args:
         query: The research question or topic.
-        max_pages: Maximum number of pages to fetch and extract.
-        depth: Reserved for future expansion (only depth=1 supported in v1).
+        max_pages: Maximum number of pages to fetch and extract (clamped to 1..50).
+        depth: Search/expansion depth, clamped to 1..3. NOTE: only depth=1 is
+            currently implemented; higher values are accepted but reserved and
+            currently behave the same as depth=1.
         session_id: Optional persistent browser session.
         prefer_domains: Optional caller-supplied host hints; matching results
             get a strong ranking bonus.
