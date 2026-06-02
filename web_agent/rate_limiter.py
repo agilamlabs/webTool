@@ -20,7 +20,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import defaultdict
+
+# v1.6.16 RL-1: bound the per-host state dicts. RateLimiter is constructed
+# once per Agent and lives for the whole process (e.g. the MCP server holds
+# one Agent and fetches arbitrary caller/LLM-chosen hosts), so otherwise
+# ``_next_allowed`` / ``_locks`` / ``_429_counts`` accumulate one permanent
+# entry per distinct host forever. Mirrors the bounded DNS cache in utils
+# (_DNS_CACHE_MAXSIZE) and ``RobotsChecker._evict_if_needed``: FIFO eviction
+# of the oldest-inserted host, never evicting a host whose lock is currently
+# held. A few hundred bytes per host means this only triggers in an
+# extremely long-lived, high-host-cardinality process; it is a slow-leak
+# guard, not a hot path.
+_RATE_LIMITER_MAXSIZE: int = 2048
 
 
 class RateLimiter:
@@ -50,11 +61,43 @@ class RateLimiter:
         self._enabled = rps_per_host > 0
         self._interval = 1.0 / rps_per_host if self._enabled else 0.0
         self._next_allowed: dict[str, float] = {}
-        self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # v1.6.16 RL-1: a plain dict with explicit get-or-create (was a
+        # ``defaultdict``) so we can FIFO-evict before inserting a brand-new
+        # host and keep the per-host maps bounded.
+        self._locks: dict[str, asyncio.Lock] = {}
         # v1.6.12: tally of 429 events seen per host. Internal-only for
         # now; hooks for a future adaptive-rps policy. No getter exposed
         # until that policy ships.
         self._429_counts: dict[str, int] = {}
+
+    def _evict_if_needed(self, incoming_host: str) -> None:
+        """Bound the per-host state dicts via FIFO eviction (RL-1).
+
+        When ``_locks`` is at capacity, drop the oldest-inserted host
+        (dict insertion order) -- but never the host we're about to use,
+        and never a host whose lock is currently held (a request is in
+        flight against it). The host's ``_next_allowed`` and ``_429_counts``
+        entries are evicted together so the three maps can't drift. Mirrors
+        ``RobotsChecker._evict_if_needed``.
+        """
+        while len(self._locks) >= _RATE_LIMITER_MAXSIZE:
+            victim: str | None = None
+            for candidate in self._locks:
+                if candidate == incoming_host:
+                    continue
+                lk = self._locks.get(candidate)
+                if lk is not None and lk.locked():
+                    continue
+                victim = candidate
+                break
+            if victim is None:
+                # Every entry is the incoming host or has an in-flight
+                # acquire -- nothing safe to evict right now. Bail rather
+                # than spin; the next call will retry.
+                break
+            self._locks.pop(victim, None)
+            self._next_allowed.pop(victim, None)
+            self._429_counts.pop(victim, None)
 
     @property
     def enabled(self) -> bool:
@@ -72,7 +115,15 @@ class RateLimiter:
         if not self._enabled or not host:
             return
         host = host.lower()
-        async with self._locks[host]:
+        # v1.6.16 RL-1: evict before inserting a brand-new host so the
+        # per-host dicts stay bounded over a long-lived process. ``setdefault``
+        # is safe without an outer lock because lock creation is sync (no
+        # ``await`` between get-or-create), so two coroutines for the same
+        # host still converge on the same Lock object (mirrors RobotsChecker).
+        if host not in self._locks:
+            self._evict_if_needed(host)
+        lock = self._locks.setdefault(host, asyncio.Lock())
+        async with lock:
             # Loop because ``notify_429`` may extend ``_next_allowed``
             # while we're sleeping; re-read each iteration until the
             # current value is in the past.
@@ -132,6 +183,14 @@ class RateLimiter:
         if not self._enabled or not host:
             return
         host = host.lower()
+        # v1.6.16 RL-1: keep the per-host maps bounded here too. In normal
+        # flow ``acquire(host)`` ran first and already created the lock
+        # entry, but guard the brand-new-host case so a 429 for a host that
+        # somehow skipped acquire() can't grow ``_next_allowed`` /
+        # ``_429_counts`` past the bound.
+        if host not in self._locks:
+            self._evict_if_needed(host)
+            self._locks.setdefault(host, asyncio.Lock())
         # Fallback = interval * factor (at least one full interval delay
         # when the server doesn't tell us). max() with retry_after means
         # an explicit short Retry-After can't shorten our own minimum

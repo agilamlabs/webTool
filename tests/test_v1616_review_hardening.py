@@ -2431,3 +2431,449 @@ class TestTRACE3CountersBounded:
             )
         assert len(rec._counters) == 1
         assert rec._counters["stable"] == 20
+
+
+# ===========================================================================
+# Hygiene & leaks cluster (CE-1, CACHE-1/CACHE-2, RL-1, SM-1, BR-2)
+# ===========================================================================
+#
+# Finding -> test map:
+#   CE-1   : oversized HTML / binary extraction content is truncated to the
+#            ``safety.max_chars_per_call`` cap (the api_json E-6 cap is reused
+#            across every branch); content_length stays honest.
+#   CACHE-1: DiskCache get/set still round-trips correctly after the blocking
+#            FS I/O was moved onto ``asyncio.to_thread`` (semantics unchanged).
+#   CACHE-2: a set() produces a readable file and leaves no leftover *.tmp.
+#   RL-1   : the per-host state dicts (_locks/_next_allowed/_429_counts) are
+#            FIFO-bounded across many hosts; a held lock is never evicted.
+#   SM-1   : if TabManager construction raises, the freshly-built context's
+#            close() is called before the error propagates (no orphan).
+#   BR-2   : a second concurrent sequence on the same session tab is refused
+#            and does NOT clobber the first sequence's dialog state.
+
+
+# ---------------------------------------------------------------------------
+# CE-1: every extractor branch is capped, not just api_json
+# ---------------------------------------------------------------------------
+class TestCE1ExtractorContentCapped:
+    def _extractor(self, cap: int):
+        from web_agent.content_extractor import ContentExtractor
+
+        cfg = AppConfig(safety=SafetyConfig(max_chars_per_call=cap))
+        return ContentExtractor(cfg)
+
+    def test_oversized_html_raw_content_truncated(self) -> None:
+        # A huge HTML body that falls through to the raw extractor must be
+        # truncated to the cap, with content_length reset to the cut length.
+        cap = 1000
+        ext = self._extractor(cap)
+        huge_text = "A" * (cap * 5)
+        fr = FetchResult(
+            url="https://e/x",
+            final_url="https://e/x",
+            status=FetchStatus.SUCCESS,
+            html=f"<html><body><p>{huge_text}</p></body></html>",
+        )
+        result = ext.extract(fr)
+        assert result.content is not None
+        assert len(result.content) == cap
+        assert result.content_length == cap
+
+    def test_oversized_binary_csv_content_truncated(self) -> None:
+        # The CSV binary branch (no optional dep) must also be capped.
+        cap = 500
+        ext = self._extractor(cap)
+        # Build a CSV blob whose extracted text far exceeds the cap.
+        rows = "\n".join(f"col_{i},value_{i}" for i in range(cap))
+        fr = FetchResult(
+            url="https://e/data.csv",
+            final_url="https://e/data.csv",
+            status=FetchStatus.SUCCESS,
+            binary=rows.encode("utf-8"),
+            content_type="text/csv",
+        )
+        result = ext.extract(fr)
+        assert result.extraction_method == "csv"
+        assert result.content is not None
+        assert len(result.content) == cap
+        assert result.content_length == cap
+
+    def test_under_cap_content_untouched(self) -> None:
+        # Regression: content below the cap is returned verbatim.
+        ext = self._extractor(1_000_000)
+        body = "<html><body><article>hello world</article></body></html>"
+        fr = FetchResult(
+            url="https://e/x",
+            final_url="https://e/x",
+            status=FetchStatus.SUCCESS,
+            html=body,
+        )
+        result = ext.extract(fr)
+        assert result.content is not None
+        assert "hello world" in result.content
+        assert result.content_length == len(result.content)
+
+    def test_cap_helper_truncates_markdown_too(self) -> None:
+        # The markdown field (trafilatura can populate it) is capped as well.
+        from web_agent.models import ExtractionResult
+
+        ext = self._extractor(10)
+        res = ExtractionResult(
+            url="u",
+            content="x" * 50,
+            markdown="y" * 50,
+            extraction_method="trafilatura",
+            content_length=50,
+        )
+        capped = ext._cap_content(res)
+        assert capped.content is not None and len(capped.content) == 10
+        assert capped.markdown is not None and len(capped.markdown) == 10
+        assert capped.content_length == 10
+
+
+# ---------------------------------------------------------------------------
+# CACHE-1 / CACHE-2: round-trip after to_thread offload; atomic, no temp litter
+# ---------------------------------------------------------------------------
+class TestCache1And2:
+    @pytest.mark.asyncio
+    async def test_set_get_round_trip(self, tmp_path: Path) -> None:
+        from web_agent.cache import DiskCache
+
+        cache = DiskCache(cache_dir=str(tmp_path / "c"), ttl_seconds=1e9)
+        payload = {"k": "v", "n": 42, "nested": {"a": [1, 2, 3]}}
+        await cache.set("https://example.com/page", payload)
+        got = await cache.get("https://example.com/page")
+        assert got == payload
+
+    @pytest.mark.asyncio
+    async def test_miss_returns_none(self, tmp_path: Path) -> None:
+        from web_agent.cache import DiskCache
+
+        cache = DiskCache(cache_dir=str(tmp_path / "c"))
+        assert await cache.get("never-written") is None
+
+    @pytest.mark.asyncio
+    async def test_expired_entry_evicted_on_get(self, tmp_path: Path) -> None:
+        from web_agent.cache import DiskCache
+
+        cache = DiskCache(cache_dir=str(tmp_path / "c"), ttl_seconds=0.0)
+        await cache.set("k", {"x": 1})
+        # ttl=0 -> any positive age is stale; second read is a miss and the
+        # stale file is best-effort deleted.
+        assert await cache.get("k") is None
+
+    @pytest.mark.asyncio
+    async def test_set_writes_readable_file_no_temp_litter(self, tmp_path: Path) -> None:
+        from web_agent.cache import DiskCache
+
+        cdir = tmp_path / "c"
+        cache = DiskCache(cache_dir=str(cdir))
+        await cache.set("k1", {"a": 1})
+        await cache.set("k2", {"b": 2})
+        # Exactly the JSON entries exist; no leftover atomic-write temp files.
+        json_files = list(cdir.glob("*.json"))
+        tmp_files = list(cdir.glob("*.tmp"))
+        assert len(json_files) == 2
+        assert tmp_files == []
+        # And the file is genuinely readable JSON.
+        assert await cache.get("k1") == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_clear_removes_all(self, tmp_path: Path) -> None:
+        from web_agent.cache import DiskCache
+
+        cdir = tmp_path / "c"
+        cache = DiskCache(cache_dir=str(cdir))
+        await cache.set("a", {"1": 1})
+        await cache.set("b", {"2": 2})
+        removed = await cache.clear()
+        assert removed == 2
+        assert list(cdir.glob("*.json")) == []
+
+    @pytest.mark.asyncio
+    async def test_eviction_keeps_cache_under_cap(self, tmp_path: Path) -> None:
+        from web_agent.cache import DiskCache
+
+        # Tiny cap forces eviction; verify it stays bounded and readable.
+        cache = DiskCache(cache_dir=str(tmp_path / "c"), max_cache_mb=0)
+        # max_cache_mb=0 -> _max_bytes=0 so every write triggers eviction of
+        # everything-but-itself; the dir never grows unbounded.
+        for i in range(8):
+            await cache.set(f"key{i}", {"v": i})
+        # At most a handful of files survive (best-effort LRU); never all 8
+        # accumulate, and no temp litter remains.
+        assert len(list((tmp_path / "c").glob("*.json"))) <= 1
+        assert list((tmp_path / "c").glob("*.tmp")) == []
+
+    @pytest.mark.asyncio
+    async def test_corrupt_file_treated_as_miss(self, tmp_path: Path) -> None:
+        from web_agent.cache import DiskCache, _hash_key
+
+        cdir = tmp_path / "c"
+        cdir.mkdir(parents=True)
+        cache = DiskCache(cache_dir=str(cdir))
+        # Simulate a half-written / corrupt entry: get() must swallow the
+        # JSONDecodeError and report a miss (CACHE-2's failure-mode contract).
+        (cdir / f"{_hash_key('bad')}.json").write_text("{not json", encoding="utf-8")
+        assert await cache.get("bad") is None
+
+
+# ---------------------------------------------------------------------------
+# RL-1: per-host state dicts are FIFO-bounded
+# ---------------------------------------------------------------------------
+class TestRL1RateLimiterBounded:
+    @pytest.mark.asyncio
+    async def test_state_dicts_bounded_under_many_hosts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from web_agent import rate_limiter as rl_module
+        from web_agent.rate_limiter import RateLimiter
+
+        monkeypatch.setattr(rl_module, "_RATE_LIMITER_MAXSIZE", 4)
+        # Large rps so acquire() never actually sleeps in the test.
+        rl = RateLimiter(rps_per_host=1e9)
+        for i in range(50):
+            await rl.acquire(f"host{i}.example")
+            rl.notify_429(f"host{i}.example", retry_after_seconds=1.0)
+
+        assert len(rl._locks) <= 4
+        assert len(rl._next_allowed) <= 4
+        assert len(rl._429_counts) <= 4
+        # Most-recent host kept; oldest evicted (FIFO).
+        assert "host49.example" in rl._locks
+        assert "host0.example" not in rl._locks
+
+    @pytest.mark.asyncio
+    async def test_held_lock_not_evicted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from web_agent import rate_limiter as rl_module
+        from web_agent.rate_limiter import RateLimiter
+
+        monkeypatch.setattr(rl_module, "_RATE_LIMITER_MAXSIZE", 2)
+        rl = RateLimiter(rps_per_host=1e9)
+        # Pre-create and HOLD the lock for "keep.example" -- an in-flight
+        # acquire. It must never be chosen as an eviction victim.
+        keep_lock = rl._locks.setdefault("keep.example", __import__("asyncio").Lock())
+        await keep_lock.acquire()
+        try:
+            for i in range(20):
+                await rl.acquire(f"other{i}.example")
+            assert "keep.example" in rl._locks
+        finally:
+            keep_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_repeated_same_host_does_not_grow(self) -> None:
+        from web_agent.rate_limiter import RateLimiter
+
+        rl = RateLimiter(rps_per_host=1e9)
+        for _ in range(100):
+            await rl.acquire("stable.example")
+        assert len(rl._locks) == 1
+        assert set(rl._locks) == {"stable.example"}
+
+    @pytest.mark.asyncio
+    async def test_disabled_limiter_is_noop(self) -> None:
+        from web_agent.rate_limiter import RateLimiter
+
+        rl = RateLimiter(rps_per_host=0)
+        await rl.acquire("h.example")
+        rl.notify_429("h.example", retry_after_seconds=5.0)
+        # Disabled limiter never touches the maps.
+        assert rl._locks == {}
+        assert rl._next_allowed == {}
+
+
+# ---------------------------------------------------------------------------
+# SM-1: a context orphaned by a post-create failure is closed, not leaked
+# ---------------------------------------------------------------------------
+class TestSM1ContextClosedOnConstructionFailure:
+    @pytest.mark.asyncio
+    async def test_tabmanager_failure_closes_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from web_agent import session_manager as sm_module
+        from web_agent.session_manager import SessionManager
+
+        # A fake context that records whether close() was awaited.
+        ctx = MagicMock()
+        ctx.close = AsyncMock()
+
+        bm = MagicMock()
+        bm.create_persistent_context = AsyncMock(return_value=ctx)
+
+        sm = SessionManager(bm, AppConfig())
+
+        # Force TabManager construction to raise AFTER the context is built
+        # but BEFORE it is registered -- the SM-1 orphan window.
+        def _boom(*a: Any, **k: Any):
+            raise RuntimeError("tab manager wiring failed")
+
+        monkeypatch.setattr(sm_module, "TabManager", _boom)
+
+        with pytest.raises(RuntimeError, match="tab manager wiring failed"):
+            await sm.create()
+
+        # The freshly-built context was closed (no orphan) and never
+        # registered in the session dicts.
+        ctx.close.assert_awaited_once()
+        assert sm._sessions == {}
+        assert sm._tabs == {}
+
+    @pytest.mark.asyncio
+    async def test_successful_create_does_not_close_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from web_agent import session_manager as sm_module
+        from web_agent.session_manager import SessionManager
+
+        ctx = MagicMock()
+        ctx.close = AsyncMock()
+        ctx.new_page = AsyncMock(return_value=MagicMock())
+        bm = MagicMock()
+        bm.create_persistent_context = AsyncMock(return_value=ctx)
+
+        # A benign TabManager whose register_initial_page is awaitable.
+        tab_mgr = MagicMock()
+        tab_mgr.register_initial_page = AsyncMock()
+        monkeypatch.setattr(sm_module, "TabManager", lambda *a, **k: tab_mgr)
+
+        sm = SessionManager(bm, AppConfig())
+        sid = await sm.create(name="ok")
+        # Registered, and the happy path never closes the context.
+        assert sid in sm._sessions
+        ctx.close.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# BR-2: concurrent execute_sequence on one session tab is refused, no clobber
+# ---------------------------------------------------------------------------
+class TestBR2ConcurrentSequenceGuard:
+    def _actions_and_page(self, cfg: AppConfig):
+        """Build a real BrowserActions over a faked session-persistent tab.
+
+        ``get_or_current``-style lookups return the SAME page for every
+        call, so two concurrent execute_sequence calls share one Page --
+        exactly the BR-2 condition.
+        """
+        from web_agent.browser_actions import BrowserActions
+
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.on = MagicMock()
+        page.remove_listener = MagicMock()
+        page.is_closed = MagicMock(return_value=False)
+        type(page).url = property(lambda _self: "https://good.example/app")
+
+        tab_mgr = MagicMock()
+        tab_mgr.current = MagicMock(return_value=page)
+        sessions = MagicMock()
+        sessions.get = MagicMock(return_value=MagicMock())
+        sessions.touch = MagicMock()
+        sessions.get_tab_manager = MagicMock(return_value=tab_mgr)
+
+        ba = BrowserActions(MagicMock(), cfg, sessions=sessions)
+        return ba, page
+
+    @pytest.mark.asyncio
+    async def test_second_sequence_refused_when_state_already_registered(self) -> None:
+        from web_agent.browser_actions import _PAGE_DIALOG_STATES, _DialogState
+        from web_agent.models import WaitInput, WaitTarget
+
+        cfg = AppConfig()
+        ba, page = self._actions_and_page(cfg)
+
+        # Simulate a first sequence already in flight: its dialog state owns
+        # the single _PAGE_DIALOG_STATES slot for this page.
+        first_state = _DialogState()
+        _PAGE_DIALOG_STATES[page] = first_state
+        try:
+            actions = [WaitInput(target=WaitTarget.LOAD_STATE, value="load")]
+            res = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
+            # The second sequence is refused (its only action aborted) and the
+            # error names the concurrency conflict.
+            assert res.actions_failed >= 1
+            joined = " ".join((r.error_message or "") for r in res.results)
+            assert "concurrent" in joined.lower()
+            # Critically: the first sequence's state slot was NOT clobbered,
+            # and its listener was NOT removed by the refused sequence.
+            assert _PAGE_DIALOG_STATES.get(page) is first_state
+            page.remove_listener.assert_not_called()
+        finally:
+            _PAGE_DIALOG_STATES.pop(page, None)
+
+    @pytest.mark.asyncio
+    async def test_truly_concurrent_sequences_one_refused(self) -> None:
+        """Two overlapping execute_sequence calls on the same tab: the first
+        holds the dialog slot while the second runs and is refused."""
+        import asyncio
+
+        from web_agent.browser_actions import _PAGE_DIALOG_STATES
+        from web_agent.models import ActionResult, ActionStatus, ActionType, WaitInput, WaitTarget
+
+        cfg = AppConfig()
+        ba, _page = self._actions_and_page(cfg)
+
+        gate = asyncio.Event()
+        first_inside = asyncio.Event()
+
+        async def _blocking_action(_page: Any, _action: Any) -> ActionResult:
+            # First call parks here (keeping its dialog state registered)
+            # until the second sequence has had its chance to run.
+            first_inside.set()
+            await gate.wait()
+            return ActionResult(action=ActionType.WAIT, status=ActionStatus.SUCCESS)
+
+        # Patch execute_action so the first sequence blocks deterministically.
+        ba.execute_action = AsyncMock(side_effect=_blocking_action)  # type: ignore[method-assign]
+
+        actions = [WaitInput(target=WaitTarget.LOAD_STATE, value="load")]
+        try:
+            first = asyncio.create_task(
+                ba.execute_sequence("https://good.example/app", actions, session_id="sid")
+            )
+            await first_inside.wait()  # first is parked, slot is held
+
+            # Now the second concurrent sequence runs against the same tab.
+            second_res = await ba.execute_sequence(
+                "https://good.example/app", actions, session_id="sid"
+            )
+            joined = " ".join((r.error_message or "") for r in second_res.results)
+            assert "concurrent" in joined.lower()
+
+            # Release the first; it completes normally.
+            gate.set()
+            first_res = await first
+            assert first_res.actions_succeeded == 1
+        finally:
+            gate.set()
+            _PAGE_DIALOG_STATES.pop(_page, None)
+
+    @pytest.mark.asyncio
+    async def test_sequential_reuse_not_refused_after_completion(self) -> None:
+        """Regression (v1.6.16 BR-2): after a sequence COMPLETES on a
+        session-persistent tab, its _PAGE_DIALOG_STATES slot must be cleared
+        in finally so the NEXT sequential execute_sequence on the same tab is
+        not falsely refused. The tab is never closed, so a WeakKeyDictionary
+        keyed by the live Page would otherwise keep the slot forever and the
+        guard would reject every call after the first."""
+        from web_agent.browser_actions import _PAGE_DIALOG_STATES
+        from web_agent.models import ActionResult, ActionStatus, ActionType, WaitInput, WaitTarget
+
+        cfg = AppConfig()
+        ba, page = self._actions_and_page(cfg)
+
+        async def _ok_action(_page: Any, _action: Any) -> ActionResult:
+            return ActionResult(action=ActionType.WAIT, status=ActionStatus.SUCCESS)
+
+        ba.execute_action = AsyncMock(side_effect=_ok_action)  # type: ignore[method-assign]
+        actions = [WaitInput(target=WaitTarget.LOAD_STATE, value="load")]
+        try:
+            r1 = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
+            assert r1.actions_failed == 0
+            # finally cleared the slot, so the live persistent tab isn't "stuck".
+            assert page not in _PAGE_DIALOG_STATES
+
+            r2 = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
+            assert r2.actions_failed == 0
+            joined = " ".join((rr.error_message or "") for rr in r2.results)
+            assert "concurrent" not in joined.lower()
+        finally:
+            _PAGE_DIALOG_STATES.pop(page, None)

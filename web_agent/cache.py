@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from contextlib import suppress
@@ -102,23 +104,40 @@ class DiskCache(Cache):
         access.
         """
         path = self._dir / f"{_hash_key(key)}.json"
-        if not path.exists():
-            return None
+        # v1.6.16 CACHE-1: offload the blocking stat + read off the event
+        # loop (mirrors trace_recorder's ``asyncio.to_thread`` for its
+        # append). We still hold ``self._lock`` so the read ordering and
+        # cache semantics are unchanged.
         try:
             async with self._lock:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = await asyncio.to_thread(self._read_payload, path)
         except (OSError, json.JSONDecodeError) as exc:
             logger.debug("cache read failed for {k}: {e}", k=key[:60], e=exc)
+            return None
+        if payload is None:
             return None
 
         cached_at = float(payload.get("_cached_at", 0))
         if time.time() - cached_at > self._ttl:
             with suppress(OSError):
-                path.unlink()
+                await asyncio.to_thread(path.unlink)
             return None
 
         data = payload.get("data")
         return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _read_payload(path: Path) -> dict[str, Any] | None:
+        """Blocking read+parse of one cache file. Runs in a worker thread.
+
+        Returns ``None`` when the file is absent (cache miss). Raises
+        ``OSError`` / ``json.JSONDecodeError`` on a genuine read/parse
+        failure so the caller can log+treat it as a miss.
+        """
+        if not path.exists():
+            return None
+        result: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+        return result
 
     async def set(self, key: str, value: dict[str, Any]) -> None:
         """Cache ``value`` under ``key``. Best-effort -- failures are logged."""
@@ -129,19 +148,54 @@ class DiskCache(Cache):
             "_key_hint": key[:200],
             "data": value,
         }
+        text = json.dumps(payload, default=str, ensure_ascii=False)
         try:
             async with self._lock:
-                self._dir.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    json.dumps(payload, default=str, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+                # v1.6.16 CACHE-1: offload the blocking mkdir + write off the
+                # event loop. v1.6.16 CACHE-2: write atomically (temp file in
+                # the same dir, then ``os.replace``) so a crash mid-write can
+                # never leave a half-written, permanently-unreadable cache
+                # file -- a partial file would fail ``json.loads`` in get()
+                # and be treated as a miss, but os.replace makes the swap
+                # all-or-nothing so a valid prior entry is never corrupted.
+                await asyncio.to_thread(self._write_atomic, path, text)
                 await self._evict_if_needed()
         except OSError as exc:
             logger.warning("cache write failed for {k}: {e}", k=key[:60], e=exc)
 
+    def _write_atomic(self, path: Path, text: str) -> None:
+        """Blocking atomic write of one cache file. Runs in a worker thread.
+
+        Writes to a uniquely-named temp file in the SAME directory (so
+        ``os.replace`` is a same-filesystem atomic rename) then swaps it
+        into place. On any failure the temp file is best-effort removed so
+        a crashed write leaves no leftover ``*.tmp`` litter.
+        """
+        self._dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(self._dir), suffix=".tmp")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp_path, path)
+        except OSError:
+            with suppress(OSError):
+                tmp_path.unlink()
+            raise
+
     async def _evict_if_needed(self) -> None:
-        """Best-effort LRU eviction: delete oldest entries until under cap."""
+        """Best-effort LRU eviction: delete oldest entries until under cap.
+
+        v1.6.16 CACHE-1: the glob + N*stat() sweep and the unlink loop run
+        off the event loop via ``asyncio.to_thread`` -- on a cache dir with
+        thousands of entries this issues thousands of stat() syscalls on
+        every write, which would otherwise stall all concurrent fetches /
+        searches while held under ``self._lock``.
+        """
+        await asyncio.to_thread(self._evict_blocking)
+
+    def _evict_blocking(self) -> None:
+        """Blocking eviction body. Runs in a worker thread."""
         if not self._dir.exists():
             return
         files = list(self._dir.glob("*.json"))
@@ -161,14 +215,19 @@ class DiskCache(Cache):
 
     async def clear(self) -> int:
         """Delete all cache entries. Returns the count removed."""
+        async with self._lock:
+            # v1.6.16 CACHE-1: offload the glob + unlink loop off the loop.
+            return await asyncio.to_thread(self._clear_blocking)
+
+    def _clear_blocking(self) -> int:
+        """Blocking clear body. Runs in a worker thread."""
         if not self._dir.exists():
             return 0
         count = 0
-        async with self._lock:
-            for f in self._dir.glob("*.json"):
-                try:
-                    f.unlink()
-                    count += 1
-                except OSError:
-                    continue
+        for f in self._dir.glob("*.json"):
+            try:
+                f.unlink()
+                count += 1
+            except OSError:
+                continue
         return count
