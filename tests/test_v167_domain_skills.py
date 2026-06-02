@@ -470,15 +470,20 @@ def test_all_builtin_skill_md_files_parse(tmp_path: Path) -> None:
 
 
 def test_github_skill_sanitizes_query_operators() -> None:
-    """Code-review M4 regression: the github_release_download skill
-    composes a search query that includes user-supplied ``repo`` and
+    """Code-review M4 + v1.6.16 GH-1 regression: the github_release_download
+    skill composes a search query that includes user-supplied ``repo`` and
     ``asset_pattern`` fields. Without sanitization, a prompt-injected
     pattern like '" OR site:evil.com'' could escape the
     ``site:github.com`` scope. The sanitizer strips quotes, parens,
-    pipes, and brackets that have search-operator meaning."""
+    pipes, brackets, the ``site:`` field operator, and the standalone
+    boolean ``OR`` -- collapsing the resulting whitespace -- while leaving
+    ordinary query text intact."""
     from web_agent.builtin_skills.github_release_download import _sanitize_query_term
 
-    assert _sanitize_query_term('" OR site:evil.com"') == "OR site:evil.com"
-    assert _sanitize_query_term("(group1 | group2)") == "group1  group2"
+    # v1.6.16 GH-1: ``site:`` and the boolean ``OR`` are now actually
+    # stripped (the prior regex removed neither), so the scope-escape
+    # payload collapses to a bare hostname token with no operators.
+    assert _sanitize_query_term('" OR site:evil.com"') == "evil.com"
+    assert _sanitize_query_term("(group1 | group2)") == "group1 group2"
     assert _sanitize_query_term("normal-string_v1.0") == "normal-string_v1.0"
     assert _sanitize_query_term("") == ""

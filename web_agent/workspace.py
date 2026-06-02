@@ -120,17 +120,28 @@ class Workspace:
         if mode == "read_only":
             raise WorkspaceError(f"Workspace mode is 'read_only'; cannot write {rel_path!r}.")
 
+        # v1.6.16 WS-1: gate the NORMALIZED write target, not the raw
+        # caller string. ``safe_join_path`` (run via ``_resolve``) collapses
+        # any ``..`` segments, so the actual write lands at a different
+        # path than ``Path(rel_path).parts`` reports. Computing the path
+        # relative to the workspace root here makes the mode gate agree
+        # with the real destination -- otherwise ``domain-skills/../notes/x``
+        # passes the ``parts[0] == SKILLS_DIR`` check yet writes to
+        # ``notes/``. ``_resolve`` has already rejected absolute paths and
+        # out-of-workspace traversal before we get here.
+        resolved = self._resolve(rel_path)
+        rel = resolved.relative_to(self.root())
+        rel_parts = rel.parts
+
         # markdown_skills_only: must be .md AND under domain-skills/
         if mode == "markdown_skills_only":
-            p = Path(rel_path)
-            if p.suffix.lower() != ".md":
+            if rel.suffix.lower() != ".md":
                 raise WorkspaceError(
                     f"Mode 'markdown_skills_only': only .md files allowed "
-                    f"(got {p.suffix!r} for {rel_path!r})."
+                    f"(got {rel.suffix!r} for {rel_path!r})."
                 )
-            # First path component must be SKILLS_DIR
-            parts = p.parts
-            if not parts or parts[0] != SKILLS_DIR:
+            # First (normalized) path component must be SKILLS_DIR
+            if not rel_parts or rel_parts[0] != SKILLS_DIR:
                 raise WorkspaceError(
                     f"Mode 'markdown_skills_only': writes must be under "
                     f"'{SKILLS_DIR}/' (got {rel_path!r})."
@@ -138,15 +149,14 @@ class Workspace:
 
         # reviewed_python_helpers: .md anywhere + helpers.py at root
         if mode == "reviewed_python_helpers":
-            p = Path(rel_path)
-            if p.suffix.lower() == ".md":
+            if rel.suffix.lower() == ".md":
                 return  # any .md ok
             # Only the EXACT root-level helpers.py qualifies. We must NOT
             # accept e.g. ``subdir/helpers.py`` -- that would let a caller
             # write arbitrary .py anywhere under the workspace as long as
             # the basename matched HELPERS_FILE, defeating the mode's
             # "single reviewed helper file" intent.
-            if Path(rel_path) == Path(HELPERS_FILE):
+            if rel == Path(HELPERS_FILE):
                 return  # helpers.py at workspace root ok
             raise WorkspaceError(
                 f"Mode 'reviewed_python_helpers': writes limited to .md and "

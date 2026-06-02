@@ -469,6 +469,31 @@ class BrowserActions:
                 host = urlparse(page.url).hostname or ""
                 return _block_all(f"Initial navigation redirected to disallowed domain: {host}")
 
+            # v1.6.16 BR-2: a session-persistent tab is shared across calls,
+            # so two execute_sequence coroutines awaited concurrently against
+            # the SAME session_id both resolve to this one Page. Each would
+            # otherwise register its own "dialog" listener and overwrite the
+            # single-slot ``_PAGE_DIALOG_STATES[page]`` entry -- corrupting
+            # dialog routing (sequence B clobbers A's DialogResponse) and
+            # tripping Playwright's "Dialog is already handled" when two live
+            # listeners fire. Concurrent automation against one shared tab is
+            # a contraindicated, undocumented usage, so rather than a full
+            # concurrency refactor we make a minimal guard: if a dialog state
+            # is already registered for this Page, refuse the second sequence
+            # with a clear error instead of clobbering the first's state. We
+            # check BEFORE setting ``dialog_handler`` / writing the slot so
+            # the refused sequence's ``finally`` leaves the first sequence's
+            # listener and state slot completely untouched. (Sequential reuse
+            # is unaffected: the prior sequence's finally removed its listener
+            # and the weak slot is gone once its _DialogState is unreferenced.)
+            if page in _PAGE_DIALOG_STATES:
+                from .exceptions import ActionError
+
+                raise ActionError(
+                    "A sequence is already running on this session's tab; "
+                    "concurrent execute_sequence calls against the same "
+                    "session_id are not supported (run them sequentially)."
+                )
             # v1.6.14 A-2: keep the exact handler reference we register so
             # the finally block can remove_listener it. dialog_state.handle
             # is a bound method -- accessing it twice yields two distinct
@@ -603,6 +628,16 @@ class BrowserActions:
             if page is not None and dialog_handler is not None:
                 with contextlib.suppress(Exception):
                     page.remove_listener("dialog", dialog_handler)
+                # v1.6.16 BR-2: also drop this page's dialog-state slot.
+                # _PAGE_DIALOG_STATES is a WeakKeyDictionary keyed by the
+                # Page, but a session-persistent tab is never closed, so the
+                # slot would otherwise survive this sequence and make the NEXT
+                # sequential execute_sequence on the same session falsely trip
+                # the concurrent-sequence guard above. Gated on
+                # ``dialog_handler is not None`` so a sequence the guard
+                # REFUSED (it never registered a handler) can't pop the owning
+                # sequence's slot.
+                _PAGE_DIALOG_STATES.pop(page, None)
             # v1.6.6: only close pages WE created. Persistent session tabs
             # outlive sequences so subsequent interact() calls share state.
             if page is not None and owner == "session_ephemeral":

@@ -171,6 +171,51 @@ class ContentExtractor:
         Raises:
             ExtractionError: If ``strict=True`` and all layers fail.
         """
+        result = self._extract_dispatch(fetch_result, strict=strict, prefer_api=prefer_api)
+        # v1.6.16 CE-1: cap the emitted content for EVERY branch, not just
+        # the api_json path (which got the E-6 cap at ``_extract_from_api_
+        # candidates``). The binary (PDF/XLSX/DOCX/CSV) and HTML
+        # (trafilatura/bs4/raw) extractors returned ``content=text`` with no
+        # bound, so a hostile/huge document (input bounded only by
+        # ``download.max_file_size_mb``, default 100 MB) could yield ~100 MB
+        # of extracted text and blow up downstream token budgets / JSON
+        # serialization. ``BudgetTracker.add_chars`` only raises after the
+        # fact and isn't even called on the single-URL extract path, so it
+        # does not save this. Truncate centrally here -- one cap for all
+        # branches -- and keep ``content_length`` honest (mirrors the
+        # api_json slice). The api_json branch's own 512 KiB cap is more
+        # conservative and still applies first, so it is preserved.
+        return self._cap_content(result)
+
+    def _cap_content(self, result: ExtractionResult) -> ExtractionResult:
+        """Truncate ``content``/``markdown`` to ``safety.max_chars_per_call``.
+
+        Reuses the existing per-call character budget field rather than a
+        new knob. Slices in place (consistent with the api_json E-6 cap,
+        which has no truncation marker) and resets ``content_length`` to the
+        truncated length so it stays honest.
+        """
+        cap = self._config.safety.max_chars_per_call
+        if cap and result.content is not None and len(result.content) > cap:
+            result.content = result.content[:cap]
+            result.content_length = len(result.content)
+        if cap and result.markdown is not None and len(result.markdown) > cap:
+            result.markdown = result.markdown[:cap]
+        return result
+
+    def _extract_dispatch(
+        self,
+        fetch_result: FetchResult,
+        *,
+        strict: bool = False,
+        prefer_api: bool = False,
+    ) -> ExtractionResult:
+        """Dispatch to the binary / HTML extractors (uncapped).
+
+        Split out from :meth:`extract` so the public method can apply a
+        single content cap (CE-1) over every return path. See
+        :meth:`extract` for the full contract.
+        """
         if fetch_result.status != FetchStatus.SUCCESS:
             if strict:
                 from .exceptions import ExtractionError

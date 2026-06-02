@@ -94,6 +94,7 @@ from .recipes import Recipes
 from .robots import RobotsChecker
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
+from .trace_recorder import is_redacted, redact_sensitive_mapping
 from .utils import BudgetTracker, check_domain_allowed
 from .web_fetcher import WebFetcher, _url_ext_classification, is_binary_kind
 
@@ -560,6 +561,18 @@ class Agent:
                     *probe_tasks, return_exceptions=True
                 )
                 for item, classification in zip(unknown_items, probe_results, strict=True):
+                    if isinstance(classification, asyncio.CancelledError):
+                        # v1.6.16 AG-1: never swallow cancellation. gather(
+                        # return_exceptions=True) hands back a CancelledError
+                        # as a result object (it is a BaseException, not an
+                        # Exception, since Python 3.8). Treating it as a
+                        # generic "probe failed -> default to HTML" would mask
+                        # a real task cancellation and let search_and_extract
+                        # keep running (fetch_many, extraction, holding browser
+                        # resources) after the caller cancelled. Re-raise so
+                        # cooperative cancellation propagates -- mirrors the
+                        # web_research E-4 fix in recipes.py.
+                        raise classification
                     if isinstance(classification, BaseException):
                         # Probe failure -> default to HTML, will be caught downstream
                         page_items.append(item)
@@ -1202,8 +1215,18 @@ class Agent:
             SkillNotRunnableError: skill is markdown-only (informational).
             SkillInputError: caller-supplied inputs failed validation.
         """
+        # v1.6.16 AG-2: domain skills are exactly where authenticated/login
+        # flows live, so the free-form ``inputs`` dict routinely carries
+        # passwords / tokens / API keys. The audit sink (AuditLogger.scope)
+        # persists args verbatim to audit.jsonl with no redaction, so pass a
+        # key-name-redacted copy instead of the raw dict. Reuses
+        # ``redact_sensitive_mapping`` from trace_recorder so the audit and
+        # trace sinks share one secret-handling convention; the record's
+        # shape is unchanged -- only sensitive values become the sentinel.
+        # The UN-redacted ``inputs`` still flows to the skill runner below.
         async with self._call_scope(
-            "apply_domain_skill", {"url": url, "name": name, "inputs": inputs}
+            "apply_domain_skill",
+            {"url": url, "name": name, "inputs": redact_sensitive_mapping(inputs)},
         ):
             return await self._skills.apply(self, url, name, inputs or {})
 
@@ -1577,7 +1600,11 @@ class Agent:
         """
         return self._trace_recorder.list_traces()
 
-    async def replay_trace(self, trace_file: str | Path) -> ActionSequenceResult:
+    async def replay_trace(
+        self,
+        trace_file: str | Path,
+        secrets: dict[int, str] | None = None,
+    ) -> ActionSequenceResult:
         """v1.6.8: re-execute the action list recorded in *trace_file*.
 
         Reconstructs ``Action`` discriminated-union entries from the JSONL
@@ -1590,12 +1617,32 @@ class Agent:
         first action's ``url`` attribute is used. If neither is present,
         raises ValueError.
 
+        Redacted secrets (v1.6.16 AG-3 / TRACE-2): trace redaction is
+        ONE-WAY -- fill/type/type_text/evaluate values that carried a secret
+        were written as the ``***REDACTED***`` sentinel (see
+        ``trace_recorder._SENSITIVE_ARG_BY_METHOD``), so the original value
+        is NOT recoverable from the trace. Faithful replay of such an action
+        therefore requires the caller to re-supply the value via *secrets*.
+        For any redacted action with NO override this method SKIPS the action
+        (it is excluded from the executed sequence) and emits a
+        ``logger.warning`` -- it never types the sentinel literally into the
+        field. Non-redacted actions (clicks, navigation, non-secret
+        fill/type, ...) always replay normally.
+
         Args:
             trace_file: Path to a ``<session_id>.jsonl`` trace file.
+            secrets: Optional mapping ``{action_index: real_value}`` used to
+                re-supply redacted values. The key is the **zero-based index
+                of the action within the replayable action list** (the same
+                order they appear in the trace, counting only
+                ``action.*`` entries). The value replaces the sentinel for
+                that action's secret field before execution. Defaults to None
+                (no overrides -> every redacted action is skipped+warned).
 
         Returns:
             ``ActionSequenceResult`` from the replay run. ``correlation_id``
-            is fresh -- the replay has its own audit identity.
+            is fresh -- the replay has its own audit identity. Skipped
+            redacted actions are NOT counted in ``actions_total``.
 
         Raises:
             FileNotFoundError: trace_file does not exist.
@@ -1604,6 +1651,7 @@ class Agent:
         from pydantic import TypeAdapter
 
         from .models import Action
+        from .trace_recorder import _SENSITIVE_ARG_BY_METHOD
 
         # v1.6.14 C-3: Local-File-Inclusion defense. ``trace_file`` is
         # accepted directly from the LLM via the ``web_replay_trace`` MCP
@@ -1647,17 +1695,48 @@ class Agent:
                 if e.get("url"):
                     start_url = str(e["url"])
                     break
+            overrides = secrets or {}
             action_dicts: list[dict[str, Any]] = []
-            for e in action_entries:
+            skipped_redacted = 0
+            for idx, e in enumerate(action_entries):
+                method = str(e["method"])
                 args = dict(e.get("args") or {})
                 # Rebuild the discriminator -- audit args dropped it during
                 # exclude=. The method tail IS the action name.
-                args["action"] = str(e["method"]).removeprefix("action.")
+                args["action"] = method.removeprefix("action.")
+                # v1.6.16 AG-3 / TRACE-2: trace redaction is ONE-WAY -- the
+                # secret field for fill/type/evaluate/wait was persisted as
+                # the ``***REDACTED***`` sentinel, not the real value. Detect
+                # the sentinel and either re-inject a caller-supplied override
+                # (keyed by the action's index in this replayable list) or
+                # SKIP the action with a warning. We must never type the
+                # sentinel verbatim into the field.
+                secret_key = _SENSITIVE_ARG_BY_METHOD.get(method)
+                if secret_key is not None and is_redacted(args.get(secret_key)):
+                    if idx in overrides:
+                        args[secret_key] = overrides[idx]
+                    else:
+                        skipped_redacted += 1
+                        logger.warning(
+                            "replay_trace: skipping redacted {m} at action "
+                            "index {i} (no secret supplied via secrets[{i}]); "
+                            "trace redaction is one-way -- supply the real "
+                            "value to replay this action",
+                            m=method,
+                            i=idx,
+                        )
+                        continue
                 action_dicts.append(args)
+            if not action_dicts:
+                raise ValueError(
+                    f"Trace {trace_file} has {len(action_entries)} replayable "
+                    f"action(s) but all were redacted with no override supplied "
+                    f"via 'secrets'; nothing to replay"
+                )
             adapter = TypeAdapter(list[Action])
             actions = adapter.validate_python(action_dicts)
             if start_url is None:
-                # Fall back to the first action's `url` attribute if any.
+                # Fall back to the first (kept) action's `url` attribute if any.
                 start_url = getattr(actions[0], "url", None)
             if not start_url:
                 raise ValueError(
@@ -1665,10 +1744,13 @@ class Agent:
                     "(no entry with 'url' and first action has no url field)"
                 )
             logger.info(
-                "Replaying {n} actions from {p} (cid={cid})",
+                "Replaying {n} actions from {p} (cid={cid}){skipped}",
                 n=len(actions),
                 p=trace_file,
                 cid=cid,
+                skipped=(
+                    f"; {skipped_redacted} redacted action(s) skipped" if skipped_redacted else ""
+                ),
             )
             return await self._actions.execute_sequence(start_url, actions)
 

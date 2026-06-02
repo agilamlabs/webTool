@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SearchResultItem(BaseModel):
@@ -282,6 +282,27 @@ class FetchResult(BaseModel):
             "(search-derived)."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_html_binary_exclusive(self) -> FetchResult:
+        """v1.6.16 (review MO-1): enforce the documented html/binary invariant.
+
+        The ``binary`` field docstring promises it is "mutually exclusive
+        with html: when binary is set, html is None". The HTML fetch path
+        populates ``html`` (binary stays None) and the streaming binary
+        path populates ``binary`` (html stays None), so this only ever
+        fires for a programming error / malformed construction that sets
+        BOTH -- which would make downstream extractors ambiguous about
+        which payload to consume. Both-None (BLOCKED / error results) and
+        either-one-set remain valid.
+        """
+        if self.html is not None and self.binary is not None:
+            raise ValueError(
+                "FetchResult.html and FetchResult.binary are mutually "
+                "exclusive: set at most one (html for text resources, "
+                "binary for PDF/XLSX/etc.). Both were provided."
+            )
+        return self
 
 
 class ExtractionResult(BaseModel):
@@ -709,10 +730,20 @@ class ScrollInput(BaseAction):
     )
     timeout: Optional[int] = Field(default=None)
     direction: ScrollDirection = Field(default=ScrollDirection.DOWN)
-    amount: int = Field(default=3, description="Scroll ticks")
+    amount: int = Field(default=3, ge=1, description="Scroll ticks")
     infinite_scroll: bool = Field(default=False, description="Auto-scroll until no new content")
-    infinite_scroll_max: int = Field(default=10, description="Max iterations for infinite scroll")
-    infinite_scroll_delay_ms: int = Field(default=1000)
+    # v1.6.16 (review BR-4): bound the infinite-scroll iteration count. The
+    # loop runs ``range(infinite_scroll_max)`` and each iteration costs
+    # ``infinite_scroll_delay_ms`` plus up to a capped evaluate, so an
+    # unbounded count makes total wall-clock attacker-controlled (an
+    # LLM-supplied ``infinite_scroll_max=10_000_000`` pins one Page
+    # forever). ``le=1000`` is far above any real lazy-load page while
+    # bounding the worst case; ``ge=1`` keeps at least one scroll.
+    infinite_scroll_max: int = Field(
+        default=10, ge=1, le=1000, description="Max iterations for infinite scroll"
+    )
+    # v1.6.16 (review BR-4): per-iteration delay in ms; never negative.
+    infinite_scroll_delay_ms: int = Field(default=1000, ge=0)
 
 
 class ScreenshotInput(BaseAction):
@@ -729,7 +760,13 @@ class ScreenshotInput(BaseAction):
     )
     full_page: bool = Field(default=False)
     format: ScreenshotFormat = Field(default=ScreenshotFormat.PNG)
-    quality: Optional[int] = Field(default=None, description="JPEG quality 0-100")
+    # v1.6.16 (review MO-1): enforce the documented 0-100 JPEG-quality
+    # range (Playwright's ``page.screenshot(quality=...)`` rejects values
+    # outside it, and quality is ignored for PNG). ``None`` keeps the
+    # "use Playwright's default" sentinel.
+    quality: Optional[int] = Field(
+        default=None, ge=0, le=100, description="JPEG quality 0-100 (ignored for PNG)"
+    )
 
 
 class NavigateInput(BaseAction):
@@ -781,7 +818,15 @@ class KeyboardInput(BaseAction):
     selector: Optional[str] = Field(default=None)
     timeout: Optional[int] = Field(default=None)
     key: str = Field(description="Key name or combo: 'Enter', 'Control+A', 'ArrowDown'")
-    repeat: int = Field(default=1, description="Number of times to press")
+    # v1.6.16 (review BR-3): bound repeat. ``_do_keyboard`` loops
+    # ``for _ in range(action.repeat)`` issuing one awaited CDP
+    # ``keyboard.press`` per iteration with no wall-clock budget, so an
+    # LLM/prompt-injection-supplied ``repeat=100_000_000`` ties up the
+    # single shared Playwright connection effectively forever. 100 is a
+    # generous cap for any legitimate keypress-repeat (e.g. holding an
+    # arrow key) while bounding the worst case. Mirrors the existing
+    # ``ClickXYInput.clicks`` (ge=1, le=3) bound.
+    repeat: int = Field(default=1, ge=1, le=100, description="Number of times to press")
 
 
 class WaitInput(BaseAction):

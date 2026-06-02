@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
@@ -104,28 +105,40 @@ class SessionManager:
         # that would result from a partial creation racing with close_all().
         async with self._lock:
             ctx = await self._bm.create_persistent_context(block_resources=False)
-            # v1.6.6: instantiate TabManager BEFORE opening the initial page
-            # so the auto-popup listener (ctx.on("page", ...)) is attached
-            # before any other code can spawn a popup.
-            # v1.6.8: hand the NetworkCollector to TabManager so popups and
-            # new_tab() pages get capture wired automatically.
-            tab_mgr = TabManager(ctx, network_collector=self._network_collector)
-
-            ua = None
+            # v1.6.16 SM-1: from here until the context is registered in the
+            # session dicts it is owned by nobody -- close_all() iterates
+            # self._sessions, so an exception escaping before registration
+            # (e.g. TabManager construction, or anything after the context is
+            # built) would leak a live BrowserContext for the process
+            # lifetime. Guarantee the context is either registered or closed:
+            # on any failure, best-effort close it and re-raise.
             try:
-                initial_page = await ctx.new_page()
-                # Register the initial page as the "main" tab. It stays open
-                # for the lifetime of the session and is reused by subsequent
-                # actions targeting this session.
-                await tab_mgr.register_initial_page(initial_page, INITIAL_TAB_ID)
-                ua = await initial_page.evaluate("() => navigator.userAgent")
-            except Exception:
-                ua = None
+                # v1.6.6: instantiate TabManager BEFORE opening the initial
+                # page so the auto-popup listener (ctx.on("page", ...)) is
+                # attached before any other code can spawn a popup.
+                # v1.6.8: hand the NetworkCollector to TabManager so popups
+                # and new_tab() pages get capture wired automatically.
+                tab_mgr = TabManager(ctx, network_collector=self._network_collector)
 
-            info = SessionInfo(session_id=session_id, name=name, user_agent=ua)
-            self._sessions[session_id] = ctx
-            self._info[session_id] = info
-            self._tabs[session_id] = tab_mgr
+                ua = None
+                try:
+                    initial_page = await ctx.new_page()
+                    # Register the initial page as the "main" tab. It stays
+                    # open for the lifetime of the session and is reused by
+                    # subsequent actions targeting this session.
+                    await tab_mgr.register_initial_page(initial_page, INITIAL_TAB_ID)
+                    ua = await initial_page.evaluate("() => navigator.userAgent")
+                except Exception:
+                    ua = None
+
+                info = SessionInfo(session_id=session_id, name=name, user_agent=ua)
+                self._sessions[session_id] = ctx
+                self._info[session_id] = info
+                self._tabs[session_id] = tab_mgr
+            except BaseException:
+                with suppress(Exception):
+                    await ctx.close()
+                raise
 
         logger.info(
             "Session created: {sid} (name={name})",

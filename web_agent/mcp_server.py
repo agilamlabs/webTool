@@ -48,6 +48,7 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -70,13 +71,16 @@ from .config import AppConfig
 from .models import (
     Action,
     ActionSequenceResult,
+    ActionStatus,
     AgentResult,
     DownloadResult,
     ExtractionResult,
     FormFilterSpec,
     ResearchResult,
+    ScreenshotFormat,
     ScreenshotResult,
 )
+from .utils import safe_join_path
 
 # ---------------------------------------------------------------------------
 # Lifespan: initialize the Agent once per MCP session (browser stays warm)
@@ -100,8 +104,6 @@ def _load_mcp_config() -> AppConfig:
     """
     yaml_path = os.environ.get("WEB_AGENT_CONFIG")
     if yaml_path:
-        from pathlib import Path
-
         path = Path(yaml_path)
         if path.exists():
             try:
@@ -1011,9 +1013,43 @@ async def web_print_page_as_pdf(
     tab_id: Optional[str] = None,
 ) -> dict:
     """Render the current page (or ``url``) as PDF via Chromium's
-    ``page.pdf()``. Output path defaults to ``automation.screenshot_dir``.
+    ``page.pdf()``.
+
+    The PDF is always written *inside* ``automation.screenshot_dir``.
+    ``output_path`` is interpreted relative to that directory; absolute
+    paths and ``..`` traversal are rejected (the rendered PDF can never
+    be written outside the configured output directory).
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
+
+    # v1.6.16 MC-1: contain the LLM-controlled ``output_path`` at this MCP
+    # boundary. The underlying ``BrowserActions.print_page_as_pdf`` honours
+    # absolute ``output_path`` values verbatim (writing the rendered PDF
+    # anywhere on disk -- the arbitrary-write class hardened out of
+    # ``save_results``/screenshots in v1.6.14 B-5). We reuse the same
+    # ``safe_join_path`` containment the screenshot path uses: validate
+    # ``output_path`` against the screenshot/output dir (rejecting
+    # cross-platform-absolute paths and ``..`` escapes) and rewrite it to a
+    # path *relative to* that dir before calling down. Passing the relative
+    # form means the downstream re-join stays inside the dir and never hits
+    # the absolute-path bypass branch.
+    if output_path is not None:
+        shot_dir = Path(agent._config.automation.screenshot_dir)
+        try:
+            contained = safe_join_path(shot_dir, output_path)
+        except ValueError as exc:
+            logger.warning("Rejected print_page_as_pdf output_path: {e}", e=exc)
+            return ScreenshotResult(
+                url=url or "",
+                path="",
+                format=ScreenshotFormat.PNG,
+                status=ActionStatus.FAILED,
+                error_message=f"output_path rejected (must stay under screenshot_dir): {exc}",
+            ).model_dump(mode="json")
+        # Hand down the contained path *relative to* shot_dir so the
+        # downstream ``safe_join_path`` re-anchors it identically.
+        output_path = str(contained.relative_to(shot_dir.resolve()))
+
     r = await agent.print_page_as_pdf(
         url=url,
         output_path=output_path,

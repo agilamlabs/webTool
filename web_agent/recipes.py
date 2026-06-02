@@ -32,6 +32,7 @@ from .models import (
     DownloadResult,
     ExtractionResult,
     FetchDiagnostic,
+    FetchResult,
     FetchStatus,
     FormFilterSpec,
     ResearchResult,
@@ -43,6 +44,7 @@ from .utils import BudgetTracker, check_domain_allowed, safe_page_content
 from .web_fetcher import (
     WebFetcher,
     _is_download_url,
+    _response_peer_is_private,
     _url_ext_classification,
     is_binary_kind,
     is_extractable_binary_kind,
@@ -600,11 +602,34 @@ class Recipes:
         ranked = sorted(allowed, key=lambda r: scores[r.url], reverse=True)
         targets = ranked[:max_pages]
 
-        # Fetch in parallel (bounded by BrowserManager semaphore inside
-        # fetcher). v1.6.9: route through fetch_smart so extensionless
-        # binary URLs (regulator dashboards etc.) get fetch_binary'd
-        # instead of HTML-extracted.
-        fetch_tasks = [self._fetcher.fetch_smart(r.url, session_id=session_id) for r in targets]
+        # Fetch in parallel. v1.6.9: route through fetch_smart so
+        # extensionless binary URLs (regulator dashboards etc.) get
+        # fetch_binary'd instead of HTML-extracted.
+        #
+        # v1.6.16 REC-2: bound the fan-out with the SAME per-session
+        # semaphore ``fetch_many`` added in v1.6.14 C-4. On the session
+        # path, ``fetch_smart -> fetch -> _do_fetch`` creates pages via
+        # ``ctx.new_page()`` directly (web_fetcher.py), bypassing the
+        # BrowserManager context semaphore -- so an unbounded
+        # ``asyncio.gather`` over a large ``max_pages`` opens 20+
+        # concurrent navigations on one BrowserContext and reproducibly
+        # crashes Chromium's renderer. Gate concurrency to
+        # ``BrowserConfig.max_pages_per_session_fetch`` (the same bound
+        # ``fetch_many`` uses); the ephemeral path (no ``session_id``)
+        # stays bounded by ``max_contexts`` via ``BrowserManager.new_page``,
+        # exactly as ``fetch_many`` leaves it. ``return_exceptions=True``
+        # is preserved so a single page failure never aborts the run, and
+        # task order matches ``targets`` for the ``strict=True`` zip below.
+        if session_id is not None:
+            sem = asyncio.Semaphore(self._config.browser.max_pages_per_session_fetch)
+
+            async def _gated_fetch(target_url: str) -> FetchResult:
+                async with sem:
+                    return await self._fetcher.fetch_smart(target_url, session_id=session_id)
+
+            fetch_tasks = [_gated_fetch(r.url) for r in targets]
+        else:
+            fetch_tasks = [self._fetcher.fetch_smart(r.url, session_id=session_id) for r in targets]
         fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
         citations: list[Citation] = []
@@ -831,15 +856,58 @@ class Recipes:
         from playwright.async_api import TimeoutError as PlaywrightTimeout
 
         from .browser_actions import _resolve_locator
-        from .models import FetchResult, FetchStatus
 
         timeout_ms = spec.wait_timeout_ms
 
         async def _drive(page: Page) -> ExtractionResult:
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             except PlaywrightTimeout:
                 logger.warning("fill_form_and_extract: navigation timed out for {url}", url=url)
+                return ExtractionResult(
+                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                )
+
+            # v1.6.16 REC-1: this recipe drives a raw Playwright page, so the
+            # SSRF re-checks that ``WebFetcher._navigate_and_extract`` performs
+            # after ``goto`` (web_fetcher.py) must be repeated here -- the
+            # up-front ``check_domain_allowed(url)`` gate above cannot see a
+            # post-navigation 3xx / meta-refresh redirect to an internal host
+            # or a DNS rebind to a private peer (cloud metadata, RFC1918,
+            # loopback). Re-validate BOTH the client-side final URL and the
+            # navigation Response URL, then re-check the ACTUAL connected
+            # peer IP. On any violation, fail the same way a blocked domain
+            # does (extraction_method="none") so internal content is never
+            # filled into / extracted from.
+            final_url = page.url
+            response_url = response.url if response is not None else None
+            for candidate in (final_url, response_url):
+                if (
+                    isinstance(candidate, str)
+                    and candidate
+                    and candidate != url
+                    and not check_domain_allowed(candidate, self._config.safety)
+                ):
+                    logger.warning(
+                        "fill_form_and_extract: navigation redirected to "
+                        "disallowed URL {c} (from {url})",
+                        c=candidate,
+                        url=url,
+                    )
+                    return ExtractionResult(
+                        url=url,
+                        extraction_method="none",
+                        correlation_id=get_correlation_id(),
+                    )
+            if getattr(self._config.safety, "block_private_ips", False) and (
+                await _response_peer_is_private(response)
+            ):
+                logger.warning(
+                    "fill_form_and_extract: navigation connected to a private/"
+                    "loopback/link-local peer for {url} (post-connect "
+                    "DNS-rebinding guard)",
+                    url=url,
+                )
                 return ExtractionResult(
                     url=url, extraction_method="none", correlation_id=get_correlation_id()
                 )
