@@ -27,7 +27,7 @@ from urllib.robotparser import RobotFileParser
 import httpx
 from loguru import logger
 
-from .utils import is_private_address
+from .utils import httpx_peer_ip, is_private_address
 
 # v1.6.16 ROBOTS-1: bound the per-host cache / lock dicts. RobotsChecker
 # lives for the whole process (e.g. the MCP server holds one Agent), so a
@@ -191,6 +191,23 @@ class RobotsChecker:
             # robots / allow-all" per the existing semantics below.
             async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=False) as client:
                 resp = await client.get(url, headers={"User-Agent": self._user_agent})
+            # v1.6.16 ROBOTS-2 (post-connect): the PRE-connect guard above
+            # checks the host before resolving, but a DNS rebind inside the
+            # cache window can still land this fetch on an internal address.
+            # follow_redirects=False makes ``resp`` a complete, non-streaming
+            # response, so httpx_peer_ip can read the concrete socket peer.
+            # If it's private, treat as allow-all (return None) -- same
+            # fail-open-to-allow policy as the pre-connect skip.
+            if self._block_private_ips:
+                peer_ip = httpx_peer_ip(resp)
+                if peer_ip and is_private_address(peer_ip):
+                    logger.debug(
+                        "robots.txt fetch for {h} connected to private peer {ip}; "
+                        "treating as allow-all (SSRF defense-in-depth)",
+                        h=host,
+                        ip=peer_ip,
+                    )
+                    return None
             if resp.status_code != 200:
                 logger.debug(
                     "robots.txt for {h}: HTTP {c}, treating as allow-all",

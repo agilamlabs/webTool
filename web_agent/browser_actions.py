@@ -1671,6 +1671,19 @@ class BrowserActions:
             raise ValueError(f"Session {session_id!r} has no current tab. Open one first.")
         self._sessions.touch(session_id)
 
+        # Re-gate the session tab's current URL before reading its content.
+        # A prior navigation may have parked this tab on a denied/private
+        # host (e.g. a redirect a post-nav check flagged while the tab still
+        # sits there); reading document.body.innerText off such a page would
+        # be a deny-list bypass / content-exfil oracle.
+        if not check_domain_allowed(page.url, self._config.safety):
+            host = urlparse(page.url).hostname or ""
+            return ActionResult(
+                action=ActionType.SCROLL,
+                status=ActionStatus.FAILED,
+                error_message=f"scroll_until_text: current page URL is on a disallowed domain: {host}",
+            )
+
         from .exceptions import ActionError
 
         # Already on the page? Quick win. A failure here is non-fatal: we
@@ -1883,6 +1896,15 @@ class BrowserActions:
             # Navigate if URL given. For session+tab mode without a URL,
             # we observe the current state in place.
             if url:
+                # Pre-navigation gate on the INPUT url. The session path
+                # resolves ``page`` from the session tab above, skipping the
+                # ephemeral branch's identical check -- without this gate the
+                # goto below would fire an outbound request to a denied/private
+                # host before the post-redirect check could see it (blind SSRF
+                # on an LLM-controlled URL).
+                if not check_domain_allowed(url, safety):
+                    host = urlparse(url).hostname or ""
+                    raise ValueError(f"Domain not allowed: {host}")
                 # Snapshot the session tab's previous URL so we can roll
                 # back if the goto lands on a denied host. Without this,
                 # a thwarted observe() permanently navigates the session's

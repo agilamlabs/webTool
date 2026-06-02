@@ -708,10 +708,15 @@ class BrowserManager:
         if should_block and blocked:
 
             async def _block_resources(route: Route) -> None:
-                if route.request.resource_type in blocked:
-                    await route.abort()
-                else:
-                    await route.continue_()
+                # v1.6.16 BR-3: on context/page teardown the route may already
+                # be gone; abort()/continue_() then raise into Playwright's
+                # dispatcher. A routing decision on a dying page is moot --
+                # suppress. Mirrors the persistent-context twin.
+                with suppress(Exception):
+                    if route.request.resource_type in blocked:
+                        await route.abort()
+                    else:
+                        await route.continue_()
 
             await ctx.route("**/*", _block_resources)
 

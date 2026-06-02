@@ -54,6 +54,22 @@ def _make_browser_manager(page: MagicMock) -> MagicMock:
     return bm
 
 
+def _make_sessions(page: MagicMock) -> MagicMock:
+    """Fake SessionManager whose current tab resolves to ``page``.
+
+    Mirrors what observe()/scroll_until_text() touch on the session path:
+    get_tab_manager -> tab_mgr; tab_mgr.get_or_current -> page;
+    tab_mgr.current_tab_id() -> id; sessions.touch(...).
+    """
+    tab_mgr = MagicMock()
+    tab_mgr.get_or_current = MagicMock(return_value=page)
+    tab_mgr.current_tab_id = MagicMock(return_value="main")
+    sessions = MagicMock()
+    sessions.get_tab_manager = MagicMock(return_value=tab_mgr)
+    sessions.touch = MagicMock()
+    return sessions
+
+
 # ----------------------------------------------------------------------
 
 
@@ -152,3 +168,30 @@ async def test_observe_text_truncated_to_safety_cap(tmp_path: Path) -> None:
 
     assert obs.visible_text is not None
     assert len(obs.visible_text) == 100
+
+
+@pytest.mark.asyncio
+async def test_observe_session_path_gates_input_url_before_goto(tmp_path: Path) -> None:
+    """H2: observe(session_id=..., url=<denied>) resolves the page from the
+    session tab, skipping the ephemeral branch's gate. The session path must
+    itself gate the INPUT url BEFORE navigating, so a denied/private host
+    never receives an outbound request (blind SSRF guard)."""
+    config = AppConfig(
+        base_dir=str(tmp_path),
+        # block_private_ips defaults True -> the IMDS host is denied
+        automation=AutomationConfig(screenshot_dir=str(tmp_path / "shots")),
+    )
+    page = _make_page()
+    ba = BrowserActions(
+        _make_browser_manager(page), config, sessions=_make_sessions(page)
+    )
+
+    with pytest.raises(ValueError, match="Domain not allowed"):
+        await ba.observe(
+            session_id="sid",
+            url="http://169.254.169.254/latest/meta-data/",
+        )
+
+    # Critical: the outbound navigation must NEVER have fired.
+    page.goto.assert_not_awaited()
+    page.screenshot.assert_not_awaited()

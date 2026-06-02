@@ -485,12 +485,32 @@ def get_retry_policy(name: str | RetryPolicy) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 # Domain Allow / Deny Helpers
 # ---------------------------------------------------------------------------
+def _canonicalize_ip_literal(host: str) -> str:
+    """Return the canonical form of an IP-literal host, else ``host`` unchanged.
+
+    IPv6 addresses have many equivalent textual forms (zero-compression,
+    leading zeros, case). ``urlparse().hostname`` lowercases and strips the
+    ``[...]`` brackets but does NOT compress, so ``2001:db8:0:0:0:0:0:1`` and
+    ``2001:db8::1`` would compare unequal in ``_matches_domain`` -- a deny
+    entry in a non-canonical form would silently fail open. Normalising both
+    the live host and the configured pattern through
+    ``ipaddress.<addr>.compressed`` makes the string comparison sound.
+    Non-IP hostnames pass through unchanged.
+    """
+    if not host:
+        return host
+    try:
+        return ipaddress.ip_address(host).compressed
+    except ValueError:
+        return host
+
+
 def _normalize_host(url: str) -> str:
     """Return the lowercase hostname (without port) from a URL, or empty string."""
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().strip()
-        return host
+        return _canonicalize_ip_literal(host)
     except Exception:
         return ""
 

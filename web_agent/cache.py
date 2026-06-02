@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from abc import ABC, abstractmethod
@@ -36,6 +37,15 @@ from loguru import logger
 def _hash_key(s: str) -> str:
     """Return a 32-char SHA256 prefix of ``s`` for use as a filename."""
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:32]
+
+
+def _sanitize_key_hint(key: str) -> str:
+    # The hint is debug-only (never used for lookup), so strip anything that
+    # could carry a secret: the URL query string (?token=/?api_key=/...) and
+    # any ``://user:pass@`` userinfo. Truncate to 200 chars as before.
+    hint = key.split("?", 1)[0]
+    hint = re.sub(r"://[^/@\s]*@", "://", hint)
+    return hint[:200]
 
 
 class Cache(ABC):
@@ -108,23 +118,29 @@ class DiskCache(Cache):
         # loop (mirrors trace_recorder's ``asyncio.to_thread`` for its
         # append). We still hold ``self._lock`` so the read ordering and
         # cache semantics are unchanged.
+        #
+        # L2: the TTL comparison and the stale-entry unlink MUST run inside
+        # the lock too. If they ran after the lock released, a concurrent
+        # set() could write a fresh entry to this same path between our read
+        # and our unlink, and a stale reader would then delete that fresh
+        # entry. Keeping the whole read/TTL/unlink critical section under the
+        # lock closes that race; behavior for a valid unexpired entry is
+        # unchanged.
         try:
             async with self._lock:
                 payload = await asyncio.to_thread(self._read_payload, path)
+                if payload is None:
+                    return None
+                cached_at = float(payload.get("_cached_at", 0))
+                if time.time() - cached_at > self._ttl:
+                    with suppress(OSError):
+                        await asyncio.to_thread(path.unlink)
+                    return None
+                data = payload.get("data")
+                return data if isinstance(data, dict) else None
         except (OSError, json.JSONDecodeError) as exc:
             logger.debug("cache read failed for {k}: {e}", k=key[:60], e=exc)
             return None
-        if payload is None:
-            return None
-
-        cached_at = float(payload.get("_cached_at", 0))
-        if time.time() - cached_at > self._ttl:
-            with suppress(OSError):
-                await asyncio.to_thread(path.unlink)
-            return None
-
-        data = payload.get("data")
-        return data if isinstance(data, dict) else None
 
     @staticmethod
     def _read_payload(path: Path) -> dict[str, Any] | None:
@@ -144,8 +160,10 @@ class DiskCache(Cache):
         path = self._dir / f"{_hash_key(key)}.json"
         payload = {
             "_cached_at": time.time(),
-            # Truncated key hint helps with debugging but is not used for lookup
-            "_key_hint": key[:200],
+            # Truncated key hint helps with debugging but is not used for lookup.
+            # Sanitized so a URL key carrying ?token=/?api_key=/user:pass@ never
+            # lands unredacted in the plaintext cache file.
+            "_key_hint": _sanitize_key_hint(key),
             "data": value,
         }
         text = json.dumps(payload, default=str, ensure_ascii=False)
@@ -199,15 +217,26 @@ class DiskCache(Cache):
         if not self._dir.exists():
             return
         files = list(self._dir.glob("*.json"))
-        total = sum(f.stat().st_size for f in files)
+        # L3: stat each file exactly once. A file vanishing mid-sweep (a
+        # concurrent unlink, or another process) would otherwise raise
+        # FileNotFoundError out of the sum()/sort-key stat() calls, escape to
+        # set()'s ``except OSError``, and be mislogged as "cache write
+        # failed". Skip vanished files instead.
+        entries = []
+        for f in files:
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, f))
+        total = sum(size for _, size, _ in entries)
         if total <= self._max_bytes:
             return
-        files.sort(key=lambda f: f.stat().st_mtime)  # oldest first
-        for f in files:
+        entries.sort(key=lambda e: e[0])  # oldest first
+        for _mtime, size, f in entries:
             if total <= self._max_bytes:
                 break
             try:
-                size = f.stat().st_size
                 f.unlink()
                 total -= size
             except OSError:

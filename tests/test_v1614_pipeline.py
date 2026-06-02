@@ -239,6 +239,85 @@ async def test_fill_form_and_extract_preserves_success_path(
 
 
 # ----------------------------------------------------------------------
+# H1 (v1.6.16): post-submit navigation must be re-gated before extraction
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fill_form_and_extract_regates_post_submit_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H1: the form SUBMIT is itself a navigation. If it 302 / JS-redirects
+    to an internal host (e.g. AWS IMDS at 169.254.169.254), the post-submit
+    URL must be re-gated BEFORE extraction. The page's ``.url`` is an
+    ALLOWED host at initial-nav time but becomes a private/link-local host
+    after submit; ``fill_form_and_extract`` must return
+    ``extraction_method="none"`` and must NOT run ``safe_page_content`` /
+    extraction on the post-submit (internal) page.
+    """
+    allowed_url = "https://example.com/form"
+    internal_url = "http://169.254.169.254/latest/meta-data/"
+
+    # Shared flag: the page URL is the allowed host until the submit click
+    # fires, then flips to the internal (link-local) host -- modelling a
+    # post-submit 302 / JS redirect to AWS IMDS.
+    state = {"submitted": False}
+
+    page = MagicMock()
+    page.goto = AsyncMock()
+    page.wait_for_load_state = AsyncMock()
+    # ``page.url`` is a property on real Playwright Page objects; here it
+    # returns the allowed host pre-submit and the internal host post-submit
+    # so the INITIAL-nav re-check is satisfied but the POST-submit gate
+    # must reject.
+    type(page).url = property(
+        lambda _self: internal_url if state["submitted"] else allowed_url
+    )
+
+    # The submit click (step 4) resolves via ``page.locator(<selector>)``;
+    # its ``.click()`` flips the redirect flag, mimicking the navigation.
+    submit_locator = MagicMock()
+
+    async def _click(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        state["submitted"] = True
+
+    submit_locator.click = AsyncMock(side_effect=_click)
+    page.locator = MagicMock(return_value=submit_locator)
+
+    # safe_page_content MUST NOT be invoked: the post-submit gate fires
+    # before extraction. If it is called, the SSRF gap is still open.
+    safe_content_calls: list = []
+
+    async def _spy_safe_content(_page, **_kwargs):  # type: ignore[no-untyped-def]
+        safe_content_calls.append(_page)
+        return ("<html><body>INTERNAL METADATA</body></html>", "content")
+
+    monkeypatch.setattr("web_agent.recipes.safe_page_content", _spy_safe_content)
+
+    recipes = _make_recipes_with_mock_page(page)
+    # A submit_selector forces step 4 to click (and thus flip the flag).
+    spec = FormFilterSpec(submit_selector="button[type=submit]")
+
+    result = await recipes.fill_form_and_extract(allowed_url, spec)
+
+    assert isinstance(result, ExtractionResult)
+    assert result.extraction_method == "none", (
+        f"post-submit redirect to an internal host must short-circuit to "
+        f"extraction_method='none', got {result.extraction_method!r}"
+    )
+    # ``url`` is reported as the original (allowed) request URL, matching
+    # the function's other early-returns.
+    assert result.url == allowed_url
+    # The submit must have actually fired (otherwise the test is vacuous).
+    assert state["submitted"] is True
+    # Critically: no extraction may have run on the post-submit page.
+    assert safe_content_calls == [], (
+        "H1 regression: safe_page_content/extraction ran on the post-submit "
+        "internal page; content from the disallowed host was captured."
+    )
+
+
+# ----------------------------------------------------------------------
 # C-8: tab_manager.py close_tab holds the lock across page.close()
 # ----------------------------------------------------------------------
 

@@ -619,6 +619,17 @@ class Agent:
                                     response_time_ms=bin_fr.response_time_ms,
                                 )
                             )
+                            # M2: charge the char budget for binary content
+                            # too (mirrors the HTML branch). Without this,
+                            # large PDFs/XLSX bypass max_chars_per_call. The
+                            # extraction + diagnostic are already recorded
+                            # above, so on overflow we just break -- same
+                            # net shape as the HTML branch.
+                            try:
+                                budget.add_chars(extraction.content_length)
+                            except Exception as exc:
+                                bag.err("budget_exceeded", str(exc))
+                                break
                         else:
                             bag.warn(
                                 "binary_extraction_failed",
@@ -660,6 +671,23 @@ class Agent:
                             )
                         )
 
+            # M1: bound the fetch fan-out by the *remaining* page budget so
+            # max_pages_per_call limits fetching, not just extraction. The
+            # binary loop above already spent pages via budget.add_page(),
+            # so remaining["pages"] correctly accounts for that. The common
+            # case (max_pages_per_call default 50 >= search-result count) is
+            # a no-op slice. The post-fetch add_page()/add_chars() checks
+            # below stay as belt-and-suspenders.
+            remaining_pages = max(0, int(budget.remaining["pages"]))
+            if len(page_items) > remaining_pages:
+                dropped = len(page_items) - remaining_pages
+                bag.warn(
+                    "page_budget_truncated",
+                    f"{dropped} page URL(s) not fetched: page budget "
+                    f"({self._config.safety.max_pages_per_call}) reached; "
+                    f"fetching {remaining_pages} of {len(page_items)}",
+                )
+                page_items = page_items[:remaining_pages]
             page_urls = [p.url for p in page_items]
             url_to_provider = {p.url: p.provider for p in page_items}
             logger.info("Fetching {n} pages...", n=len(page_urls))
@@ -971,7 +999,28 @@ class Agent:
                     f"new_tab: domain not allowed: {host!r}", url=url, host=host
                 )
             tm = self._sessions.get_tab_manager(session_id)
-            return await tm.new_tab(url=url)
+            tid = await tm.new_tab(url=url)
+            # v1.6.x H4: the INPUT url gate above cannot catch a server-side
+            # redirect from a whitelisted host into private/denied space.
+            # Re-check the tab's *landed* url; if it is now forbidden, close
+            # the just-created tab so it isn't left parked on the forbidden
+            # host, then signal denial identically to the input-url gate.
+            if url is not None:
+                page = tm.get_or_current(tid)
+                if page is not None and not check_domain_allowed(
+                    page.url, self._config.safety
+                ):
+                    from .exceptions import DomainNotAllowedError
+
+                    landed = page.url
+                    host = urlparse(landed).hostname or ""
+                    await tm.close_tab(tid)
+                    raise DomainNotAllowedError(
+                        f"new_tab: domain not allowed after redirect: {host!r}",
+                        url=landed,
+                        host=host,
+                    )
+            return tid
 
     async def switch_tab(self, tab_id: str, *, session_id: str) -> None:
         """Make ``tab_id`` the active tab. Brings it to front when possible."""
