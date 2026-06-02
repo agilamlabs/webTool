@@ -42,6 +42,7 @@ from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .utils import BudgetTracker, check_domain_allowed, safe_page_content
 from .web_fetcher import (
+    _EXT_TO_KIND,
     WebFetcher,
     _is_download_url,
     _response_peer_is_private,
@@ -393,6 +394,13 @@ class Recipes:
             file_types = ["pdf"]
         # Normalize extensions: ensure leading dot, lowercase
         normalized = {f".{ft.lstrip('.').lower()}" for ft in file_types}
+        # REC-3: the canonical *kinds* the requested extensions map to, for
+        # matching against ``classify_url`` (which returns a kind, not an
+        # extension -- ``.doc``/``.xls`` collapse to ``docx``/``xlsx``).
+        # Extensions with no kind mapping (e.g. ``.mp4``) contribute nothing,
+        # so an extensionless probe is only accepted as one of the kinds the
+        # caller actually asked for.
+        requested_kinds = {_EXT_TO_KIND[ext] for ext in normalized if ext in _EXT_TO_KIND}
 
         logger.info(
             "Recipe: find_and_download_file query={q} types={t}",
@@ -436,13 +444,23 @@ class Recipes:
                 classification = await self._fetcher.classify_url(r.url, session_id=session_id)
                 if not is_binary_kind(classification):
                     continue
-                # Match the detected kind against requested ``file_types``.
+                # REC-3: match the detected *kind* against the kinds the
+                # caller's ``file_types`` map to. ``classify_url`` returns a
+                # canonical kind (``classify_url(".doc") -> "docx"``,
+                # ``".xls" -> "xlsx"``), so comparing the kind against the raw
+                # dotted extensions (``".doc" in {".doc"}``) never matched --
+                # a caller asking for ['doc'] could never accept an
+                # extensionless DOC. Map through ``_EXT_TO_KIND`` so the
+                # comparison is kind-vs-kind.
+                #
                 # ``binary_other`` is opaque (HEAD said attachment but we
-                # can't pin the kind); skip when the caller pinned types.
+                # cannot pin the kind). Accept it only when the caller did
+                # not pin specific types (``requested_kinds`` empty); skip it
+                # otherwise rather than guess.
                 if classification == "binary_other":
-                    if normalized:
+                    if requested_kinds:
                         continue
-                elif f".{classification}" not in normalized:
+                elif classification not in requested_kinds:
                     continue
                 logger.info(
                     "Extensionless URL routed to download via HEAD probe: {url} (kind={kind})",

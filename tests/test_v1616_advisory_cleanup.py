@@ -1,0 +1,444 @@
+"""v1.6.16 LOW-severity advisory-cleanup tests.
+
+Focused unit tests for the advisory findings that were validated and
+fixed in this pass. All unit-level: no real browser, no real network.
+Mocks follow the patterns in ``tests/test_v1616_review_hardening.py``
+(fake session/tab-manager + MagicMock page) and
+``tests/test_v165_medium.py`` (Recipes with AsyncMock fetcher).
+
+Finding -> test map:
+  BR-7  : observe() URL-rollback re-validates prev_url before navigating
+          back (no second path onto a disallowed host).
+  BR-8  : scroll_until_text surfaces a closed page instead of swallowing
+          it; still rides over benign per-scroll load-state timeouts.
+  BR-9  : the submit-click heuristic is advisory only -- documented as
+          best-effort, allow_form_submit is the real gate (behaviour
+          regression guard: it still flags obvious submits + bypassable).
+  BR-10 : the WaitInput(FUNCTION) pre-flight still blocks the WHOLE
+          sequence atomically before any action runs (early-exit kept).
+  REC-3 : find_and_download_file extensionless fallback matches the
+          requested file_types by KIND (``['doc']`` accepts a ``docx``
+          classification; mismatched kinds still rejected).
+  AG-4  : save_results never derives a dotfile/empty filename from a
+          query with no alphanumerics.
+
+SKIPPED (no test):
+  REC-4 : ``_resolve_domain_hints`` is NOT dead -- it is a documented
+          back-compat public surface with its own tests in
+          tests/test_v162_models_and_profiles.py. Left in place.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeout
+from web_agent.browser_actions import BrowserActions, _looks_like_submit
+from web_agent.config import AppConfig, SafetyConfig
+from web_agent.exceptions import ActionError
+from web_agent.models import (
+    ActionStatus,
+    AgentResult,
+    DownloadResult,
+    EvaluateInput,
+    FetchStatus,
+    LocatorSpec,
+    SearchResponse,
+    SearchResultItem,
+    WaitInput,
+    WaitTarget,
+)
+from web_agent.recipes import Recipes
+
+
+def _result(position: int, url: str) -> SearchResultItem:
+    return SearchResultItem(position=position, title=url, url=url, provider="ddgs")
+
+
+def _make_browser_actions(page: MagicMock, cfg: AppConfig) -> BrowserActions:
+    """Real BrowserActions wired to a faked session that always returns
+    ``page`` for the current tab (mirrors test_v1616_review_hardening).
+
+    Wires both the ``observe``/``scroll_until_text`` lookup
+    (``get_or_current``) and the ``execute_sequence`` lookup (``get`` +
+    ``current``) so a single helper serves every test here.
+    """
+    fake_tab_mgr = MagicMock()
+    fake_tab_mgr.get_or_current = MagicMock(return_value=page)
+    fake_tab_mgr.current = MagicMock(return_value=page)
+    fake_tab_mgr.current_tab_id = MagicMock(return_value="t0")
+    fake_sessions = MagicMock()
+    fake_sessions.get = MagicMock(return_value=MagicMock())
+    fake_sessions.get_tab_manager = MagicMock(return_value=fake_tab_mgr)
+    fake_sessions.touch = MagicMock()
+    return BrowserActions(MagicMock(), cfg, sessions=fake_sessions)
+
+
+# ---------------------------------------------------------------------------
+# BR-7: observe() URL-rollback re-validates prev_url before navigating back
+# ---------------------------------------------------------------------------
+class TestBR7ObserveRollbackRevalidatesPrevUrl:
+    def _stateful_page(self, prev_url: str, redirect_url: str) -> MagicMock:
+        """Page whose .url is ``prev_url`` until goto() runs, then the
+        redirect target. goto() records every navigation target."""
+        page = MagicMock()
+        state = {"navigated": False}
+
+        async def _goto(target: str, **_k: object) -> None:
+            page.goto_targets.append(target)
+            # The first goto (to the requested url) lands on the redirect
+            # host. Subsequent gotos (rollback) just record the target.
+            if not state["navigated"]:
+                state["navigated"] = True
+                state["current"] = redirect_url
+
+        page.goto_targets = []
+        state["current"] = prev_url
+        page.goto = AsyncMock(side_effect=_goto)
+        type(page).url = property(lambda _self: state["current"])
+        page.is_closed = MagicMock(return_value=False)
+        return page
+
+    @pytest.mark.asyncio
+    async def test_disallowed_prev_url_is_not_navigated_back(self) -> None:
+        """When the tab's previous URL is itself denied by the policy, the
+        rollback must be skipped (no second path onto a disallowed host)."""
+        # Deny both the redirect target AND the previous host.
+        cfg = AppConfig(safety=SafetyConfig(denied_domains=["evil.com", "old-denied.com"]))
+        page = self._stateful_page(
+            prev_url="https://old-denied.com/page",
+            redirect_url="https://evil.com/landing",
+        )
+        ba = _make_browser_actions(page, cfg)
+
+        with pytest.raises(ValueError, match="redirected to disallowed domain"):
+            await ba.observe(url="https://allowed.example.com/start", session_id="sid")
+
+        # First goto = the requested URL. The denied prev_url must NOT be a
+        # rollback target.
+        assert page.goto_targets == ["https://allowed.example.com/start"]
+        assert "https://old-denied.com/page" not in page.goto_targets
+
+    @pytest.mark.asyncio
+    async def test_allowed_prev_url_is_navigated_back(self) -> None:
+        """Regression: a still-allowed previous URL is rolled back to (the
+        BR-7 fix must not break the legitimate rollback)."""
+        cfg = AppConfig(safety=SafetyConfig(denied_domains=["evil.com"]))
+        page = self._stateful_page(
+            prev_url="https://good.example.com/page",
+            redirect_url="https://evil.com/landing",
+        )
+        ba = _make_browser_actions(page, cfg)
+
+        with pytest.raises(ValueError, match="redirected to disallowed domain"):
+            await ba.observe(url="https://good.example.com/start", session_id="sid")
+
+        # Requested URL first, then the allowed prev_url as rollback.
+        assert page.goto_targets == [
+            "https://good.example.com/start",
+            "https://good.example.com/page",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# BR-8: scroll_until_text surfaces a closed page; rides over benign timeouts
+# ---------------------------------------------------------------------------
+class TestBR8ScrollUntilTextErrorHandling:
+    @pytest.mark.asyncio
+    async def test_page_closed_mid_scroll_raises(self) -> None:
+        """A page that closes during scrolling raises ActionError instead of
+        silently looping to a misleading 'not found'."""
+        cfg = AppConfig()
+        page = MagicMock()
+        # Initial quick-win read returns no match.
+        page.evaluate = AsyncMock(return_value="nothing here")
+        page.mouse.wheel = AsyncMock()
+        page.wait_for_load_state = AsyncMock()
+        # Closed by the time the loop checks at the top of iteration 1.
+        page.is_closed = MagicMock(return_value=True)
+        ba = _make_browser_actions(page, cfg)
+
+        with pytest.raises(ActionError, match="page was closed"):
+            await ba.scroll_until_text("target", session_id="sid", max_scrolls=3)
+
+    @pytest.mark.asyncio
+    async def test_evaluate_raises_on_closed_page_is_fatal(self) -> None:
+        """If the body read itself raises because the page closed, that is
+        fatal (re-raised), not swallowed via ``continue``."""
+        cfg = AppConfig()
+        page = MagicMock()
+        closed = {"v": False}
+        page.mouse.wheel = AsyncMock()
+        page.wait_for_load_state = AsyncMock()
+
+        async def _evaluate(_expr: str) -> str:
+            # First (quick-win) read succeeds with no match; then the page
+            # closes and the in-loop read raises.
+            if closed["v"]:
+                raise RuntimeError("Target page, context or browser has been closed")
+            return "no match yet"
+
+        page.evaluate = AsyncMock(side_effect=_evaluate)
+
+        def _is_closed() -> bool:
+            return closed["v"]
+
+        page.is_closed = MagicMock(side_effect=_is_closed)
+        ba = _make_browser_actions(page, cfg)
+
+        # Trip the close after the loop's top-of-iteration is_closed() check
+        # passes but before/at the evaluate. Use wheel as the trigger point.
+        async def _wheel(*_a: object, **_k: object) -> None:
+            closed["v"] = True
+
+        page.mouse.wheel = AsyncMock(side_effect=_wheel)
+
+        with pytest.raises(ActionError, match="page was closed"):
+            await ba.scroll_until_text("target", session_id="sid", max_scrolls=3)
+
+    @pytest.mark.asyncio
+    async def test_benign_load_state_timeout_is_tolerated(self) -> None:
+        """A per-scroll load-state TimeoutError must NOT abort the loop --
+        the scroll keeps going and eventually finds the text."""
+        cfg = AppConfig()
+        page = MagicMock()
+        reads = {"n": 0}
+
+        async def _evaluate(_expr: str) -> str:
+            reads["n"] += 1
+            # Quick-win + first loop read: no match. Then the text appears.
+            return "FOUND IT" if reads["n"] >= 3 else "loading..."
+
+        page.evaluate = AsyncMock(side_effect=_evaluate)
+        page.mouse.wheel = AsyncMock()
+        # Load-state always times out -- the benign infinite-scroll case.
+        page.wait_for_load_state = AsyncMock(side_effect=PlaywrightTimeout("timeout"))
+        page.is_closed = MagicMock(return_value=False)
+        ba = _make_browser_actions(page, cfg)
+
+        res = await ba.scroll_until_text("FOUND IT", session_id="sid", max_scrolls=5)
+        assert res.data["found"] is True
+        assert res.status == ActionStatus.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# BR-9: submit-click heuristic is advisory; allow_form_submit is the gate
+# ---------------------------------------------------------------------------
+class TestBR9SubmitHeuristicIsAdvisory:
+    def test_docstring_does_not_promise_a_guarantee(self) -> None:
+        """The fix reframes the heuristic as advisory and names the real
+        gate; assert the docstring no longer over-promises."""
+        doc = (_looks_like_submit.__doc__ or "").lower()
+        assert "advisory" in doc
+        assert "allow_form_submit" in doc
+        # Must NOT claim a guarantee.
+        assert "guarantee" not in doc or "not a guarantee" in doc
+
+    def test_still_flags_obvious_submit_css(self) -> None:
+        assert _looks_like_submit("button[type=submit]") is True
+
+    def test_still_flags_submit_keyword_locator(self) -> None:
+        assert _looks_like_submit(LocatorSpec(text="Log in")) is True
+
+    def test_bypassable_div_handler_not_flagged(self) -> None:
+        """Documents the advisory limitation: a non-button selector that
+        submits via a JS handler is NOT caught (heuristic is best-effort)."""
+        assert _looks_like_submit("div#go") is False
+        assert _looks_like_submit(LocatorSpec(selector="div.cta")) is False
+
+
+# ---------------------------------------------------------------------------
+# BR-10: WaitInput(FUNCTION) pre-flight keeps all-or-nothing block semantics
+# ---------------------------------------------------------------------------
+class TestBR10PreflightEarlyExitPreserved:
+    def _seq_page(self) -> MagicMock:
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.on = MagicMock()
+        page.remove_listener = MagicMock()
+        page.is_closed = MagicMock(return_value=False)
+        page.fill = AsyncMock()
+        page.wait_for_function = AsyncMock()
+        type(page).url = property(lambda _self: "https://good.example/app")
+        return page
+
+    @pytest.mark.asyncio
+    async def test_function_wait_blocks_whole_sequence_before_any_action(self) -> None:
+        """With allow_js_evaluation=False, a sequence containing a
+        WaitInput(FUNCTION) must block EVERY action up-front (no partial
+        execution) -- the pre-flight early-exit the comment documents.
+
+        The pre-flight runs before page acquisition, so the page is never
+        touched (goto not awaited)."""
+        cfg = AppConfig(safety=SafetyConfig(allow_js_evaluation=False))
+        page = self._seq_page()
+        ba = _make_browser_actions(page, cfg)
+
+        actions = [
+            EvaluateInput(expression="1+1"),  # would also be blocked
+            WaitInput(target=WaitTarget.FUNCTION, value="() => true"),
+        ]
+        res = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
+
+        # All actions reported blocked (SKIPPED) up-front; none executed.
+        assert res.actions_total == 2
+        assert res.actions_succeeded == 0
+        assert all(r.status == ActionStatus.SKIPPED for r in res.results)
+        assert any("allow_js_evaluation=False" in (r.error_message or "") for r in res.results)
+        # Pre-flight short-circuits BEFORE navigation/dispatch.
+        page.goto.assert_not_awaited()
+        page.fill.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_function_wait_allowed_when_js_enabled(self) -> None:
+        """Sanity: the pre-flight does not block when JS-eval is enabled --
+        the sequence runs and wait_for_function is dispatched."""
+        from web_agent.browser_actions import _PAGE_DIALOG_STATES
+
+        cfg = AppConfig(safety=SafetyConfig(allow_js_evaluation=True))
+        page = self._seq_page()
+        ba = _make_browser_actions(page, cfg)
+
+        actions = [WaitInput(target=WaitTarget.FUNCTION, value="() => true")]
+        try:
+            res = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
+        finally:
+            _PAGE_DIALOG_STATES.pop(page, None)
+        assert res.actions_succeeded == 1
+        page.wait_for_function.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# REC-3: extensionless fallback matches requested file_types by KIND
+# ---------------------------------------------------------------------------
+class TestREC3FindAndDownloadFileKindMatch:
+    def _recipes(self, urls: list[str], classification: str, download_mock: MagicMock) -> Recipes:
+        search_mock = MagicMock()
+        search_mock.search = AsyncMock(
+            return_value=SearchResponse(
+                query="q",
+                total_results=len(urls),
+                results=[_result(i + 1, u) for i, u in enumerate(urls)],
+            )
+        )
+        fetcher_mock = MagicMock()
+        fetcher_mock.classify_url = AsyncMock(return_value=classification)
+        cfg = AppConfig(log_level="WARNING", safety=SafetyConfig(probe_binary_urls=True))
+        return Recipes(
+            search=search_mock,
+            fetcher=fetcher_mock,
+            extractor=MagicMock(),
+            downloader=download_mock,
+            config=cfg,
+        )
+
+    @pytest.mark.asyncio
+    async def test_doc_request_accepts_docx_classification(self) -> None:
+        """The bug: ``file_types=['doc']`` could never match because
+        classify_url returns the kind ``'docx'`` while the old code compared
+        against the raw ``'.doc'``. After REC-3 it matches."""
+        download_mock = MagicMock()
+        download_mock.download = AsyncMock(
+            return_value=DownloadResult(
+                url="https://x.example.com/Archives/77",
+                filepath="/tmp/77.doc",
+                filename="77.doc",
+                status=FetchStatus.SUCCESS,
+            )
+        )
+        recipes = self._recipes(
+            urls=["https://x.example.com/Archives/77"],  # extensionless
+            classification="docx",
+            download_mock=download_mock,
+        )
+        result = await recipes.find_and_download_file("filing", file_types=["doc"])
+        assert result.status == FetchStatus.SUCCESS
+        download_mock.download.assert_awaited_once()
+        assert download_mock.download.await_args.args[0] == "https://x.example.com/Archives/77"
+
+    @pytest.mark.asyncio
+    async def test_xls_request_accepts_xlsx_classification(self) -> None:
+        """``file_types=['xls']`` -> kind ``'xlsx'`` -> matches."""
+        download_mock = MagicMock()
+        download_mock.download = AsyncMock(
+            return_value=DownloadResult(
+                url="https://x.example.com/d/88",
+                filepath="/tmp/88.xls",
+                filename="88.xls",
+                status=FetchStatus.SUCCESS,
+            )
+        )
+        recipes = self._recipes(
+            urls=["https://x.example.com/d/88"],
+            classification="xlsx",
+            download_mock=download_mock,
+        )
+        result = await recipes.find_and_download_file("sheet", file_types=["xls"])
+        assert result.status == FetchStatus.SUCCESS
+        download_mock.download.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mismatched_kind_still_rejected(self) -> None:
+        """Regression: a caller asking for ['pdf'] must NOT accept an
+        extensionless URL that classifies as 'xlsx'."""
+        download_mock = MagicMock()
+        download_mock.download = AsyncMock()
+        recipes = self._recipes(
+            urls=["https://x.example.com/d/99"],
+            classification="xlsx",
+            download_mock=download_mock,
+        )
+        result = await recipes.find_and_download_file("report", file_types=["pdf"])
+        assert result.status == FetchStatus.NETWORK_ERROR
+        download_mock.download.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_binary_other_skipped_when_types_pinned(self) -> None:
+        """An opaque ``binary_other`` is not accepted when the caller pinned
+        specific types (cannot prove it is the requested kind)."""
+        download_mock = MagicMock()
+        download_mock.download = AsyncMock()
+        recipes = self._recipes(
+            urls=["https://x.example.com/d/abc"],
+            classification="binary_other",
+            download_mock=download_mock,
+        )
+        result = await recipes.find_and_download_file("thing", file_types=["pdf"])
+        assert result.status == FetchStatus.NETWORK_ERROR
+        download_mock.download.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# AG-4: save_results never yields a dotfile / empty filename
+# ---------------------------------------------------------------------------
+class TestAG4SaveResultsFilenameSafety:
+    def _agent(self, out_dir: Path):
+        from web_agent.agent import Agent
+
+        return Agent(AppConfig(output_dir=str(out_dir)))
+
+    def _result_obj(self, query: str) -> AgentResult:
+        return AgentResult(
+            query=query,
+            search=SearchResponse(query=query, total_results=0, results=[]),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("query", ["???", "", "...", "   ", "!@#$%"])
+    async def test_degenerate_query_yields_safe_filename(self, tmp_path: Path, query: str) -> None:
+        agent = self._agent(tmp_path)
+        path = await agent.save_results(self._result_obj(query))
+        # Non-empty stem, real .json suffix, NOT a dotfile, NOT all-underscore.
+        assert path.suffix == ".json"
+        assert path.stem == "results"
+        assert not path.name.startswith(".")
+        assert path.exists()
+
+    @pytest.mark.asyncio
+    async def test_normal_query_still_used_as_stem(self, tmp_path: Path) -> None:
+        agent = self._agent(tmp_path)
+        path = await agent.save_results(self._result_obj("Quarterly Report 2025"))
+        assert path.name == "Quarterly_Report_2025.json"
+        assert path.exists()
