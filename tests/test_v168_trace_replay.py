@@ -146,8 +146,21 @@ async def test_trace_recorder_load_entries_round_trip(tmp_path: Path) -> None:
 
 def test_trace_recorder_load_entries_missing_file_raises(tmp_path: Path) -> None:
     rec = _make_recorder(tmp_path, trace_enabled=True)
+    # A missing file INSIDE the trace dir still raises FileNotFoundError.
     with pytest.raises(FileNotFoundError):
-        rec.load_entries(tmp_path / "does-not-exist.jsonl")
+        rec.load_entries(rec.trace_dir / "does-not-exist.jsonl")
+
+
+def test_trace_recorder_load_entries_outside_dir_raises_valueerror(tmp_path: Path) -> None:
+    """L6: containment is checked BEFORE existence, so a path OUTSIDE the
+    trace dir raises ValueError (not FileNotFoundError) even when the file
+    does not exist -- the exception type no longer leaks whether an
+    out-of-dir path exists."""
+    rec = _make_recorder(tmp_path, trace_enabled=True)
+    outside = tmp_path / "outside-the-trace-dir.jsonl"
+    assert not outside.exists()
+    with pytest.raises(ValueError, match="must be inside trace_dir"):
+        rec.load_entries(outside)
 
 
 # ---------------------------------------------------------------------------

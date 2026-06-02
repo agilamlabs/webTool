@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
-from web_agent.cache import DiskCache, _hash_key
+from web_agent.cache import DiskCache, _hash_key, _sanitize_key_hint
 
 
 class TestHashKey:
@@ -124,6 +125,69 @@ class TestDiskCache:
         # Writing should create it
         await cache.set("k", {"v": 1})
         assert cache_dir.exists()
+
+
+class TestKeyHintSanitization:
+    """M5: the debug-only ``_key_hint`` must never carry a secret from the
+    cache key (URL query string or ``://user:pass@`` userinfo) into the
+    plaintext cache JSON on disk."""
+
+    def test_strips_query_string(self) -> None:
+        hint = _sanitize_key_hint("fetch:sess:https://example.com/x?token=SECRET&a=1")
+        assert "SECRET" not in hint
+        assert "token=" not in hint
+        assert hint == "fetch:sess:https://example.com/x"
+
+    def test_strips_userinfo(self) -> None:
+        hint = _sanitize_key_hint("fetch:sess:https://user:pass@host/path")
+        assert "user:pass" not in hint
+        assert hint == "fetch:sess:https://host/path"
+
+    def test_strips_both_userinfo_and_query(self) -> None:
+        hint = _sanitize_key_hint(
+            "fetch:sess:https://alice:hunter2@host/p?api_key=ABC123"
+        )
+        assert "hunter2" not in hint
+        assert "ABC123" not in hint
+        assert "alice:hunter2" not in hint
+
+    def test_truncates_to_200(self) -> None:
+        long_path = "fetch:sess:https://example.com/" + ("a" * 500)
+        assert len(_sanitize_key_hint(long_path)) == 200
+
+    @pytest.mark.asyncio
+    async def test_on_disk_hint_omits_secrets(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / "cache"
+        cache = DiskCache(cache_dir=str(cache_dir))
+        key = "fetch:sess1:https://user:pass@host/path?token=SECRET&api_key=KEY99"
+        await cache.set(key, {"v": 1})
+
+        # Read the raw cache file back and inspect the persisted hint.
+        files = list(cache_dir.glob("*.json"))
+        assert len(files) == 1
+        on_disk = json.loads(files[0].read_text(encoding="utf-8"))
+        hint = on_disk["_key_hint"]
+        assert "SECRET" not in hint
+        assert "KEY99" not in hint
+        assert "token=" not in hint
+        assert "api_key=" not in hint
+        assert "user:pass" not in hint
+        # The whole serialized file must not contain the secrets either.
+        raw = files[0].read_text(encoding="utf-8")
+        assert "SECRET" not in raw
+        assert "KEY99" not in raw
+        assert "user:pass" not in raw
+
+    @pytest.mark.asyncio
+    async def test_eviction_still_bounds_size(self, tmp_path: Path) -> None:
+        """L3: eviction still bounds the cache even if a file vanishes
+        mid-sweep -- and a normal over-cap write evicts the oldest."""
+        cache = DiskCache(cache_dir=str(tmp_path / "cache"), max_cache_mb=0)
+        await cache.set("a", {"data": "x" * 100})
+        await asyncio.sleep(0.01)
+        await cache.set("b", {"data": "y" * 100})
+        files = list((tmp_path / "cache").glob("*.json"))
+        assert len(files) <= 1
 
 
 class TestCacheIntegrationViaAgent:

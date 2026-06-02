@@ -116,12 +116,24 @@ class AuditLogger:
 
     async def _write(self, entry: dict[str, Any]) -> None:
         """Append a single JSON line to the log file."""
+        line = json.dumps(entry, default=str, ensure_ascii=False) + "\n"
         try:
             async with self._lock:
+                # Mirror SessionTraceRecorder._append_line: do the blocking
+                # open()+write off the event loop via asyncio.to_thread. We
+                # still hold self._lock (write ordering preserved), but the
+                # loop stays responsive during disk I/O.
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                with self._path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
+                await asyncio.to_thread(self._append_line, self._path, line)
         except OSError as exc:
             # Don't crash the agent if the audit file can't be written --
             # log the failure to the normal logger and continue.
             logger.warning("Failed to write audit log entry: {e}", e=exc)
+
+    @staticmethod
+    def _append_line(path: Path, line: str) -> None:
+        """Blocking append of one pre-serialized line. Runs in a worker
+        thread via :func:`asyncio.to_thread` so it never blocks the loop.
+        """
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)

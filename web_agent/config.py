@@ -115,6 +115,13 @@ def _normalize_domain_patterns(value: Any) -> Any:
         if s:
             hostname = urlparse(f"//{s}").hostname
             s = (hostname or s).strip().lstrip(".")
+        # Mirror the live-host normalisation: canonicalize IP-literals so a
+        # non-canonical IPv6 pattern (e.g. ``2001:db8:0:0:0:0:0:1``) still
+        # matches the compressed form the comparator derives from the URL.
+        if s:
+            from .utils import _canonicalize_ip_literal
+
+            s = _canonicalize_ip_literal(s)
         if s:
             out.append(s)
     return out

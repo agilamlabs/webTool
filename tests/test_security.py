@@ -107,3 +107,48 @@ class TestPrivateIpClassifier:
         # is_reserved is True for NAT64; we deliberately don't block on it
         assert nat64.is_reserved
         assert not _is_private_ip(nat64)
+
+
+class TestDenyListIPv6Canonicalization:
+    """A deny-list IPv6 literal must match equivalent textual URL forms.
+
+    IPv6 has many equivalent spellings (zero-compression, leading zeros,
+    case). Before the fix, a non-canonical deny entry normalized to a raw
+    string that compared unequal to the compressed host the comparator
+    derived from the live URL -- the deny silently failed open.
+    """
+
+    def test_expanded_deny_matches_compressed_url(self) -> None:
+        # 2001:db8::/32 is classified PRIVATE, so block_private_ips=False is
+        # required to isolate the deny-list COMPARATOR -- otherwise the test
+        # would pass via the private-IP gate even with the fix reverted.
+        sc = SafetyConfig(
+            denied_domains=["[2001:db8:0:0:0:0:0:1]"], block_private_ips=False
+        )
+        assert check_domain_allowed("http://[2001:db8::1]/x", sc) is False
+
+    def test_compressed_deny_matches_expanded_url(self) -> None:
+        sc = SafetyConfig(denied_domains=["[2001:db8::1]"], block_private_ips=False)
+        assert (
+            check_domain_allowed(
+                "http://[2001:0db8:0000:0000:0000:0000:0000:1]/x", sc
+            )
+            is False
+        )
+
+    def test_uppercase_deny_matches_lowercase_url(self) -> None:
+        sc = SafetyConfig(denied_domains=["[2001:DB8::1]"], block_private_ips=False)
+        assert check_domain_allowed("http://[2001:db8::1]/x", sc) is False
+
+    def test_public_ipv6_deny_matches_under_ssrf_gate(self) -> None:
+        # A *public* IPv6 (Cloudflare DNS) is NOT caught by the private-IP
+        # gate, so this exercises the comparator under the default, realistic
+        # block_private_ips=True config -- the strongest form of the test.
+        sc = SafetyConfig(denied_domains=["[2606:4700:4700:0:0:0:0:1111]"])
+        assert check_domain_allowed("http://[2606:4700:4700::1111]/x", sc) is False
+
+    def test_normal_hostname_deny_still_works(self) -> None:
+        # Regression guard: plain-hostname deny semantics are unchanged.
+        sc = SafetyConfig(denied_domains=["evil.com"])
+        assert check_domain_allowed("https://evil.com/path", sc) is False
+        assert check_domain_allowed("https://api.evil.com/path", sc) is False

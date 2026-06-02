@@ -662,6 +662,190 @@ class TestDL3PageSaveMemoryBound:
 
 
 # ---------------------------------------------------------------------------
+# DL-4 / DL-5: _do_save_page mirrors _navigate_and_extract's full post-goto
+# egress re-check -- M4 (response.url redirect race) + H5 (post-connect peer
+# IP / DNS rebinding). Without these, a whitelisted host that bounces to an
+# internal address via a Location: header (which response.url reflects before
+# page.url catches up) or that rebinds DNS to a private peer after the host
+# gate would have its internal content written to disk.
+# ---------------------------------------------------------------------------
+def _save_page(*, page_url: str, response_url: str, peer_ip: str | None = None) -> Any:
+    """A fake Playwright Page for ``_do_save_page``.
+
+    ``goto`` returns a Response whose ``.url`` is ``response_url`` and whose
+    ``server_addr()`` reports ``peer_ip`` (mirrors the real C-1(b) rebind
+    signal). ``page.url`` is a property, as on real Playwright pages, so the
+    redirect-race candidate loop sees a lagging ``page.url`` vs ``response.url``.
+    """
+    response = MagicMock()
+    response.url = response_url
+    response.status = 200
+    response.headers = {"content-type": "text/html"}
+    if peer_ip is not None:
+        response.server_addr = AsyncMock(return_value={"ipAddress": peer_ip, "port": 443})
+    else:
+        response.server_addr = AsyncMock(return_value=None)
+
+    page = MagicMock()
+    page.goto = AsyncMock(return_value=response)
+    # outerHTML probe + content capture must NOT run on a blocked path; give
+    # them benign returns so any accidental call surfaces as a wrong status
+    # rather than a crash.
+    page.evaluate = AsyncMock(return_value=10)
+    type(page).url = property(lambda _self: page_url)
+    return page
+
+
+class TestDL4DL5PageSaveEgressRecheck:
+    @pytest.mark.asyncio
+    async def test_h5_private_peer_ip_blocks_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """H5: page.url AND response.url are on an allowed host, but the actual
+        connected peer rebinds to a private/IMDS address -> BLOCKED via the same
+        ``_response_peer_is_private`` helper the navigation path uses, and NO
+        file is written to disk."""
+        from web_agent import downloader as downloader_module
+        from web_agent.downloader import Downloader
+
+        cfg = AppConfig(
+            download=DownloadConfig(download_dir=str(tmp_path), max_file_size_mb=10),
+            safety=SafetyConfig(allow_downloads=True, block_private_ips=True),
+        )
+        dl = Downloader(MagicMock(), cfg)
+
+        # Every URL passes the host gate; the block must come purely from the
+        # post-connect peer-IP check (real _response_peer_is_private helper,
+        # reached via the lazy ``from .web_fetcher import`` inside the method).
+        monkeypatch.setattr(downloader_module, "check_domain_allowed", lambda *a, **k: True)
+
+        # safe_page_content MUST NOT run -- H5 aborts before any capture/write.
+        def _boom_capture(*a: Any, **k: Any):
+            raise AssertionError("safe_page_content reached despite private-peer block")
+
+        monkeypatch.setattr(downloader_module, "safe_page_content", _boom_capture)
+
+        allowed = "https://good.example/page"
+        # 169.254.169.254 = AWS IMDS; page.url / response.url both allowed.
+        page = _save_page(page_url=allowed, response_url=allowed, peer_ip="169.254.169.254")
+
+        filepath = tmp_path / "page.html"
+        result = await dl._do_save_page(page, allowed, filepath)
+
+        assert result.status == FetchStatus.BLOCKED
+        assert "dns-rebinding" in (result.error_message or "").lower()
+        assert result.filepath == ""
+        assert not filepath.exists(), "internal content was written to disk despite private peer"
+
+    @pytest.mark.asyncio
+    async def test_h5_off_skips_peer_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Operator opt-out: with block_private_ips=False the peer-IP guard is
+        not consulted (mirrors the navigation path), so a private peer on an
+        allow-listed, non-redirecting host still saves successfully."""
+        from web_agent import downloader as downloader_module
+        from web_agent.downloader import Downloader
+
+        cfg = AppConfig(
+            download=DownloadConfig(download_dir=str(tmp_path), max_file_size_mb=10),
+            safety=SafetyConfig(allow_downloads=True, block_private_ips=False),
+        )
+        dl = Downloader(MagicMock(), cfg)
+        monkeypatch.setattr(downloader_module, "check_domain_allowed", lambda *a, **k: True)
+
+        async def _content(*a: Any, **k: Any):
+            return ("<html>ok</html>", "content")
+
+        monkeypatch.setattr(downloader_module, "safe_page_content", _content)
+
+        allowed = "https://good.example/page"
+        page = _save_page(page_url=allowed, response_url=allowed, peer_ip="169.254.169.254")
+
+        filepath = tmp_path / "page.html"
+        result = await dl._do_save_page(page, allowed, filepath)
+        assert result.status == FetchStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_m4_response_url_on_denied_host_blocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M4: page.url still lags on the allowed entry host, but response.url
+        reflects a Location: redirect to a denied/internal host -> BLOCKED. The
+        old code that checked only page.url would have written the body."""
+        from web_agent import downloader as downloader_module
+        from web_agent.downloader import Downloader
+
+        cfg = AppConfig(
+            download=DownloadConfig(download_dir=str(tmp_path), max_file_size_mb=10),
+            safety=SafetyConfig(allow_downloads=True),
+        )
+        dl = Downloader(MagicMock(), cfg)
+
+        # Host gate denies the IMDS host; the allowed entry host passes. The
+        # block must trigger off response.url, since page.url is still allowed.
+        def _gate(url: str, *a: Any, **k: Any) -> bool:
+            return "169.254" not in url
+
+        monkeypatch.setattr(downloader_module, "check_domain_allowed", _gate)
+
+        def _boom_capture(*a: Any, **k: Any):
+            raise AssertionError("safe_page_content reached despite redirect block")
+
+        monkeypatch.setattr(downloader_module, "safe_page_content", _boom_capture)
+
+        allowed = "https://good.example/page"
+        denied = "http://169.254.169.254/latest/meta-data"
+        # page.url lags on the allowed host; response.url is the denied target.
+        page = _save_page(page_url=allowed, response_url=denied)
+
+        filepath = tmp_path / "page.html"
+        result = await dl._do_save_page(page, allowed, filepath)
+
+        assert result.status == FetchStatus.BLOCKED
+        assert result.error_message == "Page redirected to disallowed URL: 169.254.169.254"
+        assert result.filepath == ""
+        assert not filepath.exists()
+
+    @pytest.mark.asyncio
+    async def test_m4_page_url_on_denied_host_still_blocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard for the original step-1 check: a denied page.url
+        (with an allowed response.url) is still blocked by the candidate loop."""
+        from web_agent import downloader as downloader_module
+        from web_agent.downloader import Downloader
+
+        cfg = AppConfig(
+            download=DownloadConfig(download_dir=str(tmp_path), max_file_size_mb=10),
+            safety=SafetyConfig(allow_downloads=True),
+        )
+        dl = Downloader(MagicMock(), cfg)
+
+        def _gate(url: str, *a: Any, **k: Any) -> bool:
+            return "169.254" not in url
+
+        monkeypatch.setattr(downloader_module, "check_domain_allowed", _gate)
+        monkeypatch.setattr(
+            downloader_module,
+            "safe_page_content",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("capture reached despite page.url block")
+            ),
+        )
+
+        denied = "http://169.254.169.254/latest/meta-data"
+        allowed = "https://good.example/page"
+        page = _save_page(page_url=denied, response_url=allowed)
+
+        filepath = tmp_path / "page.html"
+        result = await dl._do_save_page(page, allowed, filepath)
+        assert result.status == FetchStatus.BLOCKED
+        assert result.error_message == "Page redirected to disallowed URL: 169.254.169.254"
+        assert not filepath.exists()
+
+
+# ---------------------------------------------------------------------------
 # ROBOTS-1: per-host cache / lock dicts evict past a bound
 # ---------------------------------------------------------------------------
 class TestRobots1Eviction:

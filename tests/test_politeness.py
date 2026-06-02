@@ -156,3 +156,104 @@ class TestRobotsChecker:
     async def test_user_agent_property_exposed(self) -> None:
         rc = RobotsChecker(user_agent="custom-ua/1.0")
         assert rc.user_agent == "custom-ua/1.0"
+
+
+class _FakeStream:
+    """Minimal stand-in for httpcore's network_stream extension."""
+
+    def __init__(self, server_addr: tuple[str, int]) -> None:
+        self._server_addr = server_addr
+
+    def get_extra_info(self, name: str):
+        if name == "server_addr":
+            return self._server_addr
+        return None
+
+
+def _resp_with_peer(peer_ip: str, status_code: int = 200) -> object:
+    import httpx
+
+    return httpx.Response(
+        status_code=status_code,
+        text="User-agent: *\nDisallow: /secret/\n",
+        extensions={"network_stream": _FakeStream((peer_ip, 443))},
+    )
+
+
+class _ClientReturning:
+    """Async-context-manager httpx.AsyncClient replacement whose GET
+    returns a pre-built response (used to inject a peer IP)."""
+
+    def __init__(self, response, **_kwargs) -> None:
+        self._response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+    async def get(self, url, headers=None):
+        return self._response
+
+
+class TestRobotsPostConnectPeerIPCheck:
+    """M3: a DNS rebind inside the cache window can connect _fetch_and_parse's
+    own httpx client to a private host even though the pre-connect host guard
+    passed (e.g. host was a literal public name / unresolvable to the checker).
+    After the GET, the peer IP is re-checked; a private peer -> allow-all
+    (return None) when block_private_ips=True."""
+
+    @pytest.mark.asyncio
+    async def test_private_peer_ip_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        rc = RobotsChecker(user_agent="test-bot", block_private_ips=True)
+        resp = _resp_with_peer("127.0.0.1")  # loopback peer
+
+        def _fake_client(*args, **kwargs):
+            return _ClientReturning(resp)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client)
+        # Use a host that the pre-connect guard treats as public (does not
+        # resolve to a private address here) so we exercise the POST-connect
+        # path specifically.
+        result = await rc._fetch_and_parse("https", "rebind.example")
+        assert result is None  # allow-all
+
+    @pytest.mark.asyncio
+    async def test_public_peer_ip_parses_normally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        rc = RobotsChecker(user_agent="test-bot", block_private_ips=True)
+        resp = _resp_with_peer("93.184.216.34")  # public peer
+
+        def _fake_client(*args, **kwargs):
+            return _ClientReturning(resp)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client)
+        result = await rc._fetch_and_parse("https", "rebind.example")
+        # A normal parser is returned; the disallow rule is honored.
+        assert result is not None
+        assert not result.can_fetch("test-bot", "https://rebind.example/secret/x")
+        assert result.can_fetch("test-bot", "https://rebind.example/ok")
+
+    @pytest.mark.asyncio
+    async def test_private_peer_allowed_when_blocking_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        # When block_private_ips=False the post-connect check is skipped and
+        # a private peer's robots.txt is parsed normally.
+        rc = RobotsChecker(user_agent="test-bot", block_private_ips=False)
+        resp = _resp_with_peer("127.0.0.1")
+
+        def _fake_client(*args, **kwargs):
+            return _ClientReturning(resp)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client)
+        result = await rc._fetch_and_parse("https", "rebind.example")
+        assert result is not None

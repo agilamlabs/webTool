@@ -327,14 +327,17 @@ class SessionTraceRecorder:
         ``trace_dir``, but ``load_entries`` is a public method on the
         recorder and could be called directly by integrators. Repeat the
         containment check here so an LLM-driven path (or any future
-        caller) can't bypass it by skipping the Agent layer. Existence
-        is checked first so the long-standing ``FileNotFoundError``
-        contract for missing paths is preserved -- the threat C-3
-        addresses is *content disclosure*, not directory probing.
+        caller) can't bypass it by skipping the Agent layer.
+
+        L6: the containment check runs BEFORE the existence check. Checking
+        ``exists()`` first leaked which out-of-dir paths exist via the
+        exception TYPE (``FileNotFoundError`` for a missing out-of-dir path
+        vs ``ValueError`` for a present one). Checking containment first
+        means every path outside ``trace_dir`` raises ``ValueError``
+        uniformly, regardless of whether it exists. For in-dir paths both
+        exception messages/types are preserved.
         """
         p = Path(trace_file).resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"Trace file not found: {p}")
         # v1.6.14 B-1: self._dir is already resolved at construction, so it
         # is the canonical containment root shared with the write path.
         trace_root = self._dir
@@ -342,6 +345,8 @@ class SessionTraceRecorder:
             p.relative_to(trace_root)
         except ValueError as e:
             raise ValueError(f"trace_file must be inside trace_dir ({trace_root}); got {p}") from e
+        if not p.exists():
+            raise FileNotFoundError(f"Trace file not found: {p}")
         entries: list[dict[str, Any]] = []
         with p.open(encoding="utf-8") as f:
             for lineno, raw in enumerate(f, start=1):

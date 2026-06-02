@@ -458,18 +458,51 @@ class Downloader:
         max_bytes = self._config.download.max_file_size_mb * 1024 * 1024
         response = await page.goto(url, wait_until="load")
 
-        # Post-redirect re-check: page.url is the final URL after redirects.
-        # If a whitelisted host bounced us to a denied / private host, do
-        # NOT save its content -- return BLOCKED before any disk write.
-        if not check_domain_allowed(page.url, self._config.safety):
-            host = urlparse(page.url).hostname or ""
-            return DownloadResult(
-                url=url,
-                filepath="",
-                filename=filepath.name,
-                status=FetchStatus.BLOCKED,
-                error_message=f"Page redirected to disallowed URL: {host}",
-            )
+        # Post-redirect re-check: a whitelisted host that bounced us to a
+        # denied / private host must NOT have its content written to disk
+        # -- return BLOCKED before any write (SSRF defense-in-depth,
+        # mirrors WebFetcher._navigate_and_extract and the httpx path).
+        #
+        # M4: validate BOTH ``page.url`` (the post-redirect client URL) and
+        # ``response.url`` (the navigation Response URL, which reflects a
+        # ``Location:`` / meta-refresh redirect even when ``page.url`` lags
+        # or is rewritten client-side). Checking only ``page.url`` left a
+        # redirect-race gap the other two egress paths already close.
+        response_url = response.url if response is not None else None
+        for candidate in (page.url, response_url):
+            if isinstance(candidate, str) and candidate and (
+                not check_domain_allowed(candidate, self._config.safety)
+            ):
+                host = urlparse(candidate).hostname or ""
+                return DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename=filepath.name,
+                    status=FetchStatus.BLOCKED,
+                    error_message=f"Page redirected to disallowed URL: {host}",
+                )
+
+        # H5: re-check the ACTUAL connected peer IP (DNS-rebinding guard).
+        # ``check_domain_allowed`` validates the host against cached DNS,
+        # but Chromium re-resolves at connect time -- a host that resolved
+        # public at check time can rebind to an internal address before the
+        # TCP connect, writing internal content to disk. ``response.server_addr()``
+        # (via ``_response_peer_is_private``) reports the real peer. Lazy
+        # import avoids any circular-import risk with web_fetcher.
+        if getattr(self._config.safety, "block_private_ips", False):
+            from .web_fetcher import _response_peer_is_private
+
+            if await _response_peer_is_private(response):
+                return DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename=filepath.name,
+                    status=FetchStatus.BLOCKED,
+                    error_message=(
+                        "Page-save connected to a private/loopback/link-local "
+                        "peer (DNS-rebinding guard)"
+                    ),
+                )
 
         content_type = None
         if response:

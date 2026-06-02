@@ -23,7 +23,7 @@ from web_agent.models import (
 )
 
 
-def _make_page() -> MagicMock:
+def _make_page(url: str = "https://example.com/") -> MagicMock:
     page = MagicMock()
     page.mouse = MagicMock()
     page.mouse.wheel = AsyncMock()
@@ -37,6 +37,10 @@ def _make_page() -> MagicMock:
     # normally-open page here (bare MagicMock would return a truthy mock and
     # trip the new guard).
     page.is_closed = MagicMock(return_value=False)
+    # H3: scroll_until_text now re-gates page.url before reading content, so
+    # the mock must expose a real (allowed) URL string. ``url`` is a property
+    # on real Pages; a bare MagicMock attr would raise inside urlparse.
+    type(page).url = property(lambda _self: url)
     return page
 
 
@@ -307,6 +311,32 @@ async def test_scroll_until_text_exhausted_returns_failed() -> None:
     assert result.data is not None
     assert result.data["found"] is False
     assert result.data["scrolls_used"] == 2
+
+
+@pytest.mark.asyncio
+async def test_scroll_until_text_denied_current_url_reads_no_content() -> None:
+    """H3: if the session tab is parked on a denied/private host, the
+    function must re-gate page.url and refuse BEFORE reading any content
+    (no document.body.innerText exfil oracle)."""
+    cfg = AppConfig()  # block_private_ips defaults True
+    fake_tab_mgr = MagicMock()
+    # The session's current tab is parked on an RFC1918 private host.
+    page = _make_page(url="http://169.254.169.254/latest/meta-data/")
+    page.evaluate = AsyncMock(return_value="SECRET INTERNAL CONTENT")
+    fake_tab_mgr.get_or_current = MagicMock(return_value=page)
+    fake_sessions = MagicMock()
+    fake_sessions.get_tab_manager = MagicMock(return_value=fake_tab_mgr)
+    fake_sessions.touch = MagicMock()
+
+    ba = BrowserActions(MagicMock(), cfg, sessions=fake_sessions)
+    result = await ba.scroll_until_text("SECRET", session_id="sid", max_scrolls=3)
+
+    assert result.status == ActionStatus.FAILED
+    assert result.action == ActionType.SCROLL
+    assert "disallowed domain" in (result.error_message or "").lower()
+    # Critical: the page's content was NEVER read, and we never scrolled.
+    page.evaluate.assert_not_awaited()
+    page.mouse.wheel.assert_not_awaited()
 
 
 # ----------------------------------------------------------------------

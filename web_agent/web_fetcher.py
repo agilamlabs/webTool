@@ -853,7 +853,11 @@ class WebFetcher:
             session_id: Optional shared persistent session for all fetches.
 
         Returns:
-            List of FetchResult in the same order as input URLs.
+            List of FetchResult in the same order as input URLs. Exceptions
+            raised by an individual ``self.fetch`` are isolated per-url and
+            converted into an error FetchResult (a single failure never
+            aborts the whole batch); ``asyncio.CancelledError`` still
+            propagates.
         """
         if session_id is not None:
             # v1.6.14 C-4: session-path gate. The semaphore is created
@@ -870,7 +874,44 @@ class WebFetcher:
             tasks = [_gated(url) for url in urls]
         else:
             tasks = [self.fetch(url, session_id=session_id) for url in urls]
-        return list(await asyncio.gather(*tasks))
+        # H6: isolate per-url failures. A bare ``gather`` (no
+        # ``return_exceptions=True``) aborts the entire batch -- and
+        # orphans every sibling's in-flight page -- the moment ANY
+        # ``self.fetch`` raises (exhausted retries re-raise, an
+        # unexpected Playwright error, or cancellation). Mirror
+        # ``Recipes.web_research``: collect results with
+        # ``return_exceptions=True``, then zip back over ``urls`` in order
+        # (tasks are created from ``urls`` in order in BOTH branches, so
+        # index alignment holds). Re-raise CancelledError so cancellation
+        # propagates; convert any other exception into an error FetchResult
+        # for that url.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: list[FetchResult] = []
+        for url, result in zip(urls, results, strict=True):
+            if isinstance(result, FetchResult):
+                out.append(result)
+                continue
+            if isinstance(result, asyncio.CancelledError):
+                # Never swallow cancellation -- propagate exactly like
+                # web_research does for its gather results.
+                raise result
+            # Any other exception: degrade this single url to an error
+            # result so its siblings survive.
+            logger.warning(
+                "fetch_many: fetch raised for {url}: {exc}",
+                url=url,
+                exc=result,
+            )
+            out.append(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.NETWORK_ERROR,
+                    error_message=str(result),
+                    correlation_id=get_correlation_id(),
+                )
+            )
+        return out
 
     async def classify_url(
         self,
@@ -933,7 +974,7 @@ class WebFetcher:
         # ``downloader._download_httpx``. Checking only the final URL let a
         # whitelisted host 302 through an internal hop, and a rebinding host
         # connect to a private peer, before the benign final URL was seen.
-        from .exceptions import NavigationError
+        from .exceptions import DomainNotAllowedError, NavigationError
 
         safety = self._config.safety
 
@@ -991,6 +1032,19 @@ class WebFetcher:
                 if ct_norm.startswith(("text/html", "application/xhtml")):
                     return "html"
                 return "unknown"
+        except (NavigationError, DomainNotAllowedError) as exc:
+            # L1: the redirect hook (_check_redirect) blocked a redirect to
+            # a denied / private host -- a probable SSRF attempt. The safe
+            # behavior (return 'unknown' so a failing HEAD never blocks the
+            # subsequent fetch) is preserved, but log at WARNING rather than
+            # DEBUG so the blocked-redirect signal is observable instead of
+            # being swallowed alongside ordinary network errors.
+            logger.warning(
+                "HEAD probe redirect blocked for {url} (SSRF defense): {e}",
+                url=url,
+                e=exc,
+            )
+            return "unknown"
         except Exception as exc:
             logger.debug("HEAD probe failed for {url}: {e}", url=url, e=exc)
             return "unknown"

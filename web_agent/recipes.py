@@ -988,6 +988,30 @@ class Recipes:
                     url=url, extraction_method="none", correlation_id=get_correlation_id()
                 )
 
+            # v1.6.16 H1: re-gate the POST-SUBMIT URL before extraction.
+            # The form submission in step 4 is itself a navigation that can
+            # 302 / JS-redirect to an internal host (SSO/SSO-rebind flows,
+            # attacker forms that POST elsewhere). The initial-nav re-check
+            # above (around the first goto) does NOT cover this later
+            # navigation, so without this gate content from a denied/private
+            # host would be captured by safe_page_content below. ``check_
+            # domain_allowed(page.url, ...)`` with ``block_private_ips=True``
+            # already rejects a ``page.url`` that is a private/loopback/
+            # link-local IP literal (e.g. http://169.254.169.254/), closing
+            # the main exposure. A full post-connect peer-IP re-check on the
+            # SUBMIT navigation is intentionally out of scope: it would
+            # require wrapping the submit in ``page.expect_navigation()``,
+            # which breaks in-place (SPA) forms that never navigate.
+            post_submit_url = page.url
+            if not check_domain_allowed(post_submit_url, self._config.safety):
+                logger.warning(
+                    "fill_form_and_extract: post-submit navigation to disallowed URL {u}",
+                    u=post_submit_url,
+                )
+                return ExtractionResult(
+                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                )
+
             # Step 6: extract
             # v1.6.13: 3-tier safe capture so a mid-navigation race
             # (very common on form-submit flows that trigger a redirect)

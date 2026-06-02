@@ -152,6 +152,10 @@ class TestBR8ScrollUntilTextErrorHandling:
         silently looping to a misleading 'not found'."""
         cfg = AppConfig()
         page = MagicMock()
+        # scroll_until_text re-gates page.url (H3); a real Page always has a
+        # URL string, so give the mock an allowed one or the gate short-circuits
+        # before the BR-8 close/timeout logic under test.
+        type(page).url = property(lambda _self: "https://good.example/app")
         # Initial quick-win read returns no match.
         page.evaluate = AsyncMock(return_value="nothing here")
         page.mouse.wheel = AsyncMock()
@@ -169,6 +173,7 @@ class TestBR8ScrollUntilTextErrorHandling:
         fatal (re-raised), not swallowed via ``continue``."""
         cfg = AppConfig()
         page = MagicMock()
+        type(page).url = property(lambda _self: "https://good.example/app")
         closed = {"v": False}
         page.mouse.wheel = AsyncMock()
         page.wait_for_load_state = AsyncMock()
@@ -204,6 +209,7 @@ class TestBR8ScrollUntilTextErrorHandling:
         the scroll keeps going and eventually finds the text."""
         cfg = AppConfig()
         page = MagicMock()
+        type(page).url = property(lambda _self: "https://good.example/app")
         reads = {"n": 0}
 
         async def _evaluate(_expr: str) -> str:
