@@ -146,12 +146,24 @@ _ELEMENT_FROM_POINT_JS = """
 
 
 def _looks_like_submit(selector: SelectorLike | None) -> bool:
-    """Best-effort heuristic: does this selector look like a submit button?
+    """Best-effort, *advisory* heuristic: does this selector look like a
+    submit button?
 
     For a CSS selector string, checks for ``button[type=submit]`` patterns.
     For a LocatorSpec, checks every text-bearing field (role_name, text,
     label, placeholder) for submit-like keywords (submit, send, save,
     log in, sign in, register, create account, continue).
+
+    BR-9: this is a string-pattern guess, not a guarantee. It is trivially
+    bypassable -- a submit can be triggered by clicking a ``<div>``, an
+    icon-only button, a non-English / synonym label, JS-attached handlers,
+    or pressing Enter in a field. So a False result does NOT prove a click
+    is non-submitting. The heuristic exists only to *flag the obvious cases*
+    when the operator has already opted out of form submission. The real
+    control is the ``safety.allow_form_submit`` config flag (default True):
+    when False, callers should keep submit-style interactions out of the
+    sequence entirely. ``allow_form_submit=True`` performs no such check at
+    all. Treat this function as a tripwire, never a sandbox.
     """
     if selector is None:
         return False
@@ -358,6 +370,16 @@ class BrowserActions:
             # allow_js_evaluation=False by emitting a wait-function with
             # malicious JS (e.g. cookie exfiltration). Gate it here at
             # the same chokepoint as EvaluateInput.
+            #
+            # BR-10: the *authoritative* gate now lives in ``_do_wait``
+            # (v1.6.14 A-1), which re-checks ``allow_js_evaluation`` on every
+            # entry point. This pre-flight is an intentional early-exit, NOT
+            # redundant defence: ``_block_all`` rejects the whole sequence
+            # atomically *before any action runs*, whereas the handler gate
+            # raises only once the loop reaches the offending wait (after
+            # earlier actions have already executed). Keep both -- removing
+            # this one would change the all-or-nothing semantics callers rely
+            # on for blocked sequences.
             if (
                 isinstance(a, WaitInput)
                 and a.target == WaitTarget.FUNCTION
@@ -369,6 +391,13 @@ class BrowserActions:
                     "(wait_for_function executes arbitrary JS; "
                     "set safety.allow_js_evaluation=True to opt in)"
                 )
+            # BR-9: advisory tripwire only. ``_looks_like_submit`` is a
+            # string-pattern guess that catches obvious submit clicks; it is
+            # bypassable (icon buttons, div handlers, Enter key, synonyms).
+            # The authoritative gate is the operator setting
+            # ``allow_form_submit=False`` AND keeping submit-style actions out
+            # of the sequence -- this check does not, and cannot, guarantee no
+            # form is submitted.
             if (
                 isinstance(a, ClickInput)
                 and not safety.allow_form_submit
@@ -376,7 +405,7 @@ class BrowserActions:
             ):
                 return _block_all(
                     "Submit-button click blocked: safety.allow_form_submit=False "
-                    "(form submission heuristic; set allow_form_submit=True to opt in)"
+                    "(advisory form-submission heuristic; set allow_form_submit=True to opt in)"
                 )
 
         should_stop = (
@@ -1642,7 +1671,11 @@ class BrowserActions:
             raise ValueError(f"Session {session_id!r} has no current tab. Open one first.")
         self._sessions.touch(session_id)
 
-        # Already on the page? Quick win.
+        from .exceptions import ActionError
+
+        # Already on the page? Quick win. A failure here is non-fatal: we
+        # simply fall through to the scroll loop, which re-reads the body.
+        # (BR-8) Log at DEBUG rather than swallowing silently.
         try:
             body = await page.evaluate("() => document.body ? document.body.innerText : ''")
             if isinstance(body, str) and text in body:
@@ -1651,18 +1684,32 @@ class BrowserActions:
                     status=ActionStatus.SUCCESS,
                     data={"text": text, "scrolls_used": 0, "found": True},
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("scroll_until_text initial body read failed: {e}", e=exc)
 
         for i in range(max_scrolls):
+            # BR-8: a closed page can never yield more text -- surface it as a
+            # genuine error instead of silently spinning to a misleading
+            # "text not found after N scrolls".
+            if page.is_closed():
+                raise ActionError("scroll_until_text: page was closed mid-scroll", action="scroll")
             try:
                 await page.mouse.wheel(0, scroll_step)
                 await page.wait_for_load_state("domcontentloaded", timeout=2000)
-            except Exception:
-                pass
+            except PlaywrightTimeout as exc:
+                # Benign: an infinite-scroll feed often never reaches a quiet
+                # load state within the 2s budget. Keep scrolling.
+                logger.debug("scroll_until_text load-state wait timed out: {e}", e=exc)
             try:
                 body = await page.evaluate("() => document.body ? document.body.innerText : ''")
-            except Exception:
+            except Exception as exc:
+                # If the page closed, this is fatal -- re-raise. Otherwise it
+                # is a transient eval error during navigation; ride over it.
+                if page.is_closed():
+                    raise ActionError(
+                        "scroll_until_text: page was closed mid-scroll", action="scroll"
+                    ) from exc
+                logger.debug("scroll_until_text body read failed (transient): {e}", e=exc)
                 continue
             if isinstance(body, str) and text in body:
                 return ActionResult(
@@ -1845,7 +1892,19 @@ class BrowserActions:
                 # Post-redirect re-check
                 if not check_domain_allowed(page.url, safety):
                     host = urlparse(page.url).hostname or ""
-                    if prev_url and prev_url != "about:blank":
+                    # BR-7: re-validate prev_url against the same safety
+                    # policy before rolling back. prev_url is the tab's
+                    # last-known URL, but the policy may have changed since
+                    # (or the prior page itself sat on a now-denied host),
+                    # and navigating back must not become a second way onto a
+                    # disallowed domain. Skip the rollback if prev_url no
+                    # longer passes; leaving the tab where it is (then
+                    # raising) is the fail-closed choice.
+                    if (
+                        prev_url
+                        and prev_url != "about:blank"
+                        and check_domain_allowed(prev_url, safety)
+                    ):
                         with contextlib.suppress(Exception):
                             await page.goto(prev_url)
                     raise ValueError(f"Page redirected to disallowed domain: {host}")

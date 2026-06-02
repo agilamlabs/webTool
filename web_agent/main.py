@@ -100,7 +100,17 @@ async def run_interact(args: argparse.Namespace) -> None:
     setup_logging(config.log_level)
 
     actions_path = Path(args.actions)
-    raw_actions = json.loads(actions_path.read_text(encoding="utf-8"))
+    # v1.6.16 MAIN-1: bound the actions-file size and surface read/parse errors
+    # as a clear CLI message instead of an opaque traceback.
+    max_actions_bytes = 5 * 1024 * 1024
+    try:
+        if actions_path.stat().st_size > max_actions_bytes:
+            raise SystemExit(
+                f"Actions file {actions_path} too large (> {max_actions_bytes} bytes)."
+            )
+        raw_actions = json.loads(actions_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Failed to read/parse actions file {actions_path}: {exc}") from exc
     adapter = TypeAdapter(list[Action])
     actions = adapter.validate_python(raw_actions)
 

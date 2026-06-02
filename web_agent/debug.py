@@ -36,6 +36,9 @@ class DebugCapture:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._capture_count = 0
+        # v1.6.16 DEBUG-2: monotonic suffix so artifact filenames stay unique
+        # even when two captures land in the same microsecond timestamp.
+        self._artifact_seq = 0
 
     @property
     def enabled(self) -> bool:
@@ -57,9 +60,15 @@ class DebugCapture:
         if cid in {".", ".."} or not cid:
             cid = "no-cid"
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        # v1.6.16 DEBUG-2: append a per-instance monotonic counter so two
+        # artifacts created within the same microsecond can't collide. The
+        # increment is synchronous (no await here), so it is safe under the
+        # single-threaded event loop without a lock.
+        self._artifact_seq += 1
+        seq = self._artifact_seq
         out_dir = Path(self._config.debug.debug_dir) / cid
         out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir / f"{ts}-{label}.{suffix}"
+        return out_dir / f"{ts}-{seq:06d}-{label}.{suffix}"
 
     def _under_limit(self) -> bool:
         return self._capture_count < self._config.debug.max_artifacts_per_call
@@ -85,6 +94,13 @@ class DebugCapture:
         if not self.enabled or not self._under_limit():
             return []
 
+        # v1.6.16 DEBUG-1: reserve slots synchronously (no await between the
+        # _under_limit() check and this increment) so two concurrent captures
+        # can't both pass the gate and overshoot max_artifacts_per_call. We
+        # reserve the max this method can emit (html + png + json), then
+        # reconcile to the actual count at the end.
+        reserved = 3
+        self._capture_count += reserved
         artifacts: list[str] = []
         try:
             if self._config.debug.capture_html:
@@ -135,7 +151,8 @@ class DebugCapture:
         except Exception as outer:
             logger.warning("DebugCapture.capture_page failed: {e}", e=outer)
 
-        self._capture_count += len(artifacts)
+        # Reconcile the pessimistic reservation with the real artifact count.
+        self._capture_count += len(artifacts) - reserved
         if artifacts:
             logger.info(
                 "Debug capture saved {n} artifact(s) for {label}",

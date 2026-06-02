@@ -1767,6 +1767,14 @@ class Agent:
 
         if output_path is None:
             safe_query = "".join(c if c.isalnum() else "_" for c in result.query)[:50]
+            # AG-4: a query with no alphanumerics (e.g. "???" -> "___", or an
+            # empty query -> "") yields a useless or dangerous stem: ""
+            # produces the dotfile ".json", and an all-"_" stem is opaque.
+            # Fall back to a fixed name when nothing meaningful survives, so
+            # the output is always a safe, non-empty, non-dotfile filename.
+            safe_query = safe_query.strip("_")
+            if not safe_query:
+                safe_query = "results"
             output_path = out_dir / f"{safe_query}.json"
         else:
             # v1.6.14 B-5: confine a caller/CLI-supplied output_path to

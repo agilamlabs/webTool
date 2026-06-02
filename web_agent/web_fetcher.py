@@ -1033,12 +1033,21 @@ class WebFetcher:
             logger.debug("Failed to read session cookies: {e}", e=exc)
             return jar
 
-        target_host = (urlparse(target_url).hostname or "").lower()
+        parsed_target = urlparse(target_url)
+        target_host = (parsed_target.hostname or "").lower()
         if not target_host:
             return jar
+        # v1.6.16 FC-2: a Secure-flagged cookie must never be forwarded over a
+        # plaintext http:// request -- that is exactly the cleartext leak the
+        # Secure attribute exists to prevent (browsers send Secure cookies on
+        # https only). An http download from a session holding Secure auth
+        # cookies would otherwise put them on the wire in the clear.
+        target_is_https = (parsed_target.scheme or "").lower() == "https"
 
         for c in cookies:
             if "name" not in c or "value" not in c:
+                continue
+            if c.get("secure") and not target_is_https:
                 continue
             domain = (c.get("domain") or "").lstrip(".").lower()
             # Cookies without a declared domain only apply to the target

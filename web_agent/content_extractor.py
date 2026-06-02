@@ -11,6 +11,7 @@ hint -- it never crashes the pipeline.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -20,6 +21,18 @@ from loguru import logger
 
 from .config import AppConfig
 from .models import ExtractionResult, FetchResult, FetchStatus
+
+# v1.6.16 CE-3: URL fragments that mark a captured response as
+# analytics/telemetry rather than the page's real data API. Used to
+# DEPRIORITISE such bodies when ``prefer_api`` picks among captured XHR/fetch
+# JSON responses, so a large batched analytics payload no longer wins over a
+# small, relevant same-origin API response.
+_ANALYTICS_URL_RE = re.compile(
+    r"(?:analytics|telemetry|tracking|/track\b|/collect\b|beacon|segment"
+    r"|google-analytics|googletagmanager|gtag|/gtm\b|doubleclick|/pixel\b"
+    r"|/stats\b|/metrics\b|/rum\b|/log(?:s|ging)?\b)",
+    re.IGNORECASE,
+)
 
 
 def _extract_json_ld(html: str) -> list[dict[str, Any]]:
@@ -319,9 +332,11 @@ class ContentExtractor:
         Scans :attr:`FetchResult.network_events` for response events
         with a captured ``body_text`` (requires
         ``DiagnosticsConfig.capture_response_bodies=True``) and JSON
-        content-type. Picks the LARGEST body and uses it as the
-        extraction source. Returns ``None`` when no candidate found
-        -- caller falls back to HTML extraction.
+        content-type. Among those it SCORES candidates (v1.6.16 CE-3:
+        same-origin preferred, analytics/telemetry URLs deprioritised,
+        JSON object/array root preferred; body size is only the
+        tie-breaker) and uses the best as the extraction source. Returns
+        ``None`` when no candidate found -- caller falls back to HTML.
 
         The extracted ``content`` is the pretty-printed JSON; ``title``
         is derived heuristically from common top-level keys
@@ -332,11 +347,12 @@ class ContentExtractor:
 
         Heuristic limitations (known, documented for caller awareness):
 
-        - **Picks the largest body, not the most relevant.** A page that
-          emits both a small product-detail API response (~2 KB) AND a
-          large analytics / Segment / GA4 batched-hit payload (~10-50
-          KB) will silently extract the analytics blob. Watch the
-          DEBUG log line emitted on selection to spot this.
+        - **Heuristic relevance, not exact.** v1.6.16 CE-3 scores
+          candidates (same-origin + JSON-root preferred, analytics/
+          telemetry URLs deprioritised) so a large Segment/GA4 batched-hit
+          payload no longer beats a small same-origin API response -- but
+          it is still a heuristic. Watch the DEBUG log line (it prints the
+          chosen URL + score) to spot a mis-pick.
         - **No URL-pattern filter.** Cannot tell the caller "use the
           response from ``/api/page-data``, not ``/v1/track``". A
           future patch can accept a regex / glob.
@@ -347,10 +363,14 @@ class ContentExtractor:
         """
         if not fetch_result.network_events:
             return None
-        # Find responses with a captured JSON body. Prefer the largest
-        # body as a simple heuristic for "the main API call".
+        # v1.6.16 CE-3: score candidates rather than blindly taking the
+        # largest body. Score = same-origin as the page (+2) - analytics/
+        # telemetry-looking URL (3) + JSON object/array root (+1); the body
+        # size is only the tie-breaker. This stops a large batched analytics
+        # payload from being picked over a small, relevant API response.
+        page_host = (urlparse(url).hostname or "").lower()
         best_evt = None
-        best_size = 0
+        best_key: tuple[int, int] = (-(10**9), -1)
         for evt in fetch_result.network_events:
             if evt.event_type != "response":
                 continue
@@ -361,12 +381,21 @@ class ContentExtractor:
             ct = (evt.content_type or "").lower()
             if "json" not in ct:
                 continue
-            size = len(evt.body_text)
-            if size > best_size:
+            evt_host = (urlparse(evt.url or "").hostname or "").lower()
+            score = 0
+            if page_host and evt_host == page_host:
+                score += 2
+            if _ANALYTICS_URL_RE.search(evt.url or ""):
+                score -= 3
+            if evt.body_text.lstrip()[:1] in ("{", "["):
+                score += 1
+            cand_key = (score, len(evt.body_text))
+            if cand_key > best_key:
+                best_key = cand_key
                 best_evt = evt
-                best_size = size
         if best_evt is None or not best_evt.body_text:
             return None
+        best_size = len(best_evt.body_text)
         try:
             parsed = json.loads(best_evt.body_text)
         except (json.JSONDecodeError, ValueError, RecursionError):
@@ -376,10 +405,12 @@ class ContentExtractor:
         # have a diagnostic signal. The heuristic is documented in
         # the docstring; this log line is the runtime telemetry.
         logger.debug(
-            "prefer_api selected XHR/fetch body for {url}: chosen_url={chosen} body_size={size}",
+            "prefer_api selected XHR/fetch body for {url}: chosen_url={chosen} "
+            "body_size={size} score={score}",
             url=url,
             chosen=best_evt.url,
             size=best_size,
+            score=best_key[0],
         )
 
         # Heuristic title from top-level keys (defensive against None /

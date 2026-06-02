@@ -73,9 +73,19 @@ class OwnershipToken:
         pdir.mkdir(parents=True, exist_ok=True)
         token = secrets.token_hex(cls.TOKEN_BYTES)
         path = pdir / cls.FILENAME
-        path.write_text(token, encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(path, 0o600)
+        # v1.6.16 OWN-1: create the file 0o600 from the START
+        # (O_CREAT|O_WRONLY|O_TRUNC, mode 0o600) so there is no world-readable
+        # window between a plain write and the chmod on POSIX. The mode arg
+        # only applies on a freshly-created file, so a trailing best-effort
+        # chmod still covers the re-issue (already-exists) case. On Windows the
+        # mode bits are largely ignored, matching the old best-effort chmod.
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(token)
+        finally:
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
         return token
 
     @classmethod

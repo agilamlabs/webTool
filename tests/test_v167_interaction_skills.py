@@ -32,6 +32,11 @@ def _make_page() -> MagicMock:
     page.frame_locator = MagicMock()
     page.evaluate = AsyncMock(return_value="")
     page.wait_for_load_state = AsyncMock()
+    # v1.6.16 BR-8: scroll_until_text now guards on page.is_closed() so a
+    # closed page surfaces as an error instead of looping silently. Model a
+    # normally-open page here (bare MagicMock would return a truthy mock and
+    # trip the new guard).
+    page.is_closed = MagicMock(return_value=False)
     return page
 
 

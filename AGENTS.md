@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # ~970 tests on Windows / ~945 + 5 platform-conditional skips on Linux
+python -m pytest -v          # ~1000 tests on Windows / ~975 + 5 platform-conditional skips on Linux
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```

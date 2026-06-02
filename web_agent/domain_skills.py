@@ -58,6 +58,7 @@ and ``apply_domain_skill`` raises ``SkillNotRunnableError`` for them.
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from pathlib import Path
@@ -258,7 +259,12 @@ def _coerce_input(value: Any, spec: SkillInputSpec) -> Any:
     if spec.type == "int":
         return int(value)
     if spec.type == "float":
-        return float(value)
+        f = float(value)
+        # v1.6.16 DS-1: reject NaN / +-inf -- they pass float() but are never
+        # valid skill inputs and poison downstream arithmetic / JSON encoding.
+        if not math.isfinite(f):
+            raise SkillInputError(f"input must be a finite {spec.type}, got {value!r}")
+        return f
     # spec.type is constrained by Literal["str", "int", "float", "bool"]
     # at the Pydantic level, so this final branch is "bool".
     if isinstance(value, bool):
