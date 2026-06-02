@@ -76,9 +76,47 @@ as 6 file-disjoint commits via parallel `general-purpose` agents.
   rather than clobbering the shared single-slot dialog state (sequential reuse
   unaffected).
 
-Deferred to a follow-up: the 34 low advisories from the review, and TRACE-4
-(per-session trace locking). The `web_replay_trace` MCP tool intentionally does
-**not** expose the new `secrets` param (safe skip+warn default for MCP/LLM callers).
+The `web_replay_trace` MCP tool intentionally does **not** expose the new
+`secrets` param (safe skip+warn default for MCP/LLM callers).
+
+### Advisory cleanup (folded into 1.6.16, no version bump)
+
+A follow-up pass worked the **34 low-severity advisories** the review had
+deferred (4 file-disjoint clusters, run sequentially with a ruff+mypy+test
+gate + commit per cluster). Each was validated against current code first:
+**23 fixed, 5 skipped** as non-issues / by-design / too-risky-for-LOW, and
+**6 had already been folded into the main 1.6.16 pass** (`CO-7/8/9`, `MO-1`,
+`CACHE-2`, `TRACE-3`). +29 tests in `tests/test_v1616_advisory_cleanup.py`.
+
+Fixed: BR-7 (`observe()` re-validates `prev_url` before the post-redirect
+rollback), BR-8 (`scroll_until_text` surfaces a closed page instead of
+swallowing everything), BR-9 (submit-click heuristic documented as advisory;
+`allow_form_submit` is the real gate), BR-10 (FUNCTION-wait JS-eval pre-flight
+kept as an intentional all-or-nothing early-exit), REC-3
+(`find_and_download_file` matches requested `file_types` by kind, so `['doc']`
+accepts an extensionless DOCX), AG-4 (`save_results` never derives a
+dotfile/empty filename), FC-2 (Secure cookies not forwarded over plaintext
+http), CE-3 (`prefer_api` scores candidates instead of taking the largest
+body), MC-3 (MCP lifespan removes only its own loguru handler), MC-4
+(`web_search`/`web_research` docstrings match the actual clamps), BR-2
+(`_NoCloseContextProxy` is weak-referenceable), BR-3 (resource-blocking route
+handler suppresses teardown races), SM-2 (UA probe moved outside the session
+lock), SP-1 (literal private-IP result filter applied to every provider at the
+SearchEngine choke point), SP-2 (`max_results` clamped at the engine), SE-1
+(search cache hit copies before mutating), EC-2 (EC skill `max_results`
+guarded), DS-1 (float skill inputs reject NaN/inf), AUDIT-1 (audit scope
+redacts sensitive kwargs), OWN-1 (ownership token file created 0o600 from the
+start), MAIN-1 (`interact` bounds the actions-file size + handles parse
+errors), DEBUG-1 (capture-slot reservation prevents concurrent overshoot),
+DEBUG-2 (unique artifact filenames via a monotonic counter).
+
+Skipped (validated as not worth changing): REC-4 (`_resolve_domain_hints` is
+documented back-compat API, not dead code), NC-1 (closed-page body capture is
+already swallowed + the task tracked/auto-discarded), BR-4
+(`_NoCloseContextProxy.close()` no-op is its documented purpose), TRACE-4
+(per-session trace locks -- a delicate refactor on an opt-in, off-by-default
+feature), CORR-1 (the import-time loguru patcher is intentional; loguru permits
+one patcher with no compose API).
 
 ## [1.6.15] - 2026-05-29
 
