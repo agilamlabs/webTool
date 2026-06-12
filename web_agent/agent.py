@@ -456,7 +456,7 @@ class Agent:
 
                     url_pages: list[ExtractionResult] = []
                     if fr.status == FetchStatus.SUCCESS and (fr.html or fr.binary):
-                        extracted = self._extractor.extract(fr)
+                        extracted = await self._extractor.extract_async(fr)
                         extracted.correlation_id = cid
                         url_pages.append(extracted)
                         diagnostics.append(
@@ -605,7 +605,7 @@ class Agent:
                             fr_item.url, session_id=session_id
                         )
                         if bin_fr.binary:
-                            extraction = self._extractor.extract(bin_fr)
+                            extraction = await self._extractor.extract_async(bin_fr)
                             extraction.correlation_id = cid
                             pages.append(extraction)
                             diagnostics.append(
@@ -679,12 +679,21 @@ class Agent:
             # a no-op slice. The post-fetch add_page()/add_chars() checks
             # below stay as belt-and-suspenders.
             remaining_pages = max(0, int(budget.remaining["pages"]))
+            # v1.6.16 deep-review fix: also stop the fan-out when the CHAR budget
+            # is already spent (the extract_files binary loop above charges chars
+            # via budget.add_chars). The slice below only consulted the PAGE
+            # dimension, so a char-exhausted call still fetched up to
+            # remaining_pages pages over the network -- and extracted one more
+            # full page before its own add_chars check tripped -- wasting I/O and
+            # overshooting max_chars_per_call. Clamp the fan-out to 0 on char
+            # exhaustion so no further network fetches happen.
+            if int(budget.remaining["chars"]) <= 0:
+                remaining_pages = 0
             if len(page_items) > remaining_pages:
                 dropped = len(page_items) - remaining_pages
                 bag.warn(
                     "page_budget_truncated",
-                    f"{dropped} page URL(s) not fetched: page budget "
-                    f"({self._config.safety.max_pages_per_call}) reached; "
+                    f"{dropped} page URL(s) not fetched: per-call budget reached; "
                     f"fetching {remaining_pages} of {len(page_items)}",
                 )
                 page_items = page_items[:remaining_pages]
@@ -708,7 +717,7 @@ class Agent:
                     except Exception as exc:
                         bag.err("budget_exceeded", str(exc))
                         break
-                    extraction = self._extractor.extract(fr)
+                    extraction = await self._extractor.extract_async(fr)
                     extraction.correlation_id = cid
                     try:
                         budget.add_chars(extraction.content_length)
@@ -849,7 +858,7 @@ class Agent:
                     url=fr.url,
                     status_code=fr.status_code,
                 )
-            extraction = self._extractor.extract(fr)
+            extraction = await self._extractor.extract_async(fr)
             extraction.correlation_id = cid
             return extraction
 
@@ -1007,18 +1016,32 @@ class Agent:
             # host, then signal denial identically to the input-url gate.
             if url is not None:
                 page = tm.get_or_current(tid)
-                if page is not None and not check_domain_allowed(
-                    page.url, self._config.safety
+                landed = page.url if page is not None else ""
+                landed_host = urlparse(landed).hostname or ""
+                # Deep-review fix: gate the denial on a NON-EMPTY landed host.
+                # ``TabManager.new_tab`` deliberately swallows an uncommitted
+                # ``page.goto`` failure (DNS error, connection refused, a
+                # download-triggering URL, a timeout before commit) and leaves
+                # the page parked on ``about:blank`` -- a hostless url.
+                # ``check_domain_allowed`` rejects that as "no host", so the
+                # old unconditional re-gate turned a transient network failure
+                # on a perfectly ALLOWED host into a spurious
+                # ``DomainNotAllowedError`` (empty host) AND destroyed the tab
+                # the TabManager intentionally keeps open for retry. A genuine
+                # redirect into denied/private space always has a host, so we
+                # only raise + close when ``landed_host`` is non-empty.
+                if (
+                    page is not None
+                    and landed_host
+                    and not check_domain_allowed(landed, self._config.safety)
                 ):
                     from .exceptions import DomainNotAllowedError
 
-                    landed = page.url
-                    host = urlparse(landed).hostname or ""
                     await tm.close_tab(tid)
                     raise DomainNotAllowedError(
-                        f"new_tab: domain not allowed after redirect: {host!r}",
+                        f"new_tab: domain not allowed after redirect: {landed_host!r}",
                         url=landed,
-                        host=host,
+                        host=landed_host,
                     )
             return tid
 
@@ -1850,6 +1873,12 @@ class Agent:
                 except ValueError as exc:
                     raise ValueError(f"output_path escapes output_dir ({out_dir}): {exc}") from exc
 
+        # v1.6.16 deep-review fix: a caller/CLI/MCP-supplied output_path may
+        # include a subdirectory (e.g. ``runs/today/out.json``) that passes the
+        # containment checks above but whose parent dir does not exist yet, so
+        # the write below would raise FileNotFoundError. Create the parent
+        # (guaranteed inside output_dir by the checks) before writing.
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         logger.info("Results saved to {path}", path=output_path)
         return output_path

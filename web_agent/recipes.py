@@ -354,7 +354,7 @@ class Recipes:
         # gets fetch_binary'd instead of dumped into the HTML extractor.
         top = ranked[0]
         fetch_result = await self._fetcher.fetch_smart(top.url, session_id=session_id)
-        extracted = self._extractor.extract(fetch_result)
+        extracted = await self._extractor.extract_async(fetch_result)
         # Inherit correlation_id from current scope
         extracted.correlation_id = get_correlation_id()
         return extracted
@@ -711,7 +711,7 @@ class Recipes:
                 )
                 continue
 
-            extracted = self._extractor.extract(fr)
+            extracted = await self._extractor.extract_async(fr)
             extracted.correlation_id = get_correlation_id()
 
             # v1.6.10 review I-1 fix: a binary FetchResult of an
@@ -1053,7 +1053,7 @@ class Recipes:
                 html_capture_source=html_source,
                 correlation_id=get_correlation_id(),
             )
-            extracted = self._extractor.extract(fr)
+            extracted = await self._extractor.extract_async(fr)
             extracted.correlation_id = get_correlation_id()
             return extracted
 

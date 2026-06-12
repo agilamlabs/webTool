@@ -179,7 +179,17 @@ class Timer:
 
     @property
     def elapsed_ms(self) -> float:
-        return (self._end - self._start) * 1000
+        # v1.6.16 fix: report a LIVE elapsed time when read INSIDE the ``with``
+        # block (before ``__exit__`` has set ``_end``). The prior version always
+        # used ``self._end``, which is still 0.0 mid-block, so any caller that
+        # built a return value with ``timer.elapsed_ms`` before the context
+        # exited got a large NEGATIVE number (``(0.0 - _start) * 1000``) --
+        # e.g. every in-block return in ``WebFetcher.fetch_binary``. Guarded on
+        # ``_start`` so a never-entered Timer still reports 0.0.
+        if not self._start:
+            return 0.0
+        end = self._end if self._end else time.perf_counter()
+        return (end - self._start) * 1000
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +827,33 @@ def _is_cross_platform_absolute(user_path: str) -> bool:
     return Path(user_path).is_absolute()
 
 
+# v1.6.16 deep-review fix: Windows reserved DEVICE names. On Windows (this
+# project's primary platform) these are devices regardless of extension, case,
+# or directory -- opening ``downloads/CON.pdf`` writes to the console device,
+# not a file -- and a web-derived filename (e.g. a search-result URL like
+# ``https://host/CON.txt``) could trigger that. Screened on every host OS for
+# cross-platform safety, mirroring the absolute-path predicate above.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _is_windows_reserved_name(component: str) -> bool:
+    """True if ``component`` is a Windows reserved device name.
+
+    The reservation ignores any extension and is case-insensitive, and Windows
+    strips trailing dots/spaces -- so ``CON``, ``con.txt``, ``COM1.log`` and
+    ``CON.`` / ``CON `` all resolve to a device. Compare the stem (text before
+    the first dot), trimmed and upper-cased, against the device set.
+    """
+    if not component:
+        return False
+    stem = component.split(".", 1)[0].strip().upper()
+    return stem in _WINDOWS_RESERVED_NAMES
+
+
 def safe_join_path(base: Path | str, user_path: str) -> Path:
     """Resolve ``base / user_path`` and ensure it does NOT escape ``base``.
 
@@ -838,8 +875,9 @@ def safe_join_path(base: Path | str, user_path: str) -> Path:
         The resolved absolute path, guaranteed to be inside ``base``.
 
     Raises:
-        ValueError: If the resolved path escapes ``base``, or if ``user_path``
-            is empty or absolute on any major platform.
+        ValueError: If the resolved path escapes ``base``, if ``user_path``
+            is empty or absolute on any major platform, or if any component is
+            a Windows reserved device name.
     """
     if not user_path:
         raise ValueError("Empty filename / path")
@@ -848,6 +886,14 @@ def safe_join_path(base: Path | str, user_path: str) -> Path:
         raise ValueError(f"Absolute paths are not allowed: {user_path!r}")
 
     user_p = Path(user_path)
+
+    # v1.6.16 deep-review fix: reject Windows reserved device names in ANY path
+    # component. safe_join_path is the single chokepoint for every user/web-
+    # derived filename (downloads, workspace files, traces), so screening here
+    # covers all of them.
+    for part in user_p.parts:
+        if _is_windows_reserved_name(part):
+            raise ValueError(f"Reserved device name not allowed in path: {part!r}")
 
     base_resolved = Path(base).resolve()
     candidate = (base_resolved / user_p).resolve()

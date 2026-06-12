@@ -10,6 +10,7 @@ hint -- it never crashes the pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Optional
@@ -199,6 +200,27 @@ class ContentExtractor:
         # api_json slice). The api_json branch's own 512 KiB cap is more
         # conservative and still applies first, so it is preserved.
         return self._cap_content(result)
+
+    async def extract_async(
+        self,
+        fetch_result: FetchResult,
+        *,
+        strict: bool = False,
+        prefer_api: bool = False,
+    ) -> ExtractionResult:
+        """Run :meth:`extract` off the event loop in a worker thread.
+
+        v1.6.16 deep-review fix: ``extract`` drives synchronous CPU-heavy
+        parsers (trafilatura, lxml, pypdf, openpyxl) over potentially multi-MB
+        documents. Calling it directly from an async method blocks the event
+        loop for the whole parse, stalling every other in-flight fetch/extract
+        (especially harmful for the long-lived MCP server). The extractors build
+        fresh per-call parser state, so running concurrent calls in threads is
+        safe. Signature mirrors :meth:`extract`.
+        """
+        return await asyncio.to_thread(
+            self.extract, fetch_result, strict=strict, prefer_api=prefer_api
+        )
 
     def _cap_content(self, result: ExtractionResult) -> ExtractionResult:
         """Truncate ``content``/``markdown`` to ``safety.max_chars_per_call``.

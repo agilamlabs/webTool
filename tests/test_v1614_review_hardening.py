@@ -122,9 +122,14 @@ class TestConfigHardening:
         assert not s.allow_form_submit
         assert not s.allow_coordinate_clicks
 
-    def test_locator_spec_role_name_only_not_empty(self) -> None:
-        assert LocatorSpec(role_name="Submit").is_empty() is False
+    def test_locator_spec_role_name_only_is_empty(self) -> None:
+        # v1.6.16 deep-review fix: role_name is only an accessible-name FILTER
+        # for role, not a standalone locator, so is_empty() now agrees with the
+        # resolver (which rejects a role_name-only spec) and reports it empty.
+        assert LocatorSpec(role_name="Submit").is_empty() is True
         assert LocatorSpec().is_empty() is True
+        # role + role_name IS a usable locator -> not empty.
+        assert LocatorSpec(role="button", role_name="Submit").is_empty() is False
 
     def test_negative_budget_rejected(self) -> None:
         with pytest.raises(ValidationError):

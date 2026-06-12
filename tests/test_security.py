@@ -47,6 +47,25 @@ class TestSafeJoinPath:
         with pytest.raises(ValueError, match="Empty"):
             safe_join_path(tmp_path, "")
 
+    @pytest.mark.parametrize(
+        "name",
+        ["CON.pdf", "con.txt", "NUL", "AUX", "PRN", "COM1.log", "LPT9.dat",
+         "sub/CON.csv", "CON.", "PRN "],
+    )
+    def test_rejects_windows_reserved_device_names(self, tmp_path: Path, name: str) -> None:
+        # v1.6.16 deep-review fix: a web-derived filename like CON.pdf would
+        # otherwise write to the Windows console device, not a file.
+        with pytest.raises(ValueError, match=r"[Rr]eserved"):
+            safe_join_path(tmp_path, name)
+
+    @pytest.mark.parametrize(
+        "name", ["console.txt", "common.csv", "lpt.txt", "com.txt", "report.pdf", "data/file.json"]
+    )
+    def test_allows_reserved_name_lookalikes(self, tmp_path: Path, name: str) -> None:
+        # Regression: only the EXACT device stems are reserved.
+        result = safe_join_path(tmp_path, name)
+        assert result.is_relative_to(tmp_path.resolve())
+
 
 class TestIsPrivateAddress:
     def test_blocks_aws_imds(self) -> None:
@@ -146,6 +165,26 @@ class TestDenyListIPv6Canonicalization:
         # block_private_ips=True config -- the strongest form of the test.
         sc = SafetyConfig(denied_domains=["[2606:4700:4700:0:0:0:0:1111]"])
         assert check_domain_allowed("http://[2606:4700:4700::1111]/x", sc) is False
+
+    def test_unbracketed_compressed_ipv6_deny_blocks(self) -> None:
+        # CO-2 regression: the port-strip urlparse step split an UNBRACKETED
+        # IPv6 deny entry on its first colon, truncating ``2001:db8::1`` to
+        # ``2001`` so the deny silently failed open. The natural unbracketed
+        # form must now block.
+        sc = SafetyConfig(denied_domains=["2001:db8::1"], block_private_ips=False)
+        assert check_domain_allowed("http://[2001:db8::1]/x", sc) is False
+
+    def test_unbracketed_expanded_ipv6_deny_matches_compressed_url(self) -> None:
+        sc = SafetyConfig(denied_domains=["2001:db8:0:0:0:0:0:1"], block_private_ips=False)
+        assert check_domain_allowed("http://[2001:db8::1]/x", sc) is False
+
+    def test_unbracketed_ipv6_allow_list_not_broken_closed(self) -> None:
+        # The flip side: an unbracketed IPv6 ALLOW entry previously truncated
+        # to ``2001`` and fail-CLOSED, blocking all traffic to the intended
+        # host. It must now allow the matching host and still deny others.
+        sc = SafetyConfig(allowed_domains=["2001:db8::1"], block_private_ips=False)
+        assert check_domain_allowed("http://[2001:db8::1]/x", sc) is True
+        assert check_domain_allowed("http://[2001:db8::2]/x", sc) is False
 
     def test_normal_hostname_deny_still_works(self) -> None:
         # Regression guard: plain-hostname deny semantics are unchanged.

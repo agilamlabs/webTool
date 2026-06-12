@@ -317,6 +317,77 @@ class TestBR10PreflightEarlyExitPreserved:
 
 
 # ---------------------------------------------------------------------------
+# BR-2 (deep-review fix): a single-action handle_dialog pre-arm writes a
+# _PAGE_DIALOG_STATES slot WITHOUT starting a sequence. The concurrency guard
+# must key on the separate _PAGE_ACTIVE_SEQUENCES marker, not slot presence,
+# so the next interact()/execute_sequence isn't falsely refused.
+# ---------------------------------------------------------------------------
+class TestBR2DialogSlotDoesNotBrickSequence:
+    def _seq_page(self) -> MagicMock:
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.on = MagicMock()
+        page.remove_listener = MagicMock()
+        page.is_closed = MagicMock(return_value=False)
+        page.wait_for_function = AsyncMock()
+        type(page).url = property(lambda _self: "https://good.example/app")
+        return page
+
+    @pytest.mark.asyncio
+    async def test_prearmed_dialog_slot_does_not_refuse_next_sequence(self) -> None:
+        from web_agent.browser_actions import (
+            _PAGE_ACTIVE_SEQUENCES,
+            _PAGE_DIALOG_STATES,
+            _DialogState,
+        )
+
+        cfg = AppConfig(safety=SafetyConfig(allow_js_evaluation=True))
+        page = self._seq_page()
+        ba = _make_browser_actions(page, cfg)
+
+        # Simulate Agent.handle_dialog -> _do_dialog writing the slot (no
+        # sequence started, no listener registered, slot never popped).
+        _PAGE_DIALOG_STATES[page] = _DialogState()
+        actions = [WaitInput(target=WaitTarget.FUNCTION, value="() => true")]
+        try:
+            res = await ba.execute_sequence(
+                "https://good.example/app", actions, session_id="sid"
+            )
+        finally:
+            _PAGE_DIALOG_STATES.pop(page, None)
+            _PAGE_ACTIVE_SEQUENCES.discard(page)
+
+        # The sequence ran -- NOT aborted with the "already running" error.
+        assert res.actions_succeeded == 1
+        assert not any("already running" in (r.error_message or "") for r in res.results)
+        # The sequence cleaned up its own in-flight marker in finally.
+        assert page not in _PAGE_ACTIVE_SEQUENCES
+
+    @pytest.mark.asyncio
+    async def test_guard_still_refuses_a_genuinely_inflight_sequence(self) -> None:
+        from web_agent.browser_actions import _PAGE_ACTIVE_SEQUENCES
+
+        cfg = AppConfig(safety=SafetyConfig(allow_js_evaluation=True))
+        page = self._seq_page()
+        ba = _make_browser_actions(page, cfg)
+
+        # A live sequence already owns this page.
+        _PAGE_ACTIVE_SEQUENCES.add(page)
+        actions = [WaitInput(target=WaitTarget.FUNCTION, value="() => true")]
+        try:
+            res = await ba.execute_sequence(
+                "https://good.example/app", actions, session_id="sid"
+            )
+            # Refused: aborted with the concurrency error, no action executed.
+            assert res.actions_succeeded == 0
+            assert any("already running" in (r.error_message or "") for r in res.results)
+            # The refused sequence must NOT have cleared the owner's marker.
+            assert page in _PAGE_ACTIVE_SEQUENCES
+        finally:
+            _PAGE_ACTIVE_SEQUENCES.discard(page)
+
+
+# ---------------------------------------------------------------------------
 # REC-3: extensionless fallback matches requested file_types by KIND
 # ---------------------------------------------------------------------------
 class TestREC3FindAndDownloadFileKindMatch:

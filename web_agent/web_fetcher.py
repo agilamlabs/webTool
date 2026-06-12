@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from loguru import logger
@@ -504,6 +504,13 @@ class WebFetcher:
             with timer:
                 result = await self._do_fetch(url, session_id=session_id)
             result.correlation_id = cid
+            # v1.6.16 fix: stamp the measured elapsed time on the success path.
+            # ``_navigate_and_extract`` builds the FetchResult without
+            # response_time_ms (only the error returns below set it), so the
+            # HTML success path -- and its cached payload -- previously always
+            # reported 0.0. Read AFTER the ``with`` exits (so the timer is
+            # finalised) and set BEFORE caching so the cached value is honest.
+            result.response_time_ms = timer.elapsed_ms
             # Cache successful fetches only -- caching errors / blocks
             # would lock in transient failures across the TTL window.
             # Key matches the lookup above (session-namespaced, C-3).
@@ -980,13 +987,19 @@ class WebFetcher:
 
         async def _check_redirect(response: httpx.Response) -> None:
             if 300 <= response.status_code < 400:
-                next_url = response.headers.get("location", "")
-                if next_url and not check_domain_allowed(next_url, safety):
-                    raise NavigationError(
-                        f"HEAD probe redirect to disallowed URL blocked: {next_url}",
-                        url=next_url,
-                        status_code=response.status_code,
-                    )
+                location = response.headers.get("location", "")
+                # v1.6.16 FC-1 fix: resolve a possibly-RELATIVE ``Location``
+                # against the responding URL before gating (see fetch_binary's
+                # twin) so a same-host relative redirect isn't mis-blocked and
+                # then swallowed to 'unknown', mis-routing the URL.
+                if location:
+                    next_url = urljoin(str(response.url), location)
+                    if not check_domain_allowed(next_url, safety):
+                        raise NavigationError(
+                            f"HEAD probe redirect to disallowed URL blocked: {next_url}",
+                            url=next_url,
+                            status_code=response.status_code,
+                        )
 
         try:
             cookie_jar = await self._cookies_for_session(session_id, url)
@@ -997,41 +1010,50 @@ class WebFetcher:
                 cookies=cookie_jar,
                 event_hooks={"response": [_check_redirect]},
             ) as client:
-                resp = await client.head(url)
-                # v1.6.16 FC-1: post-connect peer-IP re-check (DNS rebinding).
-                if getattr(safety, "block_private_ips", False):
-                    peer_ip = httpx_peer_ip(resp)
-                    if peer_ip and is_private_address(peer_ip):
+                # v1.6.16 FC-1 fix: use a STREAMING HEAD so the post-connect
+                # peer-IP re-check actually fires. ``httpx_peer_ip`` reads the
+                # httpcore ``network_stream`` extension, which is ONLY populated
+                # for a streaming response -- a buffered ``client.head()`` left
+                # it empty, making the DNS-rebinding guard below a silent no-op.
+                # A streaming HEAD pulls no body, so the probe stays as light as
+                # before while restoring the peer check.
+                async with client.stream("HEAD", url) as resp:
+                    # post-connect peer-IP re-check (DNS rebinding).
+                    if getattr(safety, "block_private_ips", False):
+                        peer_ip = httpx_peer_ip(resp)
+                        if peer_ip and is_private_address(peer_ip):
+                            logger.debug(
+                                "HEAD probe connected to private peer {ip} for {url}; "
+                                "treating as 'unknown'",
+                                ip=peer_ip,
+                                url=url,
+                            )
+                            return "unknown"
+                    final_url = str(resp.url)
+                    if final_url != url and not check_domain_allowed(
+                        final_url, self._config.safety
+                    ):
                         logger.debug(
-                            "HEAD probe connected to private peer {ip} for {url}; "
+                            "HEAD probe followed redirect to disallowed URL {final}; "
                             "treating as 'unknown'",
-                            ip=peer_ip,
-                            url=url,
+                            final=final_url,
                         )
                         return "unknown"
-                final_url = str(resp.url)
-                if final_url != url and not check_domain_allowed(final_url, self._config.safety):
-                    logger.debug(
-                        "HEAD probe followed redirect to disallowed URL {final}; "
-                        "treating as 'unknown'",
-                        final=final_url,
-                    )
+                    ct = resp.headers.get("content-type")
+                    disp = resp.headers.get("content-disposition")
+                    # v1.6.10: map Content-Type to a granular kind first so
+                    # callers can filter by file_types. Anything binary that
+                    # doesn't match a known mapping collapses to
+                    # 'binary_other' (still routed through fetch_binary).
+                    ct_norm = (ct or "").lower().split(";", 1)[0].strip()
+                    for prefix, kind in _CT_TO_KIND.items():
+                        if ct_norm.startswith(prefix):
+                            return kind
+                    if _content_type_is_binary(ct) or _disposition_is_attachment(disp):
+                        return "binary_other"
+                    if ct_norm.startswith(("text/html", "application/xhtml")):
+                        return "html"
                     return "unknown"
-                ct = resp.headers.get("content-type")
-                disp = resp.headers.get("content-disposition")
-                # v1.6.10: map Content-Type to a granular kind first so
-                # callers can filter by file_types. Anything binary that
-                # doesn't match a known mapping collapses to
-                # 'binary_other' (still routed through fetch_binary).
-                ct_norm = (ct or "").lower().split(";", 1)[0].strip()
-                for prefix, kind in _CT_TO_KIND.items():
-                    if ct_norm.startswith(prefix):
-                        return kind
-                if _content_type_is_binary(ct) or _disposition_is_attachment(disp):
-                    return "binary_other"
-                if ct_norm.startswith(("text/html", "application/xhtml")):
-                    return "html"
-                return "unknown"
         except (NavigationError, DomainNotAllowedError) as exc:
             # L1: the redirect hook (_check_redirect) blocked a redirect to
             # a denied / private host -- a probable SSRF attempt. The safe
@@ -1188,13 +1210,24 @@ class WebFetcher:
         # caught below and surfaced as ``FetchStatus.BLOCKED``.
         async def _check_redirect(response: httpx.Response) -> None:
             if 300 <= response.status_code < 400:
-                next_url = response.headers.get("location", "")
-                if next_url and not check_domain_allowed(next_url, safety):
-                    raise NavigationError(
-                        f"Redirect to disallowed URL blocked: {next_url}",
-                        url=next_url,
-                        status_code=response.status_code,
-                    )
+                location = response.headers.get("location", "")
+                # v1.6.16 FB-1 fix: RFC 9110 allows a RELATIVE ``Location``
+                # (e.g. ``/download/file.pdf``), which is extremely common for
+                # trailing-slash / auth redirects. The raw header has no host,
+                # so gating it directly made ``check_domain_allowed`` reject a
+                # legitimate same-host relative redirect ("no host") and turn a
+                # normal binary fetch into a spurious BLOCKED. Resolve against
+                # the responding URL first; ``urljoin`` leaves an ABSOLUTE
+                # Location unchanged, so a cross-host redirect is still gated on
+                # its real host.
+                if location:
+                    next_url = urljoin(str(response.url), location)
+                    if not check_domain_allowed(next_url, safety):
+                        raise NavigationError(
+                            f"Redirect to disallowed URL blocked: {next_url}",
+                            url=next_url,
+                            status_code=response.status_code,
+                        )
 
         timer = Timer()
         try:

@@ -189,35 +189,48 @@ class RobotsChecker:
             # SSRF lever (a redirect to an internal host would otherwise be
             # fetched). Any non-200 -- including a 3xx -- is treated as "no
             # robots / allow-all" per the existing semantics below.
-            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=False) as client:
-                resp = await client.get(url, headers={"User-Agent": self._user_agent})
-            # v1.6.16 ROBOTS-2 (post-connect): the PRE-connect guard above
-            # checks the host before resolving, but a DNS rebind inside the
-            # cache window can still land this fetch on an internal address.
-            # follow_redirects=False makes ``resp`` a complete, non-streaming
-            # response, so httpx_peer_ip can read the concrete socket peer.
-            # If it's private, treat as allow-all (return None) -- same
-            # fail-open-to-allow policy as the pre-connect skip.
-            if self._block_private_ips:
-                peer_ip = httpx_peer_ip(resp)
-                if peer_ip and is_private_address(peer_ip):
-                    logger.debug(
-                        "robots.txt fetch for {h} connected to private peer {ip}; "
-                        "treating as allow-all (SSRF defense-in-depth)",
-                        h=host,
-                        ip=peer_ip,
-                    )
-                    return None
-            if resp.status_code != 200:
-                logger.debug(
-                    "robots.txt for {h}: HTTP {c}, treating as allow-all",
-                    h=host,
-                    c=resp.status_code,
-                )
-                return None
-            rp = RobotFileParser()
-            rp.parse(resp.text.splitlines())
-            return rp
+            async with httpx.AsyncClient(
+                timeout=self._timeout, follow_redirects=False
+            ) as client:
+                # v1.6.16 ROBOTS-2 (post-connect) fix: STREAM the GET so the
+                # peer-IP re-check below actually works. ``httpx_peer_ip`` reads
+                # the httpcore ``network_stream`` extension, which is ONLY
+                # populated on a streaming response -- the prior buffered
+                # ``client.get()`` (read AFTER the client context had already
+                # closed) left it empty, making this DNS-rebinding guard a
+                # silent no-op. The PRE-connect guard above checks the host
+                # before resolving, but a DNS rebind inside the cache window can
+                # still land this fetch on an internal address; inspect the
+                # concrete connected peer while the connection is OPEN and, if
+                # it is private, treat as allow-all (return None) -- the same
+                # fail-open-to-allow policy as the pre-connect skip.
+                async with client.stream(
+                    "GET", url, headers={"User-Agent": self._user_agent}
+                ) as resp:
+                    if self._block_private_ips:
+                        peer_ip = httpx_peer_ip(resp)
+                        if peer_ip and is_private_address(peer_ip):
+                            logger.debug(
+                                "robots.txt fetch for {h} connected to private peer {ip}; "
+                                "treating as allow-all (SSRF defense-in-depth)",
+                                h=host,
+                                ip=peer_ip,
+                            )
+                            return None
+                    if resp.status_code != 200:
+                        logger.debug(
+                            "robots.txt for {h}: HTTP {c}, treating as allow-all",
+                            h=host,
+                            c=resp.status_code,
+                        )
+                        return None
+                    # Peer cleared the rebinding guard -- now pull the body
+                    # (a streaming response is not readable as ``.text`` until
+                    # the content is drained) and parse it.
+                    await resp.aread()
+                    rp = RobotFileParser()
+                    rp.parse(resp.text.splitlines())
+                    return rp
         except Exception as exc:
             logger.debug(
                 "robots.txt fetch failed for {h}: {e}, treating as allow-all",

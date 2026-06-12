@@ -136,3 +136,42 @@ async def test_new_tab_without_url_skips_regate() -> None:
 
     assert tid == "blank-tab"
     tab_mgr.close_tab.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_tab_goto_failure_about_blank_is_not_a_domain_denial() -> None:
+    """Deep-review regression: when ``TabManager.new_tab`` swallows an
+    uncommitted goto failure (DNS error, connection refused, a download-
+    triggering URL, a timeout before commit) the page is left on
+    ``about:blank`` -- a HOSTLESS url. The landed-url re-gate must NOT
+    mis-report that transient failure as a ``DomainNotAllowedError`` (empty
+    host) nor destroy the tab the TabManager keeps open for retry; the tid is
+    returned as-is."""
+    tab_mgr = MagicMock()
+    tab_mgr.new_tab = AsyncMock(return_value="tab-blank")
+    tab_mgr.get_or_current = MagicMock(return_value=_make_landed_page("about:blank"))
+    tab_mgr.close_tab = AsyncMock()
+
+    agent = _agent_with_tab_manager(_cfg(), tab_mgr)
+
+    tid = await agent.new_tab(ALLOWED_INPUT_URL, session_id="s1")
+
+    assert tid == "tab-blank"
+    tab_mgr.close_tab.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_tab_empty_landed_url_is_not_a_domain_denial() -> None:
+    """A page whose ``.url`` is empty (a failed/uncommitted navigation) is
+    likewise NOT a redirect into denied space -- no raise, no tab teardown."""
+    tab_mgr = MagicMock()
+    tab_mgr.new_tab = AsyncMock(return_value="tab-empty")
+    tab_mgr.get_or_current = MagicMock(return_value=_make_landed_page(""))
+    tab_mgr.close_tab = AsyncMock()
+
+    agent = _agent_with_tab_manager(_cfg(), tab_mgr)
+
+    tid = await agent.new_tab(ALLOWED_INPUT_URL, session_id="s1")
+
+    assert tid == "tab-empty"
+    tab_mgr.close_tab.assert_not_awaited()

@@ -640,11 +640,18 @@ class LocatorSpec(BaseModel):
     test_id: Optional[str] = Field(default=None, description="data-testid value")
 
     def is_empty(self) -> bool:
+        # v1.6.16 deep-review fix: ``role_name`` is NOT a standalone locator --
+        # it is only an accessible-name FILTER applied on top of ``role`` (see
+        # _resolve_locator, which consults it solely inside ``if spec.role``).
+        # Counting it here made ``LocatorSpec(role_name='Submit')`` report
+        # is_empty()==False while the resolver still rejected it as "empty" --
+        # an inconsistent contract that misled callers using is_empty() as a
+        # pre-validation gate. Exclude it so is_empty() matches the resolver's
+        # actual usable-locator set.
         return not any(
             (
                 self.selector,
                 self.role,
-                self.role_name,
                 self.text,
                 self.label,
                 self.placeholder,
@@ -708,7 +715,11 @@ class TypeInput(BaseAction):
     selector: SelectorLike = Field(description="CSS selector or LocatorSpec for the input element")
     timeout: Optional[int] = Field(default=None)
     text: str = Field(description="Text to type")
-    delay: int = Field(default=0, description="Delay in ms between key presses")
+    # v1.6.16 deep-review fix: bound the per-keystroke delay. It feeds an
+    # UNTIMED ``page.keyboard.type(..., delay=...)`` (no Playwright timeout
+    # applies), so an LLM/prompt-injection-supplied huge value pinned the
+    # single shared Playwright connection. Parity with the BR-3 repeat bound.
+    delay: int = Field(default=0, ge=0, le=5000, description="Delay in ms between key presses")
     clear_first: bool = Field(default=False, description="Clear field before typing")
 
 
@@ -872,7 +883,9 @@ class ClickXYInput(BaseAction):
     y: float = Field(description="Viewport Y coordinate (CSS pixels)")
     button: MouseButton = Field(default=MouseButton.LEFT)
     clicks: int = Field(default=1, ge=1, le=3, description="1=single, 2=double, 3=triple")
-    delay: int = Field(default=0, description="ms between mousedown and mouseup")
+    # v1.6.16 deep-review fix: bound the mousedown->mouseup delay (untimed
+    # ``page.mouse.click(..., delay=...)``); see TypeInput.delay rationale.
+    delay: int = Field(default=0, ge=0, le=5000, description="ms between mousedown and mouseup")
     timeout: Optional[int] = Field(default=None)
 
 
@@ -885,7 +898,9 @@ class TypeTextInput(BaseAction):
 
     action: Literal["type_text"] = "type_text"
     text: str = Field(description="Text to type into the current focus target")
-    delay: int = Field(default=0, description="ms between key presses")
+    # v1.6.16 deep-review fix: bound the per-keystroke delay (untimed
+    # ``page.keyboard.type(..., delay=...)``); see TypeInput.delay rationale.
+    delay: int = Field(default=0, ge=0, le=5000, description="ms between key presses")
 
 
 class PressKeyInput(BaseAction):
@@ -1188,8 +1203,14 @@ class FormFilterSpec(BaseModel):
         default=None,
         description="Locator that must appear after submit before extraction runs.",
     )
+    # v1.6.16 deep-review fix: ``ge=1`` so a value of 0 is unreachable -- the
+    # recipe passes this straight to ``page.goto(timeout=...)`` / wait_for,
+    # where Playwright treats 0 as "DISABLE the timeout" (wait forever),
+    # inverting the field's documented "Maximum time" contract. Capped at 5 min.
     wait_timeout_ms: int = Field(
         default=15000,
+        ge=1,
+        le=300_000,
         description="Maximum time (ms) to wait for wait_for to appear.",
     )
 

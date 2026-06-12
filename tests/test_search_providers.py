@@ -373,14 +373,16 @@ class TestSearchEngineChain:
         names = [p.name for p in engine.providers]
         assert names == ["ddgs", "playwright"]
 
-    @pytest.mark.asyncio
-    async def test_unknown_provider_name_silently_dropped(self) -> None:
-        from web_agent.search_engine import SearchEngine
+    def test_unknown_provider_name_rejected_at_config_time(self) -> None:
+        # v1.6.16 deep-review fix: an unknown provider name is REJECTED at
+        # config time (Literal) instead of being silently dropped from the
+        # chain (which previously degraded it, or -- if every name was wrong --
+        # yielded an empty chain and a misleading "providers exhausted ([])"
+        # error on every search).
+        import pydantic
 
-        config = AppConfig(search={"providers": ["nonexistent", "ddgs"]})
-        engine = SearchEngine(browser_manager=MagicMock(), config=config)
-        names = [p.name for p in engine.providers]
-        assert names == ["ddgs"]
+        with pytest.raises(pydantic.ValidationError):
+            AppConfig(search={"providers": ["nonexistent", "ddgs"]})
 
 
 # ---------------------------------------------------------------------------
