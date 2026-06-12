@@ -508,6 +508,11 @@ class TestV1611Integration:
                 content_length=5,
             )
         )
+        # extract_async delegates to extract off the event loop in the real
+        # ContentExtractor; mirror that so the mocked recipe path awaits cleanly.
+        extractor_mock.extract_async = AsyncMock(
+            side_effect=lambda fr, **kw: extractor_mock.extract(fr, **kw)
+        )
 
         config = AppConfig(
             log_level="WARNING",
@@ -591,6 +596,11 @@ class TestV1611Integration:
 
         extractor_mock = MagicMock()
         extractor_mock.extract = MagicMock(side_effect=fake_extract)
+        # extract_async delegates to extract off the event loop in the real
+        # ContentExtractor; mirror that so the mocked recipe path awaits cleanly.
+        extractor_mock.extract_async = AsyncMock(
+            side_effect=lambda fr, **kw: extractor_mock.extract(fr, **kw)
+        )
 
         config = AppConfig(
             log_level="WARNING",

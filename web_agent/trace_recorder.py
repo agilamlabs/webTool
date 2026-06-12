@@ -143,10 +143,14 @@ def is_redacted(value: Any) -> bool:
 def redact_sensitive_mapping(mapping: dict[str, Any] | None) -> dict[str, Any]:
     """Return a copy of *mapping* with sensitive VALUES masked by key name.
 
-    A value is masked (replaced with :data:`_REDACTED`) when its key
-    matches :func:`_key_is_sensitive` (password/token/secret/key/...).
-    Non-sensitive values are preserved verbatim so the record stays useful
-    for debugging. ``None`` maps to an empty dict. Never mutates the input.
+    A value is masked (replaced with :data:`_REDACTED`) when its key matches
+    :func:`_key_is_sensitive` (password/token/secret/key/...). The scrub is
+    RECURSIVE (v1.6.16 deep-review fix): a sensitive key NESTED under a
+    non-sensitive one -- e.g. ``{"login": {"password": "..."}}`` (domain-skill
+    ``inputs`` pass through nested dicts) -- is still masked, and a sensitive
+    key whose value is a container masks the WHOLE container. Non-sensitive
+    scalars are preserved verbatim so the record stays useful for debugging.
+    ``None`` maps to an empty dict. Never mutates the input.
 
     This is the audit-path analogue of :func:`_redact_args`: the trace sink
     redacts by action schema; free-form dicts (e.g. domain-skill ``inputs``)
@@ -154,7 +158,23 @@ def redact_sensitive_mapping(mapping: dict[str, Any] | None) -> dict[str, Any]:
     """
     if not mapping:
         return {}
-    return {k: (_REDACTED if _key_is_sensitive(k) else v) for k, v in mapping.items()}
+    return {k: _redact_value(k, v) for k, v in mapping.items()}
+
+
+def _redact_value(key: str, value: Any) -> Any:
+    """Recursively mask *value* given its *key*.
+
+    A sensitive *key* masks the whole value (including nested containers);
+    otherwise recurse into dicts / lists / tuples so a sensitive key nested
+    deeper down is still caught. Scalars under a non-sensitive key pass through.
+    """
+    if _key_is_sensitive(key):
+        return _REDACTED
+    if isinstance(value, dict):
+        return {k: _redact_value(k, v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(key, item) for item in value]
+    return value
 
 
 def _redact_args(method: str, args: dict[str, Any]) -> dict[str, Any]:

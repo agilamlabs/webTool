@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from loguru import logger
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from .agent import Agent
 from .config import AppConfig
@@ -109,13 +109,28 @@ async def run_interact(args: argparse.Namespace) -> None:
                 f"Actions file {actions_path} too large (> {max_actions_bytes} bytes)."
             )
         raw_actions = json.loads(actions_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # v1.6.16 deep-review fix: ``ValueError`` covers BOTH json.JSONDecodeError
+        # and UnicodeDecodeError. A non-UTF-8 actions file (e.g. JSON saved as
+        # UTF-16 by PowerShell's default Out-File on the Windows hosts this
+        # project targets) previously escaped this net as an opaque traceback,
+        # contradicting the MAIN-1 "clear CLI message" contract.
         raise SystemExit(f"Failed to read/parse actions file {actions_path}: {exc}") from exc
     adapter = TypeAdapter(list[Action])
-    actions = adapter.validate_python(raw_actions)
+    # v1.6.16 deep-review fix: surface well-formed-JSON-but-invalid-action-shape
+    # as a clear CLI message instead of a raw pydantic ValidationError traceback.
+    try:
+        actions = adapter.validate_python(raw_actions)
+    except ValidationError as exc:
+        raise SystemExit(f"Invalid actions in {actions_path}: {exc}") from exc
 
     async with Agent(config) as agent:
-        result = await agent.interact(args.url, actions, stop_on_error=not args.no_stop_on_error)
+        # v1.6.16 deep-review fix: pass None (not a hardcoded bool) when
+        # ``--no-stop-on-error`` is absent, so ``automation.stop_on_error`` in
+        # the operator's config is actually consulted. The flag, when given,
+        # explicitly overrides it to False (do-not-stop).
+        stop_on_error = False if args.no_stop_on_error else None
+        result = await agent.interact(args.url, actions, stop_on_error=stop_on_error)
         print(result.model_dump_json(indent=2))
 
 

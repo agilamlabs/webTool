@@ -123,6 +123,33 @@ class _FakeHeadResponse:
             self.extensions["network_stream"] = _FakeNetworkStream(peer_ip)
 
 
+class _RobotsStream:
+    """Fake httpx streaming response for the robots.txt ``client.stream('GET')``
+    (ROBOTS-2 peer-IP fix). Exposes a peer via ``network_stream`` and a body
+    that is only readable as ``.text`` after ``aread()`` -- matching real httpx.
+    """
+
+    def __init__(self, *, status_code: int = 200, peer_ip: str | None = None, body: str = "") -> None:
+        self.status_code = status_code
+        self._body = body
+        self.extensions: dict[str, Any] = {}
+        if peer_ip is not None:
+            self.extensions["network_stream"] = _FakeNetworkStream(peer_ip)
+
+    async def __aenter__(self) -> _RobotsStream:
+        return self
+
+    async def __aexit__(self, *a: Any) -> bool:
+        return False
+
+    async def aread(self) -> bytes:
+        return self._body.encode("utf-8")
+
+    @property
+    def text(self) -> str:
+        return self._body
+
+
 def _make_fake_client(*, stream_resp=None, head_resp=None):
     """Build a fake httpx.AsyncClient class returning the given responses.
 
@@ -141,15 +168,26 @@ def _make_fake_client(*, stream_resp=None, head_resp=None):
         async def __aexit__(self, *a: Any) -> bool:
             return False
 
-        def stream(self, _method: str, _url: str, **_k: Any):
+        def stream(self, method: str, _url: str, **_k: Any):
+            # classify_url now probes via a STREAMING HEAD (FC-1 peer-IP fix);
+            # fetch_binary streams a GET. Dispatch so a single fake serves both.
+            if method.upper() == "HEAD":
+                assert head_resp is not None
+                hooks = self._hooks
+                resp = head_resp
+
+                class _HeadStreamCtx:
+                    async def __aenter__(_s):  # noqa: N805
+                        for hook in hooks:
+                            await hook(resp)
+                        return resp
+
+                    async def __aexit__(_s, *a):  # noqa: N805
+                        return False
+
+                return _HeadStreamCtx()
             assert stream_resp is not None
             return stream_resp
-
-        async def head(self, _url: str, **_k: Any):
-            assert head_resp is not None
-            for hook in self._hooks:
-                await hook(head_resp)
-            return head_resp
 
     return _FakeClient
 
@@ -363,13 +401,23 @@ class TestFC1ClassifyUrlSSRF:
             async def __aexit__(self, *a):
                 return False
 
-            async def head(self, _url: str, **_k: Any):
-                redirect = MagicMock()
-                redirect.status_code = 301
-                redirect.headers = {"location": "http://169.254.169.254/x"}
-                for h in self._hooks:
-                    await h(redirect)
-                return _FakeHeadResponse(url="https://good.example/doc")
+            def stream(self, method: str, _url: str, **_k: Any):
+                hooks = self._hooks
+
+                class _Ctx:
+                    async def __aenter__(_s):  # noqa: N805
+                        redirect = MagicMock()
+                        redirect.status_code = 301
+                        redirect.headers = {"location": "http://169.254.169.254/x"}
+                        redirect.url = "https://good.example/doc"
+                        for h in hooks:
+                            await h(redirect)
+                        return _FakeHeadResponse(url="https://good.example/doc")
+
+                    async def __aexit__(_s, *a):  # noqa: N805
+                        return False
+
+                return _Ctx()
 
         monkeypatch.setattr("httpx.AsyncClient", _FakeClient)
 
@@ -391,6 +439,261 @@ class TestFC1ClassifyUrlSSRF:
 
         kind = await fetcher.classify_url("https://good.example/doc")
         assert kind == "pdf"
+
+    @pytest.mark.asyncio
+    async def test_uses_streaming_head_so_peer_check_actually_fires(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deep-review fix: ``httpx_peer_ip`` only sees ``network_stream`` on a
+        STREAMING response -- a buffered ``client.head()`` left the FC-1
+        DNS-rebinding guard a silent no-op. Pin that classify_url probes via
+        ``client.stream('HEAD')``: a fake whose ``head()`` raises proves it is
+        never called, and the private peer (exposed only on the stream) must
+        force an 'unknown' classification."""
+        from web_agent import web_fetcher
+        from web_agent.web_fetcher import WebFetcher
+
+        cfg = AppConfig(safety=SafetyConfig(block_private_ips=True, probe_binary_urls=True))
+        fetcher = WebFetcher(MagicMock(), cfg)
+        monkeypatch.setattr(web_fetcher, "check_domain_allowed", lambda *a, **k: True)
+
+        class _FakeClient:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                self._hooks = (k.get("event_hooks") or {}).get("response", [])
+
+            async def __aenter__(self) -> _FakeClient:
+                return self
+
+            async def __aexit__(self, *a: Any) -> bool:
+                return False
+
+            async def head(self, *a: Any, **k: Any):
+                raise AssertionError(
+                    "classify_url must use a streaming HEAD, not buffered client.head()"
+                )
+
+            def stream(self, method: str, _url: str, **_k: Any):
+                assert method.upper() == "HEAD"
+                resp = _FakeHeadResponse(url="https://good.example/doc", peer_ip="127.0.0.1")
+
+                class _Ctx:
+                    async def __aenter__(_s):  # noqa: N805
+                        return resp
+
+                    async def __aexit__(_s, *a):  # noqa: N805
+                        return False
+
+                return _Ctx()
+
+        monkeypatch.setattr("httpx.AsyncClient", _FakeClient)
+        kind = await fetcher.classify_url("https://good.example/doc")
+        assert kind == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Relative-redirect regression: a RELATIVE same-host ``Location`` must NOT be
+# mis-blocked. The raw header has no host, so the prior code gated it directly
+# and ``check_domain_allowed`` rejected it as "no host" -- turning a normal
+# relative redirect (trailing-slash / auth flows, RFC 9110) into a spurious
+# BLOCKED / 'unknown'. The hooks now ``urljoin`` the Location onto the
+# responding URL before gating. These deliberately use the REAL
+# ``check_domain_allowed`` (no monkeypatched gate) so the hostless-relative
+# rejection is actually exercised; ``block_private_ips=False`` isolates the
+# redirect-resolution from any DNS lookup.
+# ---------------------------------------------------------------------------
+class TestRelativeRedirectNotBlocked:
+    @pytest.mark.asyncio
+    async def test_fetch_binary_allows_relative_same_host_location(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from web_agent.web_fetcher import WebFetcher
+
+        cfg = AppConfig(safety=SafetyConfig(block_private_ips=False))
+        fetcher = WebFetcher(MagicMock(), cfg)
+
+        class _FakeClient:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                self._hooks = (k.get("event_hooks") or {}).get("response", [])
+
+            async def __aenter__(self) -> _FakeClient:
+                return self
+
+            async def __aexit__(self, *a: Any) -> bool:
+                return False
+
+            def stream(self, _m: str, _u: str, **_k: Any):
+                hooks = self._hooks
+
+                class _Ctx:
+                    async def __aenter__(_self):  # noqa: N805
+                        redirect = MagicMock()
+                        redirect.status_code = 302
+                        redirect.headers = {"location": "/downloads/report.pdf"}
+                        redirect.url = "https://good.example/file"
+                        for h in hooks:
+                            await h(redirect)  # must NOT raise after the fix
+                        return _FakeStreamResponse(
+                            url="https://good.example/downloads/report.pdf",
+                            chunks=[b"PDFDATA"],
+                        )
+
+                    async def __aexit__(_self, *a):  # noqa: N805
+                        return False
+
+                return _Ctx()
+
+        monkeypatch.setattr("httpx.AsyncClient", _FakeClient)
+        result = await fetcher.fetch_binary("https://good.example/file")
+        assert result.status == FetchStatus.SUCCESS
+        assert result.binary == b"PDFDATA"
+
+    @pytest.mark.asyncio
+    async def test_classify_url_allows_relative_same_host_location(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from web_agent.web_fetcher import WebFetcher
+
+        cfg = AppConfig(safety=SafetyConfig(block_private_ips=False, probe_binary_urls=True))
+        fetcher = WebFetcher(MagicMock(), cfg)
+
+        class _FakeClient:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                self._hooks = (k.get("event_hooks") or {}).get("response", [])
+
+            async def __aenter__(self) -> _FakeClient:
+                return self
+
+            async def __aexit__(self, *a: Any) -> bool:
+                return False
+
+            def stream(self, method: str, _url: str, **_k: Any):
+                hooks = self._hooks
+
+                class _Ctx:
+                    async def __aenter__(_s):  # noqa: N805
+                        redirect = MagicMock()
+                        redirect.status_code = 301
+                        redirect.headers = {"location": "/real/doc"}
+                        redirect.url = "https://good.example/doc"
+                        for h in hooks:
+                            await h(redirect)  # must NOT raise after the fix
+                        return _FakeHeadResponse(
+                            url="https://good.example/doc",
+                            headers={"content-type": "application/pdf"},
+                        )
+
+                    async def __aexit__(_s, *a):  # noqa: N805
+                        return False
+
+                return _Ctx()
+
+        monkeypatch.setattr("httpx.AsyncClient", _FakeClient)
+        kind = await fetcher.classify_url("https://good.example/doc")
+        assert kind == "pdf"
+
+    @pytest.mark.asyncio
+    async def test_download_httpx_allows_relative_same_host_location(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from web_agent.downloader import Downloader
+
+        cfg = AppConfig(
+            download=DownloadConfig(download_dir=str(tmp_path)),
+            safety=SafetyConfig(allow_downloads=True, block_private_ips=False),
+        )
+        dl = Downloader(MagicMock(), cfg)
+
+        class _RelStream:
+            def __init__(self, hooks: list[Any]) -> None:
+                self._hooks = hooks
+                self.url = "https://good.example/files/a.pdf"
+                self.headers = {"content-type": "application/pdf"}
+                self.extensions: dict[str, Any] = {}
+
+            async def __aenter__(self) -> _RelStream:
+                redirect = MagicMock()
+                redirect.status_code = 302
+                redirect.headers = {"location": "/files/a.pdf"}
+                redirect.url = "https://good.example/report.pdf"
+                for h in self._hooks:
+                    await h(redirect)  # must NOT raise after the fix
+                return self
+
+            async def __aexit__(self, *a: Any) -> bool:
+                return False
+
+            def raise_for_status(self) -> None:
+                return None
+
+            async def aiter_bytes(self, chunk_size: int = 8192):
+                yield b"PDFDATA"
+
+        class _FakeClient:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                self._hooks = (k.get("event_hooks") or {}).get("response", [])
+
+            async def __aenter__(self) -> _FakeClient:
+                return self
+
+            async def __aexit__(self, *a: Any) -> bool:
+                return False
+
+            def stream(self, _m: str, _u: str, **_k: Any):
+                return _RelStream(self._hooks)
+
+        monkeypatch.setattr("httpx.AsyncClient", _FakeClient)
+        result = await dl.download("https://good.example/report.pdf")
+        assert result.status == FetchStatus.SUCCESS
+        assert (tmp_path / "report.pdf").read_bytes() == b"PDFDATA"
+
+
+# ---------------------------------------------------------------------------
+# response_time_ms telemetry (deep-review fix): fetch_binary read
+# timer.elapsed_ms INSIDE the ``with timer:`` block -> a large NEGATIVE value;
+# fetch()'s HTML success path never set it at all (always 0.0).
+# ---------------------------------------------------------------------------
+class TestResponseTimeTelemetry:
+    @pytest.mark.asyncio
+    async def test_fetch_binary_success_reports_nonnegative_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from web_agent import web_fetcher
+        from web_agent.web_fetcher import WebFetcher
+
+        cfg = AppConfig(safety=SafetyConfig(block_private_ips=False))
+        fetcher = WebFetcher(MagicMock(), cfg)
+        monkeypatch.setattr(web_fetcher, "check_domain_allowed", lambda *a, **k: True)
+        resp = _FakeStreamResponse(url="https://good.example/file.pdf", chunks=[b"PDFDATA"])
+        monkeypatch.setattr("httpx.AsyncClient", _make_fake_client(stream_resp=resp))
+
+        result = await fetcher.fetch_binary("https://good.example/file.pdf")
+        assert result.status == FetchStatus.SUCCESS
+        # Was a large negative number (timer read before __exit__ ran).
+        assert result.response_time_ms >= 0.0
+
+    @pytest.mark.asyncio
+    async def test_fetch_html_success_stamps_response_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from web_agent.web_fetcher import WebFetcher
+
+        cfg = AppConfig()
+        fetcher = WebFetcher(MagicMock(), cfg)  # no cache / rate limiter
+
+        async def _fake_do_fetch(url: str, session_id: Any = None) -> FetchResult:
+            # Mimic _navigate_and_extract: SUCCESS, response_time_ms left default.
+            await asyncio.sleep(0.005)
+            return FetchResult(
+                url=url, final_url=url, status=FetchStatus.SUCCESS, html="<html>x</html>"
+            )
+
+        monkeypatch.setattr(fetcher, "_do_fetch", _fake_do_fetch)
+        result = await fetcher.fetch("https://good.example/page")
+        assert result.status == FetchStatus.SUCCESS
+        # Was always 0.0 on the HTML success path.
+        assert result.response_time_ms > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -915,15 +1218,90 @@ class TestRobots2PrivateHostSkipped:
             async def __aexit__(self, *a):
                 return False
 
-            async def get(self, _url: str, **_k: Any):
-                resp = MagicMock()
-                resp.status_code = 404
-                return resp
+            def stream(self, method: str, _url: str, **_k: Any):
+                assert method.upper() == "GET"
+                return _RobotsStream(status_code=404)
 
         monkeypatch.setattr(robots_module.httpx, "AsyncClient", _Client)
         result = await rc._fetch_and_parse("http", "127.0.0.1")
         assert attempted["n"] == 1  # the fetch was attempted (not skipped)
         assert result is None  # 404 -> allow-all
+
+
+# ---------------------------------------------------------------------------
+# ROBOTS-2 (deep-review fix): the POST-connect peer-IP guard must actually
+# fire. It reads ``network_stream``, which httpcore only populates on a
+# STREAMING response -- the prior buffered ``client.get()`` (read after the
+# client closed) made it a silent no-op. robots.txt must STREAM the GET.
+# ---------------------------------------------------------------------------
+class TestRobots2PostConnectPeerCheck:
+    @pytest.mark.asyncio
+    async def test_streams_get_and_private_peer_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rc = RobotsChecker(user_agent="bot", block_private_ips=True)
+        # Pre-connect host check sees a public host; the connected peer rebinds
+        # to a private address. Same helper for host + peer, so map only the
+        # peer literal to "private".
+        monkeypatch.setattr(robots_module, "is_private_address", lambda h: h == "10.1.2.3")
+        used = {"get": 0, "stream": 0}
+
+        class _Client:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _Client:
+                return self
+
+            async def __aexit__(self, *a: Any) -> bool:
+                return False
+
+            async def get(self, *a: Any, **k: Any):
+                used["get"] += 1
+                raise AssertionError("robots must STREAM the GET, not buffer it")
+
+            def stream(self, method: str, _url: str, **_k: Any):
+                used["stream"] += 1
+                assert method.upper() == "GET"
+                return _RobotsStream(status_code=200, peer_ip="10.1.2.3", body="User-agent: *\n")
+
+        monkeypatch.setattr(robots_module.httpx, "AsyncClient", _Client)
+        result = await rc._fetch_and_parse("https", "pub.example")
+        # The streaming path was used (NOT buffered get) and the private peer
+        # forced allow-all.
+        assert used == {"get": 0, "stream": 1}
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_public_peer_streams_body_and_parses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rc = RobotsChecker(user_agent="bot", block_private_ips=True)
+        monkeypatch.setattr(robots_module, "is_private_address", lambda h: False)
+
+        class _Client:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _Client:
+                return self
+
+            async def __aexit__(self, *a: Any) -> bool:
+                return False
+
+            def stream(self, method: str, _url: str, **_k: Any):
+                return _RobotsStream(
+                    status_code=200,
+                    peer_ip="93.184.216.34",
+                    body="User-agent: *\nDisallow: /private\n",
+                )
+
+        monkeypatch.setattr(robots_module.httpx, "AsyncClient", _Client)
+        rp = await rc._fetch_and_parse("https", "pub.example")
+        assert rp is not None
+        # The streamed body was drained + parsed.
+        assert rp.can_fetch("bot", "https://pub.example/private") is False
+        assert rp.can_fetch("bot", "https://pub.example/public") is True
 
 
 # ---------------------------------------------------------------------------
@@ -1969,6 +2347,9 @@ class TestREC2WebResearchBoundedConcurrency:
 
         ex = MagicMock()
         ex.extract = MagicMock(side_effect=_extract)
+        # extract_async runs extract off the event loop in the real
+        # ContentExtractor; mirror that delegation so the recipe path awaits.
+        ex.extract_async = AsyncMock(side_effect=lambda fr, **kw: ex.extract(fr, **kw))
         return ex
 
     def _recipes(self, urls: list[str], bound: int) -> Any:
@@ -2958,16 +3339,24 @@ class TestBR2ConcurrentSequenceGuard:
 
     @pytest.mark.asyncio
     async def test_second_sequence_refused_when_state_already_registered(self) -> None:
-        from web_agent.browser_actions import _PAGE_DIALOG_STATES, _DialogState
+        from web_agent.browser_actions import (
+            _PAGE_ACTIVE_SEQUENCES,
+            _PAGE_DIALOG_STATES,
+            _DialogState,
+        )
         from web_agent.models import WaitInput, WaitTarget
 
         cfg = AppConfig()
         ba, page = self._actions_and_page(cfg)
 
-        # Simulate a first sequence already in flight: its dialog state owns
-        # the single _PAGE_DIALOG_STATES slot for this page.
+        # Simulate a first sequence already in flight: it owns this page's
+        # _PAGE_ACTIVE_SEQUENCES marker. The BR-2 deep-review fix keys the
+        # concurrency guard on that set (NOT dialog-slot presence, which the
+        # single-action handle_dialog path also writes). Its dialog state
+        # still occupies the single _PAGE_DIALOG_STATES slot.
         first_state = _DialogState()
         _PAGE_DIALOG_STATES[page] = first_state
+        _PAGE_ACTIVE_SEQUENCES.add(page)
         try:
             actions = [WaitInput(target=WaitTarget.LOAD_STATE, value="load")]
             res = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
@@ -2976,12 +3365,15 @@ class TestBR2ConcurrentSequenceGuard:
             assert res.actions_failed >= 1
             joined = " ".join((r.error_message or "") for r in res.results)
             assert "concurrent" in joined.lower()
-            # Critically: the first sequence's state slot was NOT clobbered,
-            # and its listener was NOT removed by the refused sequence.
+            # Critically: the refused sequence did NOT clobber the first
+            # sequence's dialog slot, did NOT clear its in-flight marker, and
+            # did NOT remove its listener.
             assert _PAGE_DIALOG_STATES.get(page) is first_state
+            assert page in _PAGE_ACTIVE_SEQUENCES
             page.remove_listener.assert_not_called()
         finally:
             _PAGE_DIALOG_STATES.pop(page, None)
+            _PAGE_ACTIVE_SEQUENCES.discard(page)
 
     @pytest.mark.asyncio
     async def test_truly_concurrent_sequences_one_refused(self) -> None:

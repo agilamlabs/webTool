@@ -24,7 +24,7 @@ from __future__ import annotations
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from loguru import logger
@@ -331,13 +331,20 @@ class Downloader:
         async def _check_redirect(response: httpx.Response) -> None:
             """Event hook: re-validate redirect targets against safety config."""
             if 300 <= response.status_code < 400:
-                next_url = response.headers.get("location", "")
-                if next_url and not check_domain_allowed(next_url, safety):
-                    raise NavigationError(
-                        f"Redirect to disallowed URL blocked: {next_url}",
-                        url=next_url,
-                        status_code=response.status_code,
-                    )
+                location = response.headers.get("location", "")
+                # v1.6.16 C-1c fix: a ``Location`` header may be RELATIVE
+                # (RFC 9110). Resolve it against the responding URL before
+                # gating so a legitimate same-host relative redirect is not
+                # mis-blocked as "no host"; ``urljoin`` leaves an absolute
+                # Location unchanged, so cross-host redirects stay gated.
+                if location:
+                    next_url = urljoin(str(response.url), location)
+                    if not check_domain_allowed(next_url, safety):
+                        raise NavigationError(
+                            f"Redirect to disallowed URL blocked: {next_url}",
+                            url=next_url,
+                            status_code=response.status_code,
+                        )
 
         async with httpx.AsyncClient(
             follow_redirects=True,

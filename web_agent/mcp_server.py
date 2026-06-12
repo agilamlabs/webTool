@@ -98,25 +98,24 @@ def _load_mcp_config() -> AppConfig:
          ``WEB_AGENT_*`` env vars (incl. nested ``__`` paths since
          v1.6.5) thanks to pydantic-settings.
 
-    A missing or unreadable YAML file is logged at WARNING and falls
-    back to defaults rather than failing the server start -- matches
-    the CLI's tolerance for missing config.
+    A MISSING YAML file is logged at WARNING and falls back to defaults
+    (matches the CLI's tolerance for no config). An EXISTING but unparseable
+    file FAILS the server start (v1.6.16 deep-review fix) -- silently serving
+    permissive ``AppConfig()`` defaults would drop the operator's allow/deny
+    lists / ``safe_mode`` on a YAML typo, weakening the intended security
+    posture.
     """
     yaml_path = os.environ.get("WEB_AGENT_CONFIG")
     if yaml_path:
         path = Path(yaml_path)
         if path.exists():
-            try:
-                logger.info("Loading MCP config from {p}", p=path)
-                return AppConfig.from_yaml(path)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to load WEB_AGENT_CONFIG={p}: {e}; using defaults",
-                    p=path,
-                    e=exc,
-                )
-        else:
-            logger.warning("WEB_AGENT_CONFIG={p} not found; using defaults", p=path)
+            # v1.6.16 deep-review fix: FAIL CLOSED when the configured file
+            # exists but cannot be parsed -- let from_yaml's ConfigError
+            # propagate so the server refuses to start rather than run with
+            # weaker security. (Only a MISSING file falls back to defaults.)
+            logger.info("Loading MCP config from {p}", p=path)
+            return AppConfig.from_yaml(path)
+        logger.warning("WEB_AGENT_CONFIG={p} not found; using defaults", p=path)
     return AppConfig()
 
 
@@ -293,7 +292,7 @@ async def web_interact(
     ctx: Context,
     url: str,
     actions: list[dict],
-    stop_on_error: bool = True,
+    stop_on_error: Optional[bool] = None,
     session_id: Optional[str] = None,
 ) -> ActionSequenceResult:
     """Execute a scripted sequence of browser actions on a URL.
@@ -335,7 +334,11 @@ async def web_interact(
     Args:
         url: Starting URL.
         actions: Ordered list of action dicts.
-        stop_on_error: Halt sequence on first failure (skip remaining).
+        stop_on_error: Halt the sequence on the first failed action (skip the
+            rest). ``None`` (default) defers to ``automation.stop_on_error`` in
+            the operator's config; pass a bool to override it. (v1.6.16
+            deep-review fix: the prior hardcoded ``True`` default made the
+            config knob unreachable from the MCP tool.)
         session_id: Optional persistent browser session.
 
     Returns:

@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, ClassVar, Optional
 from urllib.parse import urlparse
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakSet
 
 from loguru import logger
 from playwright.async_api import Dialog, Locator, Page
@@ -223,6 +223,18 @@ def _resolve_locator(page: Page, spec: SelectorLike) -> Locator:
     if spec.selector:
         return page.locator(spec.selector)
 
+    # v1.6.16 deep-review fix: ``role_name`` is only an accessible-name filter
+    # applied together with ``role`` (handled in the ``if spec.role`` branch
+    # above). A role_name-only spec is unusable -- give a PRECISE error instead
+    # of the misleading "LocatorSpec is empty" (a field IS set, just not a
+    # standalone locator).
+    if spec.role_name:
+        raise SelectorNotFoundError(
+            "LocatorSpec.role_name is set without role; role_name is only an "
+            "accessible-name filter applied together with role.",
+            action="resolve_locator",
+        )
+
     raise SelectorNotFoundError(
         "LocatorSpec is empty (no selector field set)",
         action="resolve_locator",
@@ -253,6 +265,18 @@ class _DialogState:
 # stuffing the state onto the Page via ``page._web_agent_dialog_state``,
 # which would break if Playwright ever introduced ``__slots__``.
 _PAGE_DIALOG_STATES: WeakKeyDictionary[Page, _DialogState] = WeakKeyDictionary()
+
+# v1.6.16 BR-2 fix: a SEPARATE in-flight marker for the concurrent-sequence
+# guard. The guard previously keyed on ``page in _PAGE_DIALOG_STATES`` as a
+# proxy for "a sequence is running" -- but the single-action dialog path
+# (``Agent.handle_dialog`` -> ``execute_single_on_session`` -> ``_do_dialog``)
+# also writes that slot WITHOUT starting a sequence and never pops it, so the
+# next ``interact()`` falsely tripped the guard and aborted the whole sequence
+# with a misleading "already running" error. Tracking live sequences in their
+# own WeakSet decouples "a sequence is in flight" from "a dialog-state slot
+# exists". Only ``execute_sequence`` populates this set; it is removed in the
+# sequence's ``finally``.
+_PAGE_ACTIVE_SEQUENCES: WeakSet[Page] = WeakSet()
 
 
 class BrowserActions:
@@ -443,6 +467,11 @@ class BrowserActions:
         # inside the try. Bound early to None so the finally can remove it
         # unconditionally even if page-acquisition raises before registration.
         dialog_handler: Any = None
+        # v1.6.16 BR-2: True once THIS sequence has registered itself in
+        # _PAGE_ACTIVE_SEQUENCES, so the finally only clears the marker it
+        # owns -- a sequence refused by the concurrency guard (which never
+        # added itself) must not clear the running sequence's marker.
+        marked_active = False
         # v1.6.8: bind early so the except path / final return doesn't
         # see an UnboundLocalError when an exception fires before the
         # success-snapshot line inside the try.
@@ -506,16 +535,16 @@ class BrowserActions:
             # dialog routing (sequence B clobbers A's DialogResponse) and
             # tripping Playwright's "Dialog is already handled" when two live
             # listeners fire. Concurrent automation against one shared tab is
-            # a contraindicated, undocumented usage, so rather than a full
-            # concurrency refactor we make a minimal guard: if a dialog state
-            # is already registered for this Page, refuse the second sequence
-            # with a clear error instead of clobbering the first's state. We
-            # check BEFORE setting ``dialog_handler`` / writing the slot so
-            # the refused sequence's ``finally`` leaves the first sequence's
-            # listener and state slot completely untouched. (Sequential reuse
-            # is unaffected: the prior sequence's finally removed its listener
-            # and the weak slot is gone once its _DialogState is unreferenced.)
-            if page in _PAGE_DIALOG_STATES:
+            # a contraindicated, undocumented usage, so we refuse the second
+            # concurrent sequence with a clear error. The in-flight state is
+            # tracked in its OWN set (``_PAGE_ACTIVE_SEQUENCES``), NOT via
+            # dialog-slot presence: the single-action ``handle_dialog`` path
+            # writes a dialog slot without starting a sequence, so keying the
+            # guard on the slot made a later interact() falsely abort here. We
+            # register AFTER passing the check and de-register in ``finally``
+            # (guarded by ``marked_active`` so a refused sequence can never
+            # clear the running sequence's marker).
+            if page in _PAGE_ACTIVE_SEQUENCES:
                 from .exceptions import ActionError
 
                 raise ActionError(
@@ -523,6 +552,8 @@ class BrowserActions:
                     "concurrent execute_sequence calls against the same "
                     "session_id are not supported (run them sequentially)."
                 )
+            _PAGE_ACTIVE_SEQUENCES.add(page)
+            marked_active = True
             # v1.6.14 A-2: keep the exact handler reference we register so
             # the finally block can remove_listener it. dialog_state.handle
             # is a bound method -- accessing it twice yields two distinct
@@ -667,6 +698,13 @@ class BrowserActions:
                 # REFUSED (it never registered a handler) can't pop the owning
                 # sequence's slot.
                 _PAGE_DIALOG_STATES.pop(page, None)
+            # v1.6.16 BR-2: drop THIS sequence's in-flight marker so the next
+            # sequence on the same persistent tab isn't falsely refused.
+            # Guarded by ``marked_active`` so a sequence the concurrency guard
+            # refused (it never added itself) can't clear the running
+            # sequence's marker.
+            if page is not None and marked_active:
+                _PAGE_ACTIVE_SEQUENCES.discard(page)
             # v1.6.6: only close pages WE created. Persistent session tabs
             # outlive sequences so subsequent interact() calls share state.
             if page is not None and owner == "session_ephemeral":
@@ -718,7 +756,14 @@ class BrowserActions:
             result: ActionResult = await handler(self, page, action_input)
             result.duration_ms = (time.perf_counter() - start) * 1000
             return result
-        except (PlaywrightTimeout, ActionTimeoutError) as e:
+        # v1.6.16 deep-review fix: also catch the builtin/asyncio TimeoutError.
+        # ``asyncio.wait_for`` (used to bound the infinite-scroll page.evaluate
+        # calls in _do_scroll) raises the BUILTIN TimeoutError, which is neither
+        # PlaywrightTimeout nor ActionTimeoutError -- so a hung infinite-scroll
+        # previously fell through to the generic handler below and was reported
+        # as FAILED instead of the TIMEOUT the inline comment there promises.
+        # (asyncio.TimeoutError IS the builtin TimeoutError on Python 3.11+.)
+        except (PlaywrightTimeout, ActionTimeoutError, TimeoutError) as e:
             artifacts: list[str] = []
             if self._debug.enabled:
                 artifacts = await self._debug.capture_page(
@@ -1663,6 +1708,14 @@ class BrowserActions:
         Useful for infinite-scroll feeds where the target row only
         materializes after enough scrolling.
         """
+        # v1.6.16 deep-review fix: bound max_scrolls. This path does NOT go
+        # through a pydantic action model, so ScrollInput.infinite_scroll_max's
+        # le=1000 bound does not apply; each iteration costs a mouse.wheel + a
+        # ~2s wait_for_load_state + a page.evaluate, so an LLM / prompt-injection
+        # value like 10**8 made total wall-clock attacker-controlled (months)
+        # and pinned the session tab. Clamp to the same 1000 ceiling (covers the
+        # MCP tool and the direct Python API in one place).
+        max_scrolls = max(0, min(max_scrolls, 1000))
         if self._sessions is None:
             raise RuntimeError("scroll_until_text requires a SessionManager")
         tab_mgr = self._sessions.get_tab_manager(session_id)

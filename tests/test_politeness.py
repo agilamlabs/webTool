@@ -181,8 +181,12 @@ def _resp_with_peer(peer_ip: str, status_code: int = 200) -> object:
 
 
 class _ClientReturning:
-    """Async-context-manager httpx.AsyncClient replacement whose GET
-    returns a pre-built response (used to inject a peer IP)."""
+    """Async-context-manager httpx.AsyncClient replacement whose STREAMING GET
+    yields a pre-built response (used to inject a peer IP).
+
+    robots.txt now probes via ``client.stream('GET')`` (ROBOTS-2 peer-IP fix):
+    httpcore only populates the ``network_stream`` extension on a streaming
+    response, so a buffered ``client.get()`` left the peer check a no-op."""
 
     def __init__(self, response, **_kwargs) -> None:
         self._response = response
@@ -193,8 +197,17 @@ class _ClientReturning:
     async def __aexit__(self, *exc) -> None:
         return None
 
-    async def get(self, url, headers=None):
-        return self._response
+    def stream(self, method, url, headers=None):
+        resp = self._response
+
+        class _Ctx:
+            async def __aenter__(_s):  # noqa: N805
+                return resp
+
+            async def __aexit__(_s, *a):  # noqa: N805
+                return False
+
+        return _Ctx()
 
 
 class TestRobotsPostConnectPeerIPCheck:

@@ -113,8 +113,21 @@ def _normalize_domain_patterns(value: Any) -> Any:
         # ``//host`` through urlparse so .hostname applies the identical
         # normalisation (lowercases, drops the port, unwraps ``[...]``).
         if s:
-            hostname = urlparse(f"//{s}").hostname
-            s = (hostname or s).strip().lstrip(".")
+            # CO-2 fix: a BARE IP literal must NOT go through the urlparse
+            # hostinfo step. urllib's _hostinfo splits on the FIRST colon, so
+            # an unbracketed IPv6 like ``2001:db8::1`` would be truncated to
+            # its first hextet (``2001``) and the deny/allow entry would then
+            # silently never match the compressed host the comparator derives
+            # (fail-open for deny, fail-closed breakage for allow). Bare
+            # literals carry no port and need no bracket-stripping, so leave
+            # them untouched for _canonicalize_ip_literal below. urlparse still
+            # handles hostnames, host:port (``evil.com:8443``), and bracketed
+            # IPv6 (``[::1]`` / ``[2001:db8::1]:8443``).
+            try:
+                ipaddress.ip_address(s)
+            except ValueError:
+                hostname = urlparse(f"//{s}").hostname
+                s = (hostname or s).strip().lstrip(".")
         # Mirror the live-host normalisation: canonicalize IP-literals so a
         # non-canonical IPv6 pattern (e.g. ``2001:db8:0:0:0:0:0:1``) still
         # matches the compressed form the comparator derives from the URL.
@@ -570,7 +583,13 @@ class SearchConfig(BaseSettings):
     )
 
     # Multi-provider chain (NEW in 1.4.0)
-    providers: list[str] = Field(
+    # v1.6.16 deep-review fix: typed as a Literal so a typo'd provider name
+    # ('duckduckgo', 'ddg') is rejected at config time. Previously an unknown
+    # name was silently DROPPED from the chain (search_engine builds it with
+    # ``if name in catalog``), degrading the chain -- or, if all names were
+    # wrong, yielding an empty chain and a misleading "providers exhausted ([])"
+    # error on every search.
+    providers: list[Literal["searxng", "ddgs", "playwright"]] = Field(
         default_factory=lambda: ["searxng", "ddgs", "playwright"],
         description=(
             "Search providers tried in priority order. First non-empty "
@@ -612,7 +631,10 @@ class FetchConfig(BaseSettings):
     retry field, it overrides the policy.
     """
 
-    wait_until: str = Field(
+    # v1.6.16 deep-review fix: typed as a Literal of the values Playwright's
+    # ``page.goto(wait_until=...)`` accepts, so a typo ('networkIdle') is
+    # rejected at config time instead of failing EVERY fetch at runtime.
+    wait_until: Literal["commit", "domcontentloaded", "load", "networkidle"] = Field(
         default="domcontentloaded",
         description=(
             "Playwright wait condition for page navigation. Default "
@@ -631,9 +653,15 @@ class FetchConfig(BaseSettings):
     # defensive ConfigError wrap in ``_apply_retry_policy`` -- review D-5).
     # Values mirror :class:`web_agent.utils.RetryPolicy`.
     retry_policy: Literal["fast", "balanced", "paranoid"] = "balanced"
-    max_retries: int = 3
-    retry_base_delay: float = 1.0
-    retry_max_delay: float = 30.0
+    # v1.6.16 deep-review fix: ``utils.async_retry`` treats ``max_retries`` as
+    # TOTAL attempts and raises ``ValueError('max_retries must be >= 1')`` at
+    # decoration time. So ``max_retries=0`` (a natural "disable retries"
+    # sentinel) passed config validation and then made EVERY fetch raise a raw
+    # ValueError. ``ge=1`` rejects it at config time; the value is total
+    # attempts (1 = no retries). Negative backoff delays are likewise invalid.
+    max_retries: int = Field(default=3, ge=1)
+    retry_base_delay: float = Field(default=1.0, ge=0)
+    retry_max_delay: float = Field(default=30.0, gt=0)
     non_retryable_status_codes: list[int] = Field(
         default_factory=lambda: [400, 401, 403, 404, 405, 410, 451]
     )
@@ -735,6 +763,33 @@ class DownloadConfig(BaseSettings):
         ]
     )
 
+    @field_validator("allowed_extensions", mode="before")
+    @classmethod
+    def _normalize_allowed_extensions(cls, v: Any) -> Any:
+        """v1.6.16 deep-review fix: normalize each entry to lowercase + a
+        leading dot. The downloader gate compares ``filepath.suffix.lower()``
+        against these entries, so a config value like ``'PDF'``, ``'pdf'`` (no
+        dot), or ``'.XLSX'`` could never match and silently BLOCKED every
+        download of that type (fail-closed). Mirrors the load-time normalization
+        ``_normalize_domain_patterns`` already applies to domain lists. Empty
+        entries are dropped; non-string entries pass through so pydantic can
+        surface the type error naturally.
+        """
+        if not isinstance(v, list):
+            return v
+        out: list[Any] = []
+        for item in v:
+            if not isinstance(item, str):
+                out.append(item)
+                continue
+            s = item.strip().lower()
+            if not s:
+                continue
+            if not s.startswith("."):
+                s = "." + s
+            out.append(s)
+        return out
+
     # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_DOWNLOAD__ so
     # a bare ``MAX_FILE_SIZE_MB`` / ``DOWNLOAD_DIR`` / ``ALLOWED_EXTENSIONS``
     # env var can't override download settings. Nested
@@ -770,7 +825,9 @@ class AutomationConfig(BaseSettings):
     # sentinel valid.
     default_action_timeout: int = Field(default=10000, ge=0)
     screenshot_dir: str = "./screenshots"
-    screenshot_format: str = "png"
+    # v1.6.16 deep-review fix: Playwright's page.screenshot accepts only
+    # 'png'/'jpeg'; a Literal rejects an invalid value at config time.
+    screenshot_format: Literal["png", "jpeg"] = "png"
     # v1.6.16 (review CO-7): JPEG quality is a 0-100 percentage (ignored for
     # PNG). Constrain to that range so an out-of-band value can't reach
     # Playwright's ``page.screenshot(quality=...)``.
@@ -1374,7 +1431,12 @@ class AppConfig(BaseSettings):
     # v1.6.8: network capture, download intents, post-action screenshots,
     # session replay traces
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
-    log_level: str = "INFO"
+    # v1.6.16 deep-review fix: a Literal of loguru's level names so an unknown
+    # value is rejected at config time instead of failing when logging is wired
+    # (loguru's level lookup is case-sensitive / uppercase).
+    log_level: Literal[
+        "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
+    ] = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")
     ranking_profiles: dict[str, list[str]] = Field(
@@ -1443,6 +1505,15 @@ class AppConfig(BaseSettings):
                 data = yaml.safe_load(f) or {}
         except yaml.YAMLError as exc:
             raise ConfigError(f"Failed to parse YAML config {p}: {exc}") from exc
+        # v1.6.16 deep-review fix: yaml.safe_load returns a list/scalar for a
+        # typo'd config (e.g. a top-level ``- browser:`` sequence). The base_dir
+        # injection + cls(**data) below then raised a raw TypeError, breaking the
+        # documented ConfigError contract. Reject a non-mapping root explicitly.
+        if not isinstance(data, dict):
+            raise ConfigError(
+                f"Config file {p} must contain a YAML mapping at the top level, "
+                f"got {type(data).__name__}."
+            )
         if "base_dir" not in data:
             data["base_dir"] = str(p.parent.resolve())
         try:

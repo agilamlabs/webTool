@@ -57,6 +57,12 @@ def _agent_with_mocks(cfg: AppConfig) -> Agent:
     agent._search = MagicMock()  # type: ignore[attr-defined]
     agent._fetcher = MagicMock()  # type: ignore[attr-defined]
     agent._extractor = MagicMock()  # type: ignore[attr-defined]
+    # extract_async runs extract off the event loop in the real
+    # ContentExtractor; mirror that delegation so tests that configure
+    # ``_extractor.extract`` per-case keep working (resolved at call time).
+    agent._extractor.extract_async = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=lambda fr, **kw: agent._extractor.extract(fr, **kw)
+    )
     return agent
 
 
@@ -214,4 +220,59 @@ async def test_binary_extraction_charges_char_budget() -> None:
     assert fetch_binary.await_count == 1, (
         "M2: char-budget overflow on the binary path must break the loop "
         f"(second file should not be fetched); await_count={fetch_binary.await_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_char_exhaustion_skips_html_page_fanout() -> None:
+    """Deep-review fix: when the extract_files binary loop exhausts the CHAR
+    budget, the subsequent HTML page fan-out is skipped -- the M1 slice now
+    consults the char dimension, so no fetch_many network I/O happens after
+    chars are spent. Previously only the PAGE dimension was checked, so an
+    HTML page was still fetched (and one more page extracted) past the budget.
+    """
+    cfg = AppConfig(
+        safety=SafetyConfig(
+            max_chars_per_call=100,  # the PDF below blows this
+            max_pages_per_call=50,  # NOT the constraint under test
+            block_private_ips=False,
+        )
+    )
+    agent = _agent_with_mocks(cfg)
+
+    # A binary (PDF) result that exhausts the char budget, plus an HTML page.
+    results = [
+        _search_item(1, "https://s0.example.com/big.pdf"),
+        _search_item(2, "https://s1.example.com/page.html"),  # .html -> page item
+    ]
+    agent._search.search = AsyncMock(  # type: ignore[attr-defined]
+        return_value=SearchResponse(query="q", total_results=2, results=results)
+    )
+    agent._fetcher.fetch_binary = AsyncMock(  # type: ignore[attr-defined]
+        return_value=FetchResult(
+            url="https://s0.example.com/big.pdf",
+            final_url="https://s0.example.com/big.pdf",
+            status=FetchStatus.SUCCESS,
+            binary=b"%PDF",
+        )
+    )
+    fetch_many = AsyncMock(return_value=[])
+    agent._fetcher.fetch_many = fetch_many  # type: ignore[attr-defined]
+    agent._extractor.extract = MagicMock(  # type: ignore[attr-defined]
+        return_value=ExtractionResult(
+            url="https://s0.example.com/big.pdf",
+            content="x" * 5000,
+            extraction_method="pdf",
+            content_length=5000,
+        )
+    )
+
+    await agent.search_and_extract("q", max_results=2, extract_files=True)
+
+    # The HTML page fan-out is clamped to empty once chars are exhausted.
+    assert fetch_many.await_count == 1
+    fanned_out = fetch_many.await_args.args[0]
+    assert fanned_out == [], (
+        "char-exhausted call must not fan out HTML pages over the network; "
+        f"got {fanned_out}"
     )
