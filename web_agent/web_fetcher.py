@@ -16,6 +16,7 @@ Optional features:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -631,14 +632,16 @@ class WebFetcher:
         page: Page,
         url: str,
         debug_artifacts: list[str],
-        wait_strategy_box: list[str] | None = None,
+        wait_strategy_box: Sequence[str] | None = None,
     ) -> FetchResult:
         """Perform the actual navigation + content read on an open page.
 
         ``wait_strategy_box`` is a single-element list used by ``_do_fetch``
         to persist the wait strategy across retries: once networkidle fails
         for this URL, the box is updated to ``"load"`` so subsequent retries
-        skip the doomed networkidle attempt entirely (Phase D2).
+        skip the doomed networkidle attempt entirely (Phase D2). Annotated
+        ``Sequence`` (covariant) so callers may pass Literal-typed lists; the
+        retry-persistence write-back only happens when the box is a real list.
         """
         cfg = self._config.fetch
         if wait_strategy_box is None:
@@ -658,7 +661,8 @@ class WebFetcher:
                         "(persisted for subsequent retries)",
                         url=url,
                     )
-                    wait_strategy_box[0] = "load"  # persist across retries
+                    if isinstance(wait_strategy_box, list):
+                        wait_strategy_box[0] = "load"  # persist across retries
                     response = await page.goto(url, wait_until="load")
                 else:
                     raise

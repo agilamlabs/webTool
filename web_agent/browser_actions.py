@@ -879,7 +879,7 @@ class BrowserActions:
             as the default for the fetch path in v1.6.2.
             """
             wait_until = self._config.fetch.wait_until
-            await page.goto(url, wait_until=wait_until)  # type: ignore[arg-type]
+            await page.goto(url, wait_until=wait_until)
             # Post-redirect re-check: a whitelisted host can redirect
             # to a private IP / denied host. Block before screenshotting.
             if not check_domain_allowed(page.url, self._config.safety):
@@ -1836,7 +1836,7 @@ class BrowserActions:
 
             assert page is not None
             if url:
-                await page.goto(url, wait_until=self._config.fetch.wait_until)  # type: ignore[arg-type]
+                await page.goto(url, wait_until=self._config.fetch.wait_until)
                 if not check_domain_allowed(page.url, safety):
                     host = urlparse(page.url).hostname or ""
                     raise ValueError(f"Page redirected to disallowed domain: {host}")
@@ -1963,7 +1963,7 @@ class BrowserActions:
                 # a thwarted observe() permanently navigates the session's
                 # main tab away from whatever the user was on.
                 prev_url = page.url if owner_mode == "session_persistent" else None
-                await page.goto(url, wait_until=self._config.fetch.wait_until)  # type: ignore[arg-type]
+                await page.goto(url, wait_until=self._config.fetch.wait_until)
                 # Post-redirect re-check
                 if not check_domain_allowed(page.url, safety):
                     host = urlparse(page.url).hostname or ""

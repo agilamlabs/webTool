@@ -545,6 +545,15 @@ class BrowserConfig(BaseSettings):
     model_config = {"env_prefix": "WEB_AGENT_BROWSER__"}
 
 
+def _default_search_providers() -> list[Literal["searxng", "ddgs", "playwright"]]:
+    """Default provider chain for :attr:`SearchConfig.providers`.
+
+    A bare lambda would infer ``list[str]``, which mypy rejects against the
+    Literal-typed field (list is invariant), so the factory is annotated.
+    """
+    return ["searxng", "ddgs", "playwright"]
+
+
 class SearchConfig(BaseSettings):
     """Web search parameters and multi-provider chain configuration.
 
@@ -590,7 +599,7 @@ class SearchConfig(BaseSettings):
     # wrong, yielding an empty chain and a misleading "providers exhausted ([])"
     # error on every search.
     providers: list[Literal["searxng", "ddgs", "playwright"]] = Field(
-        default_factory=lambda: ["searxng", "ddgs", "playwright"],
+        default_factory=_default_search_providers,
         description=(
             "Search providers tried in priority order. First non-empty "
             "result wins. Available: 'searxng', 'ddgs', 'playwright'."
