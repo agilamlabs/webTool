@@ -38,6 +38,17 @@ class SearchResponse(BaseModel):
         default=False,
         description="True if this response was served from the local cache.",
     )
+    search_blocked: bool = Field(
+        default=False,
+        description=(
+            "v1.7.0 (Wave 2E): True when zero results came back because the "
+            "providers were actively blocked (CAPTCHA / rate-limit) or in "
+            "circuit-breaker cooldown -- as opposed to a genuine no-results "
+            "answer. Lets an agent distinguish 'retry later / try a different "
+            "source' from 'this query has no hits'. False on any non-empty "
+            "result."
+        ),
+    )
 
 
 class FetchStatus(str, Enum):

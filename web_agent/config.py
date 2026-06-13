@@ -721,6 +721,17 @@ class SearchConfig(BaseSettings):
             "rejected by httpx / disables the timeout."
         ),
     )
+    circuit_cooldown_s: float = Field(
+        default=60.0,
+        ge=0,
+        description=(
+            "v1.7.0 (Wave 2E): seconds a search provider is skipped after it "
+            "blocks (CAPTCHA / rate-limit) or errors, before the chain "
+            "re-probes it. A bounded per-provider circuit breaker so a "
+            "just-blocked provider is not hammered on every subsequent search. "
+            "0 disables the breaker (every provider tried every call)."
+        ),
+    )
 
     # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_SEARCH__ so a
     # bare ``REGION`` / ``LANGUAGE`` / ``MAX_RESULTS`` env var can't override

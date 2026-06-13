@@ -56,6 +56,7 @@ from .config import (
     DownloadConfig,
     ExtractionConfig,
     FetchConfig,
+    ProxyConfig,
     SafetyConfig,
     SearchConfig,
     SkillsConfig,
@@ -129,6 +130,7 @@ from .models import (
     ShadowDomClickInput,
     SkillApplicationResult,
     SkillInputSpec,
+    StorageStateResult,
     TabInfo,
     ToolError,
     ToolMessage,
@@ -145,6 +147,7 @@ from .ownership import OwnershipToken
 from .rate_limiter import RateLimiter
 from .recipes import Recipes
 from .robots import RobotsChecker
+from .search_engine import SearchEngine, SearchOutcome
 from .search_providers import (
     DDGSProvider,
     PlaywrightProvider,
@@ -178,6 +181,7 @@ __all__ = [
     "DownloadConfig",
     "ExtractionConfig",
     "FetchConfig",
+    "ProxyConfig",
     "SafetyConfig",
     "SearchConfig",
     "SkillsConfig",
@@ -270,6 +274,8 @@ __all__ = [
     "ScreenshotResult",
     "ScrollDirection",
     "ScrollInput",
+    "SearchEngine",
+    "SearchOutcome",
     "SearchResponse",
     "SearchResultItem",
     "SelectInput",
@@ -279,6 +285,7 @@ __all__ = [
     "ShadowDomClickInput",
     "SkillApplicationResult",
     "SkillInputSpec",
+    "StorageStateResult",
     "TabInfo",
     "ToolError",
     "ToolMessage",

@@ -80,10 +80,12 @@ from .models import (
     PressKeyInput,
     ResearchResult,
     ScreenshotResult,
+    SearchResponse,
     SearchResultItem,
     SelectorLike,
     SessionInfo,
     SkillApplicationResult,
+    StorageStateResult,
     TabInfo,
     ToolMessage,
     ToolSeverity,
@@ -310,6 +312,7 @@ class Agent:
             self._config,
             rate_limiter=self._rate_limiter,
             cache=self._cache,
+            circuit_cooldown_s=self._config.search.circuit_cooldown_s,
         )
         self._fetcher = WebFetcher(
             self._bm,
@@ -962,6 +965,72 @@ class Agent:
     def list_sessions(self) -> list[SessionInfo]:
         """Return SessionInfo snapshots for all live sessions."""
         return self._sessions.list()
+
+    async def export_session_state(
+        self, session_id: str, path: str | Path
+    ) -> StorageStateResult:
+        """Capture a logged-in session's auth (cookies + origins) to a file.
+
+        v1.7.0: after a login has been performed on ``session_id`` (by a
+        human in a headed session, or by the agent), this saves Playwright's
+        portable storage_state to ``path`` so a later run can reuse the
+        authentication without re-entering credentials or 2FA. ``path`` is
+        confined to the download directory -- traversal / absolute escapes
+        are rejected. Pair with :meth:`import_session_state`.
+
+        Raises:
+            KeyError: If ``session_id`` is unknown or no longer live.
+        """
+        async with self._call_scope(
+            "export_session_state", {"session_id": session_id}
+        ):
+            return await self._sessions.export_state(session_id, path)
+
+    async def import_session_state(
+        self, path: str | Path, *, name: str | None = None
+    ) -> str:
+        """Create a NEW session pre-loaded with auth saved by export.
+
+        v1.7.0: rehydrates the storage_state file written by
+        :meth:`export_session_state` into a fresh session so the agent is
+        already authenticated. Cookies are restored; per-origin
+        localStorage is best-effort. Returns the new ``session_id`` to pass
+        to subsequent fetch/interact calls. ``path`` is confined to the
+        download directory.
+        """
+        async with self._call_scope("import_session_state", {"name": name}):
+            return await self._sessions.import_state(path, name=name)
+
+    async def search(
+        self,
+        query: str,
+        max_results: int | None = None,
+        *,
+        strict: bool = False,
+    ) -> SearchResponse:
+        """Links-only web search: SERP items (title/url/snippet), NO fetch.
+
+        v1.7.0: the cheap entry point -- search, read snippets, then fetch
+        only the 1-2 URLs you actually want with :meth:`fetch_and_extract`.
+        Contrast :meth:`search_and_extract`, which fetches AND extracts
+        every result (N browser page loads + the token cost of every page
+        body). On an empty result, ``SearchResponse.search_blocked``
+        distinguishes provider blocking (CAPTCHA / rate-limit / breaker
+        cooldown) from a genuine no-hits answer.
+
+        Raises:
+            SearchError: Only when ``strict=True`` and the entire provider
+                chain is exhausted or blocked.
+        """
+        async with self._call_scope(
+            "search", {"query": query, "max_results": max_results}
+        ):
+            outcome = await self._search.search_with_outcome(
+                query, max_results, strict=strict
+            )
+            response = outcome.response
+            response.search_blocked = outcome.blocked
+            return response
 
     # ------------------------------------------------------------------
     # v1.6.6 Tabs (Feature 3)

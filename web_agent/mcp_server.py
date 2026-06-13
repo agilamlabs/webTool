@@ -81,6 +81,7 @@ from .models import (
     ResearchResult,
     ScreenshotFormat,
     ScreenshotResult,
+    SearchResponse,
 )
 from .utils import safe_join_path
 
@@ -345,6 +346,42 @@ async def web_search(
             continuation_tool=f"web_fetch (url={page.url!r})",
         )
     return result
+
+
+@mcp.tool()
+async def web_search_links(
+    ctx: Context,
+    query: str,
+    max_results: int = 10,
+    strict: bool = False,
+) -> SearchResponse:
+    """Search the web and return LINKS ONLY -- titles, URLs, snippets. No fetch.
+
+    The cheap, fast way to search: this does NOT open or extract any result
+    page, so it costs one search round-trip instead of N browser page loads
+    and N page bodies' worth of tokens. Use it to scan the SERP, read the
+    snippets, then fetch ONLY the one or two URLs you actually want via
+    ``web_fetch(url=...)``. Reach for ``web_search`` (which fetches AND
+    extracts every top result) only when you genuinely need the page bodies.
+
+    On an empty result, ``search_blocked=true`` means the providers were
+    actively blocked (CAPTCHA / rate-limit) or in circuit-breaker cooldown
+    -- retry later or try a different query -- as opposed to a real no-hits
+    answer. ``strict=true`` raises instead when the whole provider chain is
+    exhausted or blocked.
+
+    Args:
+        query: The search query (a SERP URL is unwrapped to its ?q= query).
+        max_results: Max links to return (default 10; clamped to 1..50).
+        strict: Raise when every provider is exhausted/blocked.
+
+    Returns:
+        SearchResponse with ``results`` (title/url/snippet/position) and
+        ``search_blocked``. No page content.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    max_results = min(max(max_results, 1), 50)
+    return await agent.search(query, max_results=max_results, strict=strict)
 
 
 @mcp.tool()
@@ -871,6 +908,96 @@ async def list_browser_sessions(ctx: Context) -> dict:
         "count": len(sessions),
         "sessions": [s.model_dump(mode="json") for s in sessions],
     }
+
+
+# ---------------------------------------------------------------------------
+# v1.7.0: Session management + authentication handoff
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def web_create_session(ctx: Context, name: Optional[str] = None) -> dict:
+    """Create a persistent browser session and return its session_id.
+
+    A session keeps cookies, localStorage, and tabs alive across multiple
+    tool calls (web_fetch / web_interact / web_observe / web_screenshot all
+    accept ``session_id=``). Without one, every call is a clean,
+    unauthenticated browser. Use a session to stay logged in across a
+    multi-step task.
+
+    The "log in once" handoff: run the server with ``browser.headless=false``,
+    create a session, complete the login (and any 2FA / CAPTCHA) in the
+    visible window or via web_interact, then call ``web_export_session`` to
+    save the authenticated state for reuse in later runs via
+    ``web_import_session``.
+
+    Returns ``{"session_id": "..."}``. Sessions count against
+    ``browser.session_max_count`` and are reaped after
+    ``browser.session_idle_ttl_s`` of inactivity -- close ones you no longer
+    need with ``web_close_session``.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    session_id = await agent.create_session(name=name)
+    return {"session_id": session_id}
+
+
+@mcp.tool()
+async def web_list_sessions(ctx: Context) -> dict:
+    """List live persistent browser sessions.
+
+    Returns ``{"count": N, "sessions": [SessionInfo, ...]}``. Each
+    SessionInfo carries the session_id, optional name, user_agent, and
+    ``has_storage_state`` (True when the session was hydrated from saved
+    auth). Use this to find a session_id to reuse or to manage the
+    ``browser.session_max_count`` budget.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    sessions = agent.list_sessions()
+    return {
+        "count": len(sessions),
+        "sessions": [s.model_dump(mode="json") for s in sessions],
+    }
+
+
+@mcp.tool()
+async def web_close_session(ctx: Context, session_id: str) -> dict:
+    """Close and discard a persistent browser session, freeing its Chromium
+    context. Returns ``{"closed": session_id}``. Closing sessions you are
+    done with keeps you under ``browser.session_max_count``.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    await agent.close_session(session_id)
+    return {"closed": session_id}
+
+
+@mcp.tool()
+async def web_export_session(ctx: Context, session_id: str, path: str) -> dict:
+    """Save a logged-in session's authentication (cookies + storage) to a file.
+
+    Call this AFTER a login has been completed on ``session_id`` -- it
+    captures Playwright's portable storage_state so a future run can reuse
+    the authentication without re-entering credentials or 2FA. ``path`` is a
+    filename relative to the download directory; traversal and absolute
+    paths are rejected. Returns cookie_count / origin_count / the saved path
+    and ``saved=true``. Pair with ``web_import_session``.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    result = await agent.export_session_state(session_id, path)
+    return result.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_import_session(ctx: Context, path: str, name: Optional[str] = None) -> dict:
+    """Create a NEW session pre-loaded with authentication saved earlier by
+    ``web_export_session`` -- so the agent starts already logged in, with no
+    credentials or 2FA in the conversation. ``path`` is a filename relative
+    to the download directory. Cookies are restored (per-origin localStorage
+    is best-effort). Returns ``{"session_id": "..."}`` -- pass it to
+    subsequent fetch / interact calls.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    session_id = await agent.import_session_state(path, name=name)
+    return {"session_id": session_id}
 
 
 # ---------------------------------------------------------------------------
