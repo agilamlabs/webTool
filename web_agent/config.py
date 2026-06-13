@@ -23,7 +23,7 @@ import ipaddress
 import socket
 from pathlib import Path
 from typing import Any, Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import yaml
 from pydantic import AliasChoices, Field, field_validator, model_validator
@@ -478,6 +478,25 @@ class BrowserConfig(BaseSettings):
             "(orphans from crashed runs). The live profile and anything "
             "that looks owned by a possibly-live process are skipped. "
             "``0`` disables the sweep."
+        ),
+    )
+    # --- v1.7.0 (Wave 2F): fingerprint coherence --------------------------
+    coherent_fingerprint: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0 (Wave 2F): keep the launched context's identity "
+            "self-consistent. When True (default) and "
+            "``user_agent_mode='random'``, the rotated User-Agent is drawn "
+            "ONLY from the OS family implied by ``locale`` (e.g. a "
+            "``de-DE`` / ``en-US`` context never advertises a Linux/macOS "
+            "UA on a Windows-looking fingerprint), so the UA OS, "
+            "navigator.platform, locale, and timezone no longer "
+            "contradict each other. The GUARANTEE is intra-context "
+            "coherence of (UA OS family <-> platform token) derived from "
+            "the configured locale -- it is NOT a stealth/bypass claim. "
+            "Set False to restore the pre-v1.7.0 cross-OS rotation. Has no "
+            "effect for ``user_agent_mode='explicit'`` / "
+            "``'playwright_default'`` (the UA is operator-pinned there)."
         ),
     )
 
@@ -1524,6 +1543,159 @@ class DiagnosticsConfig(BaseSettings):
     model_config = {"env_prefix": "WEB_AGENT_DIAGNOSTICS__"}
 
 
+class ProxyConfig(BaseSettings):
+    """v1.7.0 (Wave 2F): outbound proxy for every webTool egress path.
+
+    The web is actively closing to agents (Cloudflare default-blocks AI
+    crawlers; a vanilla local browser is flagged and blocked within
+    seconds). A proxy is the single most common operator control that
+    makes *compliant* access possible -- routing through a residential /
+    datacenter egress the operator is authorised to use. This config is
+    the one place that egress is set, threaded into BOTH the Playwright
+    launch (``proxy={...}`` on ``chromium.launch`` /
+    ``launch_persistent_context``) and the httpx side-paths (HEAD probe /
+    binary fetch) so the browser and the bare-HTTP requests share one
+    identity instead of leaking two different source IPs.
+
+    This is NOT a stealth-bypass promise -- it is the control surface
+    operators need. When ``server`` is unset (the default), every code
+    path behaves exactly as pre-v1.7.0: no proxy kwarg is passed anywhere.
+
+    Fields map to Playwright's proxy dict:
+
+    * ``server`` -- ``"http://host:port"`` / ``"https://host:port"`` /
+      ``"socks5://host:port"``. Scheme is validated when set.
+    * ``username`` / ``password`` -- proxy auth (omitted when unset).
+    * ``bypass`` -- comma-separated no-proxy hosts (Playwright
+      ``bypass``); also fed to httpx as ``NO_PROXY`` semantics via the
+      mounts the fetcher builds.
+
+    Env loading (matches the sub-config discipline)::
+
+        WEB_AGENT_PROXY__SERVER=http://127.0.0.1:8080
+        WEB_AGENT_PROXY__USERNAME=alice
+        WEB_AGENT_PROXY__PASSWORD=secret
+        WEB_AGENT_PROXY__BYPASS=localhost,127.0.0.1,*.internal
+    """
+
+    server: Optional[str] = Field(
+        default=None,
+        description=(
+            "Proxy server URL, e.g. ``http://host:port`` or "
+            "``socks5://host:port``. When None (default), NO proxy is "
+            "applied to any egress path -- pre-v1.7.0 behaviour. Scheme "
+            "must be one of http / https / socks5 when set."
+        ),
+    )
+    username: Optional[str] = Field(
+        default=None,
+        description="Proxy username for authenticated proxies. Omitted when None.",
+    )
+    password: Optional[str] = Field(
+        default=None,
+        description="Proxy password for authenticated proxies. Omitted when None.",
+    )
+    bypass: Optional[str] = Field(
+        default=None,
+        description=(
+            "Comma-separated list of hosts that bypass the proxy "
+            "(Playwright ``bypass``). Example: "
+            "``localhost,127.0.0.1,*.internal``. Omitted when None."
+        ),
+    )
+
+    @field_validator("server", mode="after")
+    @classmethod
+    def _validate_server_scheme(cls, v: Optional[str]) -> Optional[str]:
+        """Reject a non-http/https/socks5 proxy scheme at config time.
+
+        Playwright and httpx both accept only these schemes; an unknown
+        scheme (or a bare ``host:port`` with no scheme) would fail deep
+        inside the launch / client construction with an opaque error.
+        Surface it as a clean ConfigError instead.
+        """
+        if v is None:
+            return v
+        s = v.strip()
+        if not s:
+            # An explicit empty string is a misconfiguration -- treat it
+            # as "no proxy" so it cannot accidentally pass a blank server
+            # string into Playwright (which rejects it).
+            return None
+        parsed = urlparse(s)
+        allowed = {"http", "https", "socks5"}
+        if parsed.scheme.lower() not in allowed:
+            from .exceptions import ConfigError
+
+            raise ConfigError(
+                f"ProxyConfig.server={v!r} has unsupported scheme "
+                f"{parsed.scheme!r}. Use one of: "
+                "http://host:port, https://host:port, socks5://host:port."
+            )
+        if not parsed.hostname:
+            from .exceptions import ConfigError
+
+            raise ConfigError(
+                f"ProxyConfig.server={v!r} is missing a host. Expected "
+                "scheme://host:port, e.g. http://127.0.0.1:8080."
+            )
+        return s
+
+    def is_active(self) -> bool:
+        """True iff a proxy server is configured (so callers can gate the
+        proxy kwarg without re-checking ``server is not None`` everywhere)."""
+        return bool(self.server)
+
+    def playwright_proxy(self) -> Optional[dict[str, str]]:
+        """Build the Playwright ``proxy=`` dict, or ``None`` when inactive.
+
+        Returns a dict with ``server`` always present and
+        ``username`` / ``password`` / ``bypass`` included only when set,
+        so callers pass ``proxy=cfg.playwright_proxy()`` and simply OMIT
+        the kwarg entirely when this returns ``None`` (never pass
+        ``proxy=None`` vs absent inconsistently).
+        """
+        if not self.server:
+            return None
+        proxy: dict[str, str] = {"server": self.server}
+        if self.username is not None:
+            proxy["username"] = self.username
+        if self.password is not None:
+            proxy["password"] = self.password
+        if self.bypass is not None:
+            proxy["bypass"] = self.bypass
+        return proxy
+
+    def httpx_proxy_url(self) -> Optional[str]:
+        """Build the httpx ``proxy=`` URL (embedding auth), or ``None``.
+
+        httpx 0.28 takes a single ``proxy=`` string/URL on
+        ``AsyncClient``; credentials are carried in the URL userinfo
+        (``scheme://user:pass@host:port``). Returns ``None`` when no proxy
+        is configured so the fetcher omits the kwarg. ``bypass`` is not
+        encodable in a single httpx proxy URL -- the fetcher only uses the
+        side-path proxy for outbound document/binary requests, and the
+        bypass list is honoured by the browser path (Playwright) where it
+        matters most.
+        """
+        if not self.server:
+            return None
+        if self.username is None and self.password is None:
+            return self.server
+        parsed = urlparse(self.server)
+        user = quote(self.username or "", safe="")
+        pwd = quote(self.password or "", safe="")
+        netloc_host = parsed.netloc.rsplit("@", 1)[-1]
+        return f"{parsed.scheme}://{user}:{pwd}@{netloc_host}{parsed.path}"
+
+    # v1.7.0 (Wave 2F): scope env-var lookup to WEB_AGENT_PROXY__ so a bare
+    # ``SERVER`` / ``USERNAME`` env var can't override proxy settings and so
+    # a default ``AppConfig()`` (which builds this via ``default_factory``)
+    # does not read unprefixed vars. Nested ``WEB_AGENT_PROXY__<FIELD>`` via
+    # AppConfig still works. Mirrors every other sub-config.
+    model_config = {"env_prefix": "WEB_AGENT_PROXY__"}
+
+
 class AppConfig(BaseSettings):
     """Top-level configuration for the web_agent toolkit.
 
@@ -1585,6 +1757,10 @@ class AppConfig(BaseSettings):
     # v1.6.8: network capture, download intents, post-action screenshots,
     # session replay traces
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
+    # v1.7.0 (Wave 2F): outbound proxy shared by the Playwright launch and
+    # the httpx side-paths. Inactive by default (server unset -> no proxy
+    # anywhere).
+    proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     # v1.6.16 deep-review fix: a Literal of loguru's level names so an unknown
     # value is rejected at config time instead of failing when logging is wired
     # (loguru's level lookup is case-sensitive / uppercase).

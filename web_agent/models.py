@@ -1288,6 +1288,61 @@ class SessionInfo(BaseModel):
     last_used_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     page_count: int = Field(default=0)
     user_agent: Optional[str] = None
+    has_storage_state: bool = Field(
+        default=False,
+        description=(
+            "v1.7.0: True once this session has been hydrated from a saved "
+            "storage_state (via Agent.import_session_state) -- i.e. it "
+            "currently carries imported cookies / origins. Informational; "
+            "live cookie state may still change as the session navigates."
+        ),
+    )
+
+
+class StorageStateResult(BaseModel):
+    """v1.7.0: outcome of exporting or importing a session's storage state.
+
+    A storage state is Playwright's portable snapshot of an authenticated
+    BrowserContext: its cookies plus per-origin localStorage (and, when
+    requested, IndexedDB). Capturing it to a file and rehydrating it in a
+    later process is how an Agent reuses a login performed once -- the
+    "log in by hand, automate afterwards" handoff.
+
+    Returned by :meth:`Agent.export_session_state` (``saved=True``) and
+    :meth:`Agent.import_session_state` (``loaded=True``).
+    """
+
+    session_id: str = Field(
+        description=(
+            "The session whose state was exported, or the NEW session created "
+            "to hold the imported state."
+        ),
+    )
+    path: Optional[str] = Field(
+        default=None,
+        description="Absolute on-disk path of the storage_state file (confined to the download dir).",
+    )
+    cookie_count: int = Field(
+        default=0,
+        description="Number of cookies in the storage state.",
+    )
+    origin_count: int = Field(
+        default=0,
+        description="Number of origins (localStorage buckets) in the storage state.",
+    )
+    saved: bool = Field(
+        default=False,
+        description="True when this result is from a successful export_state.",
+    )
+    loaded: bool = Field(
+        default=False,
+        description="True when this result is from a successful import_state.",
+    )
+    error: Optional[str] = Field(
+        default=None,
+        description="Failure reason when neither saved nor loaded (path rejected, bad file, etc.).",
+    )
+    correlation_id: Optional[str] = Field(default=None)
 
 
 # =========================================================================

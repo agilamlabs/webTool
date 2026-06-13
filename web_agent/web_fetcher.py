@@ -51,6 +51,7 @@ from .utils import (
     get_random_user_agent,
     httpx_peer_ip,
     is_private_address,
+    locale_os_family,
     parse_retry_after,
     safe_page_content,
 )
@@ -397,6 +398,64 @@ class WebFetcher:
         if self._rate_limiter is not None:
             self._rate_limiter.notify_429(host, retry_after)
         return retry_after
+
+    # ------------------------------------------------------------------
+    # v1.7.0 (Wave 2F): coherent identity for the httpx side-paths
+    # ------------------------------------------------------------------
+
+    def _coherent_side_path_headers(self) -> dict[str, str]:
+        """Minimal browser-consistent header set for the httpx side-paths.
+
+        The HEAD probe and ``fetch_binary`` previously sent only a random
+        User-Agent on top of httpx's default Python identity, so a request
+        could claim a Chrome UA while advertising ``Accept: */*`` and no
+        ``Accept-Language`` -- a trivially incoherent fingerprint that does
+        not match what the browser path sends for the SAME operator.
+
+        This builds a coherent triplet:
+
+        * ``User-Agent`` -- drawn from the SAME coherence policy as the
+          browser context (OS family pinned by ``BrowserConfig.locale``
+          when ``coherent_fingerprint`` is on), so the side-path UA OS does
+          not contradict the browser's; otherwise the full rotation pool.
+        * ``Accept-Language`` -- derived from ``BrowserConfig.locale`` (e.g.
+          ``en-US`` -> ``en-US,en;q=0.9``) so it matches the browser's
+          locale claim.
+        * ``Accept`` -- a browser-like document Accept string.
+
+        Returns a fresh dict each call (UA rotates per request).
+        """
+        bcfg = self._config.browser
+        os_family = (
+            locale_os_family(bcfg.locale) if getattr(bcfg, "coherent_fingerprint", True) else None
+        )
+        locale = (bcfg.locale or "en-US").strip() or "en-US"
+        primary = locale.split(",", 1)[0].strip()
+        # Build "en-US,en;q=0.9" from "en-US"; for a bare "en" just "en".
+        base_lang = primary.split("-", 1)[0]
+        accept_language = (
+            f"{primary},{base_lang};q=0.9" if base_lang and base_lang != primary else primary
+        )
+        return {
+            "User-Agent": get_random_user_agent(os_family),
+            "Accept-Language": accept_language,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,*/*;q=0.8"
+            ),
+        }
+
+    def _httpx_proxy_kwargs(self) -> dict[str, Any]:
+        """v1.7.0 (Wave 2F): ``proxy=`` kwarg for the httpx side-paths.
+
+        Returns ``{"proxy": <url>}`` when ``ProxyConfig.server`` is set,
+        else an EMPTY dict so the ``proxy`` key is omitted entirely from
+        ``httpx.AsyncClient(...)`` (httpx 0.28 takes a single ``proxy=``
+        URL; ``proxies=`` was removed). Splatting an empty dict keeps the
+        "absent, not None" contract the launch path also follows.
+        """
+        proxy_url = self._config.proxy.httpx_proxy_url()
+        return {"proxy": proxy_url} if proxy_url is not None else {}
 
     async def fetch_smart(
         self,
@@ -1301,12 +1360,15 @@ class WebFetcher:
 
         try:
             cookie_jar = await self._cookies_for_session(session_id, url)
+            # v1.7.0 (Wave 2F): coherent browser-consistent headers (UA OS
+            # matches the browser locale) + outbound proxy when configured.
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=10.0,
-                headers={"User-Agent": get_random_user_agent()},
+                headers=self._coherent_side_path_headers(),
                 cookies=cookie_jar,
                 event_hooks={"response": [_check_redirect]},
+                **self._httpx_proxy_kwargs(),
             ) as client:
                 # v1.6.16 FC-1 fix: use a STREAMING HEAD so the post-connect
                 # peer-IP re-check actually fires. ``httpx_peer_ip`` reads the
@@ -1540,12 +1602,18 @@ class WebFetcher:
                 binary_timeout_s = min(
                     max(self._config.browser.navigation_timeout / 1000.0, 1.0), 120.0
                 )
+                # v1.7.0 (Wave 2F): coherent browser-consistent headers (UA
+                # OS matches the browser locale + Accept-Language) and the
+                # outbound proxy when configured, so the binary side-path
+                # presents the same identity as the browser path instead of
+                # httpx's default Python TLS/UA fingerprint.
                 async with httpx.AsyncClient(
                     follow_redirects=True,
                     timeout=binary_timeout_s,
-                    headers={"User-Agent": get_random_user_agent()},
+                    headers=self._coherent_side_path_headers(),
                     cookies=cookie_jar,
                     event_hooks={"response": [_check_redirect]},
+                    **self._httpx_proxy_kwargs(),
                 ) as client:
                     async with client.stream("GET", url) as resp:
                         # v1.6.16 FB-1: post-connect peer-IP re-check (DNS

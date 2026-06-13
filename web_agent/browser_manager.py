@@ -25,7 +25,7 @@ from playwright_stealth import Stealth
 
 from .config import AppConfig
 from .ownership import OwnershipToken
-from .utils import get_random_user_agent, safe_join_path
+from .utils import get_random_user_agent, locale_os_family, safe_join_path
 
 if TYPE_CHECKING:  # pragma: no cover -- avoid runtime import cycle
     from .network_collector import NetworkCollector
@@ -39,6 +39,15 @@ def _resolve_user_agent(bcfg: Any) -> str | None:
     string when mode is ``"explicit"`` (validator guarantees the
     string is set).
 
+    v1.7.0 (Wave 2F) fingerprint coherence: when ``coherent_fingerprint``
+    is on AND the mode is ``"random"``, the rotated UA is pinned to the OS
+    family implied by ``locale`` (via :func:`locale_os_family`). This is
+    the coherence GUARANTEE -- the launched context never advertises a UA
+    whose OS contradicts the locale/platform of the same context. With
+    coherence off (or an unmappable locale) the full cross-OS pool is
+    used, restoring pre-v1.7.0 rotation. ``"explicit"`` /
+    ``"playwright_default"`` are untouched: the UA is operator-pinned.
+
     ``bcfg`` is typed as ``Any`` because importing ``BrowserConfig``
     here would create a cycle (config.py -> browser_manager.py -> ...).
     """
@@ -48,7 +57,10 @@ def _resolve_user_agent(bcfg: Any) -> str | None:
         return ua if isinstance(ua, str) else None
     if mode == "playwright_default":
         return None
-    return get_random_user_agent()
+    os_family: str | None = None
+    if getattr(bcfg, "coherent_fingerprint", True):
+        os_family = locale_os_family(getattr(bcfg, "locale", "en-US"))
+    return get_random_user_agent(os_family)
 
 
 def _should_disable_chromium_sandbox(cfg_value: Optional[bool]) -> bool:
@@ -659,6 +671,20 @@ class BrowserManager:
                 args.append(f"--remote-debugging-port={bcfg.cdp_port}")
                 args.append(f"--remote-debugging-address={bcfg.cdp_host}")
 
+            # v1.7.0 (Wave 2F): outbound proxy. ``playwright_proxy()`` returns
+            # the ``proxy=`` dict (server + optional username/password/bypass)
+            # or None when no proxy is configured. We splat it into a kwargs
+            # dict so the ``proxy`` key is OMITTED ENTIRELY when inactive --
+            # never ``proxy=None`` vs absent inconsistently. Applied to BOTH
+            # launch_persistent_context (named + ephemeral) and chromium.launch.
+            proxy_dict = self._config.proxy.playwright_proxy()
+            proxy_kwargs: dict[str, Any] = {"proxy": proxy_dict} if proxy_dict is not None else {}
+            if proxy_dict is not None:
+                logger.info(
+                    "Routing browser egress through proxy: {server}",
+                    server=proxy_dict.get("server"),
+                )
+
             try:
                 # v1.7.0: raw Playwright lifecycle. Stealth evasions are
                 # applied per-context in _build_context / on the named
@@ -690,6 +716,7 @@ class BrowserManager:
                             timezone_id=bcfg.timezone_id,
                             java_script_enabled=True,
                             bypass_csp=False,
+                            **proxy_kwargs,
                         )
                     )
                     self._persistent_context.set_default_timeout(bcfg.default_timeout)
@@ -738,6 +765,7 @@ class BrowserManager:
                             headless=bcfg.headless,
                             slow_mo=bcfg.slow_mo,
                             args=args,
+                            **proxy_kwargs,
                         )
                     )
                     self._browser = self._ephemeral_root_context.browser
@@ -754,6 +782,7 @@ class BrowserManager:
                         headless=bcfg.headless,
                         slow_mo=bcfg.slow_mo,
                         args=args,
+                        **proxy_kwargs,
                     )
                 self._crashed = False
                 self._generation += 1
