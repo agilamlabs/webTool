@@ -2056,6 +2056,112 @@ class MetricsConfig(BaseSettings):
     model_config = {"env_prefix": "WEB_AGENT_METRICS__"}
 
 
+class MonitoringConfig(BaseSettings):
+    """v1.7.0 (Wave 8): snapshot / diff change-monitoring storage + bounds.
+
+    Controls where :meth:`Agent.snapshot_page` persists snapshots and how big a
+    snapshot / diff can get. Snapshots are explicit (there is no enable gate):
+    you only pay for what you capture.
+    """
+
+    snapshot_dir: str = Field(
+        default=".webtool/snapshots",
+        description=(
+            "Directory for persisted page snapshots, resolved against "
+            "``AppConfig.base_dir`` when relative. Created on first write. Each "
+            "snapshot is a JSON file keyed by its (sanitized) label."
+        ),
+    )
+    max_snapshot_chars: int = Field(
+        default=200_000,
+        ge=1_000,
+        le=5_000_000,
+        description=(
+            "Cap on the normalized content stored per snapshot. A larger page is "
+            "truncated to this many characters before hashing/storing so a giant "
+            "page can't bloat the snapshot store or a diff."
+        ),
+    )
+    diff_max_lines: int = Field(
+        default=200,
+        ge=1,
+        le=10_000,
+        description=(
+            "Cap on how many added / removed lines a SnapshotDiff carries (each "
+            "side). The full counts are still reported in added_count / "
+            "removed_count and ``truncated`` flags when the lists were capped."
+        ),
+    )
+
+    model_config = {"env_prefix": "WEB_AGENT_MONITORING__"}
+
+
+class CrawlConfig(BaseSettings):
+    """v1.7.0 (Wave 8): defaults + ceilings for the bounded same-site crawl.
+
+    :meth:`Agent.crawl_site` walks a site breadth-first within scope, optionally
+    seeded from sitemap.xml. These are the DEFAULTS and the hard CEILINGS: a
+    per-call ``max_pages`` / ``max_depth`` is clamped to the ceilings here so a
+    large caller value can never make the crawl unbounded.
+    """
+
+    max_pages: int = Field(
+        default=20,
+        ge=1,
+        le=500,
+        description=(
+            "Default AND ceiling for pages fetched per crawl. A per-call value "
+            "is clamped to [1, this]. Keeps a crawl bounded regardless of caller."
+        ),
+    )
+    max_depth: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description=(
+            "Default AND ceiling for link depth from the start URL (0 == only the "
+            "start URL). A per-call value is clamped to [0, this]."
+        ),
+    )
+    same_registrable_domain: bool = Field(
+        default=False,
+        description=(
+            "Crawl scope. False (default) confines the crawl to the EXACT start "
+            "host (strictest). True widens it to the start URL's registrable "
+            "domain so 'www.' / subdomains of the same site are in scope."
+        ),
+    )
+    use_sitemap: bool = Field(
+        default=True,
+        description=(
+            "Seed the crawl frontier from ``/sitemap.xml`` (and a sitemap index's "
+            "child sitemaps) when reachable. Discovered URLs are still gated by "
+            "scope + every per-fetch safety check; a missing/blocked sitemap is "
+            "silently skipped."
+        ),
+    )
+    sitemap_max_urls: int = Field(
+        default=1_000,
+        ge=1,
+        le=50_000,
+        description=(
+            "Cap on URLs parsed from sitemap(s) for seeding, so a giant sitemap "
+            "can't exhaust memory. Bounds child-sitemap recursion too."
+        ),
+    )
+    per_page_link_cap: int = Field(
+        default=200,
+        ge=1,
+        le=5_000,
+        description=(
+            "Cap on how many in-scope links are harvested from a single page into "
+            "the frontier, so one link-farm page can't explode the frontier."
+        ),
+    )
+
+    model_config = {"env_prefix": "WEB_AGENT_CRAWL__"}
+
+
 class AppConfig(BaseSettings):
     """Top-level configuration for the web_agent toolkit.
 
@@ -2125,6 +2231,9 @@ class AppConfig(BaseSettings):
     # (cheap counters at outcome points; size-bounded by a label-cardinality
     # cap). Disable to make every registry increment a no-op.
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    # v1.7.0 (Wave 8): snapshot/diff change-monitoring + bounded same-site crawl.
+    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    crawl: CrawlConfig = Field(default_factory=CrawlConfig)
     # v1.6.16 deep-review fix: a Literal of loguru's level names so an unknown
     # value is rejected at config time instead of failing when logging is wired
     # (loguru's level lookup is case-sensitive / uppercase).
