@@ -946,7 +946,7 @@ class LocatorSpec(BaseModel):
 
     Provides AI-friendly element selection beyond raw CSS. At least one
     locator field must be set. Resolution priority (first non-None wins):
-    role > test_id > label > placeholder > text > selector.
+    ref > role > test_id > label > placeholder > text > selector.
 
     Examples::
 
@@ -961,9 +961,25 @@ class LocatorSpec(BaseModel):
 
         # Fall back to a CSS selector:
         LocatorSpec(selector="button.primary")
+
+        # v1.7.0 Wave 4C set-of-marks: target an element enumerated by the
+        # most recent observe() on this tab. ``ref`` resolves the live
+        # ``[data-webtool-ref="eN"]`` attribute observe() stamped on the page;
+        # it re-resolves against the CURRENT DOM, so a stale ref (the element
+        # was removed / the page re-rendered) fails cleanly via the normal
+        # SelectorNotFoundError / ActionStatus.FAILED path.
+        LocatorSpec(ref="e5")
     """
 
     selector: Optional[str] = Field(default=None, description="CSS selector")
+    ref: Optional[str] = Field(
+        default=None,
+        description=(
+            "Set-of-marks element ref from the latest observe() on this tab "
+            "(e.g. 'e5'). Resolves the live [data-webtool-ref] attribute; "
+            "highest resolution priority. Re-resolves against the current DOM."
+        ),
+    )
     role: Optional[str] = Field(
         default=None,
         description="ARIA role: 'button', 'link', 'textbox', 'checkbox', etc.",
@@ -985,6 +1001,7 @@ class LocatorSpec(BaseModel):
         # actual usable-locator set.
         return not any(
             (
+                self.ref,
                 self.selector,
                 self.role,
                 self.text,
@@ -1637,6 +1654,60 @@ class TabInfo(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class InteractiveElement(BaseModel):
+    """One enumerated, actionable element from observe()'s set-of-marks pass.
+
+    v1.7.0 Wave 4C. ``observe()`` walks the DOM once and returns a bounded,
+    numbered list of the genuinely interactive elements that are visible in
+    the viewport. The model picks "element #N from what I just observed"
+    instead of guessing a CSS selector -- closing the observe -> act loop and
+    avoiding the hallucinated / stale-reference and brittle-selector failures
+    that dominate WebArena/WebVoyager analyses.
+
+    Targeting: pass ``ref`` back as ``LocatorSpec(ref=...)`` (e.g. on a click
+    or fill action). observe() stamps the matching ``data-webtool-ref="eN"``
+    attribute on the live element, so the ref re-resolves against the CURRENT
+    DOM. ``selector`` is also surfaced as a non-mutating fallback.
+    """
+
+    ref: str = Field(
+        description=(
+            "Stable per-observe reference, e.g. 'e1', 'e2'. Pass back as "
+            "LocatorSpec(ref=...) to act on this element."
+        )
+    )
+    role: str = Field(
+        description=(
+            "ARIA role or a tag-derived fallback: 'button', 'link', 'textbox', "
+            "'checkbox', 'combobox', etc."
+        )
+    )
+    name: str = Field(
+        default="",
+        description=(
+            "Accessible name (aria-label / text / placeholder / value), "
+            "truncated. Empty when the element exposes no name."
+        ),
+    )
+    tag: str = Field(description="Lowercased HTML tag name, e.g. 'a', 'button', 'input'.")
+    enabled: bool = Field(default=True, description="False when disabled / aria-disabled.")
+    visible: bool = Field(
+        default=True,
+        description="True when in the viewport. Just-offscreen elements are excluded.",
+    )
+    bbox: list[float] = Field(
+        default_factory=list,
+        description="[x, y, width, height] in CSS pixels (viewport-relative).",
+    )
+    selector: Optional[str] = Field(
+        default=None,
+        description=(
+            "A resolvable selector targeting this element ([data-webtool-ref] "
+            "when ref tagging is on). Non-mutating fallback to the ref path."
+        ),
+    )
+
+
 class ObserveResult(BaseModel):
     """Snapshot of a page's visual + structural state for observe -> act -> verify loops.
 
@@ -1644,6 +1715,10 @@ class ObserveResult(BaseModel):
     translating screenshot pixels to click coordinates. The viewport
     dimensions are CSS pixels (what Playwright's mouse API expects);
     multiply by DPR to map from a hi-DPI screenshot.
+
+    v1.7.0 Wave 4C adds ``elements``: a bounded, numbered set-of-marks list
+    of the actionable elements in the viewport. Act on one by passing its
+    ``ref`` back as ``LocatorSpec(ref=...)``.
     """
 
     url: str = Field(description="URL captured (post-redirect)")
@@ -1669,6 +1744,22 @@ class ObserveResult(BaseModel):
         description=(
             "Accessibility tree. None by default (snapshots can be megabytes "
             "on complex pages); enable with include_aria=True."
+        ),
+    )
+    elements: list[InteractiveElement] = Field(
+        default_factory=list,
+        description=(
+            "v1.7.0 Wave 4C set-of-marks: bounded, numbered list of the "
+            "actionable elements visible in the viewport. Empty when "
+            "include_elements=False or the page has none. Act on one via "
+            "LocatorSpec(ref=...)."
+        ),
+    )
+    elements_truncated: bool = Field(
+        default=False,
+        description=(
+            "True when the page exposed more interactive elements than "
+            "automation.observe_max_elements and the list was capped."
         ),
     )
     tab_id: Optional[str] = Field(default=None)
@@ -1802,6 +1893,55 @@ class SkillApplicationResult(BaseModel):
 # (interaction-library Action types are defined above, before the Action
 # discriminated union -- see UploadFileInput / IframeClickInput /
 # ShadowDomClickInput / DragAndDropInput around the BaseAction block.)
+
+
+class MetricsSnapshot(BaseModel):
+    """v1.7.0 (Wave 4A): a point-in-time view of the in-process metrics.
+
+    Serializes :meth:`web_agent.metrics.MetricsRegistry.snapshot` for the
+    wire so an operator (or the MCP ``web_metrics`` tool) can answer "how many
+    fetches, how many got bot-walled, how many browser crashes/relaunches,
+    which search providers are blocked, what's my error rate" without grepping
+    logs. JSON-trivial -- every field is defaulted.
+
+    Series keys follow the registry's ``name`` / ``name{label=value,...}``
+    convention (labels sorted for determinism). ``distributions`` values are
+    the five-number summary ``{count, sum, min, max, avg}``.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether metrics recording is enabled. False means counters / "
+            "distributions are empty because increments are no-ops."
+        ),
+    )
+    counters: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Counter series: ``{name or name{label=value,...}: total}``. "
+            "Monotonic since process start (or last registry reset)."
+        ),
+    )
+    distributions: dict[str, dict[str, float]] = Field(
+        default_factory=dict,
+        description=(
+            "Distribution series: ``{series_key: {count, sum, min, max, avg}}``. "
+            "A cheap four-number summary (no histogram buckets)."
+        ),
+    )
+    uptime_s: float = Field(
+        default=0.0,
+        description="Seconds since the registry was constructed or last reset.",
+    )
+    snapshot_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC timestamp when this snapshot was taken.",
+    )
+    correlation_id: Optional[str] = Field(
+        default=None,
+        description="Correlation id of the call that produced this snapshot, when available.",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -55,6 +55,7 @@ from loguru import logger
 from .browser_manager import BrowserManager
 from .cache import Cache
 from .config import AppConfig
+from .metrics import MetricsRegistry, get_metrics, noop_registry
 from .models import SearchResponse
 from .rate_limiter import RateLimiter
 from .search_providers import (
@@ -236,6 +237,12 @@ class SearchEngine:
         clock: Injectable monotonic clock for the circuit breaker. Tests
             pass a fake clock to exercise cooldown expiry without sleeping;
             production uses ``time.monotonic``.
+        metrics: Optional :class:`~web_agent.metrics.MetricsRegistry`. When
+            omitted, a shared no-op registry is used so increments cost
+            nothing. Records ``search_total``,
+            ``search_provider_outcome{provider, outcome}``, and
+            ``search_circuit_trip{provider}`` at the provider-walk outcome
+            points.
     """
 
     def __init__(
@@ -247,10 +254,18 @@ class SearchEngine:
         *,
         circuit_cooldown_s: float = DEFAULT_CIRCUIT_COOLDOWN_S,
         clock: Optional[Callable[[], float]] = None,
+        metrics: Optional[MetricsRegistry] = None,
     ) -> None:
         self._config = config
         self._cache = cache
         self._breaker = _ProviderCircuitBreaker(circuit_cooldown_s, clock=clock)
+        # v1.7.0 (Wave 4A): observability registry. Defaults to a shared no-op
+        # registry when the Agent doesn't pass one, so every increment is a
+        # single cheap call and existing call sites are unaffected. Stored
+        # behind the ``_metrics`` property so a test that bypasses __init__
+        # (``SearchEngine.__new__``) still sees the no-op registry rather than
+        # an AttributeError on the first increment.
+        self._metrics_reg = get_metrics(metrics)
 
         # Build the full catalog. Only providers listed in
         # config.search.providers (in that order) actually run.
@@ -291,6 +306,16 @@ class SearchEngine:
     def providers(self) -> list[SearchProvider]:
         """Read-only snapshot of the configured provider chain (in order)."""
         return list(self._providers)
+
+    @property
+    def _metrics(self) -> MetricsRegistry:
+        """The observability registry, falling back to no-op if unset.
+
+        v1.7.0 (Wave 4A): tolerates a ``SearchEngine.__new__`` bypass that
+        sets only ``_config`` / ``_cache`` / ``_providers`` (a long-standing
+        test idiom) so the outcome-point increments never raise.
+        """
+        return getattr(self, "_metrics_reg", None) or noop_registry()
 
     async def search(
         self,
@@ -344,6 +369,10 @@ class SearchEngine:
         # clamps too, but a direct API caller bypasses that.
         max_r = max(1, min(int(max_r), 100))
 
+        # v1.7.0 (Wave 4A): one increment per search call (counts cache hits
+        # too -- a cache hit is still a search the daemon served).
+        self._metrics.incr("search_total")
+
         # Cache lookup -- key includes max_results so different result
         # counts for the same query don't collide.
         #
@@ -390,6 +419,11 @@ class SearchEngine:
             if self._breaker.is_open(provider):
                 skipped_cooldown.append(provider.name)
                 any_blocked = True
+                # v1.7.0 (Wave 4A): provider skipped because its circuit is
+                # open (recently blocked / failed).
+                self._metrics.incr(
+                    "search_provider_outcome", provider=provider.name, outcome="cooldown"
+                )
                 continue
 
             tried.append(provider.name)
@@ -403,6 +437,11 @@ class SearchEngine:
                 self._breaker.trip(provider, exc.reason)
                 errors[provider.name] = exc.reason
                 any_blocked = True
+                # v1.7.0 (Wave 4A): provider-outcome + circuit-trip counters.
+                self._metrics.incr(
+                    "search_provider_outcome", provider=provider.name, outcome="blocked"
+                )
+                self._metrics.incr("search_circuit_trip", provider=provider.name)
                 continue
             except Exception as exc:
                 # Transient/unknown failure. Treat as a circuit-tripping
@@ -412,6 +451,11 @@ class SearchEngine:
                 logger.warning("Provider {p} raised: {e}", p=provider.name, e=exc)
                 self._breaker.trip(provider, "error")
                 errors[provider.name] = str(exc) or exc.__class__.__name__
+                # v1.7.0 (Wave 4A): provider-outcome + circuit-trip counters.
+                self._metrics.incr(
+                    "search_provider_outcome", provider=provider.name, outcome="error"
+                )
+                self._metrics.incr("search_circuit_trip", provider=provider.name)
                 continue
 
             # v1.6.16 SP-1: drop any result whose host is a literal private IP,
@@ -428,6 +472,10 @@ class SearchEngine:
                     "Search succeeded via {p} ({n} results)",
                     p=provider.name,
                     n=response.total_results,
+                )
+                # v1.7.0 (Wave 4A): the provider answered with hits.
+                self._metrics.incr(
+                    "search_provider_outcome", provider=provider.name, outcome="ok"
                 )
                 # Provider answered cleanly -- clear any prior trip.
                 self._breaker.record_success(provider)

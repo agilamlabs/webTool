@@ -24,6 +24,7 @@ from playwright.async_api import (
 from playwright_stealth import Stealth
 
 from .config import AppConfig
+from .metrics import MetricsRegistry, get_metrics
 from .ownership import OwnershipToken
 from .utils import get_random_user_agent, locale_os_family, safe_join_path
 
@@ -168,8 +169,14 @@ class BrowserManager:
         self,
         config: AppConfig,
         network_collector: Optional[NetworkCollector] = None,
+        metrics: Optional[MetricsRegistry] = None,
     ) -> None:
         self._config = config
+        # v1.7.0 (Wave 4A): observability registry. Defaults to a shared
+        # no-op registry when the Agent doesn't pass one, so the launch /
+        # crash / relaunch increments cost nothing and existing call sites
+        # are unaffected.
+        self._metrics = get_metrics(metrics)
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         # v1.7.0: stealth is applied explicitly per-context via
@@ -348,6 +355,10 @@ class BrowserManager:
         if self._stopping or not self._started:
             return
         self._crashed = True
+        # v1.7.0 (Wave 4A): count the unexpected death (crash / OOM-kill /
+        # external terminate). Fires once per disconnect; the relaunch
+        # outcome is counted separately in ensure_running.
+        self._metrics.incr("browser_crash")
         logger.warning(
             "Chromium disconnected unexpectedly (crash, OOM-kill, or external "
             "terminate). auto_relaunch={ar}: {hint}",
@@ -441,7 +452,11 @@ class BrowserManager:
                     n=attempts,
                     g=self._generation,
                 )
+                # v1.7.0 (Wave 4A): a relaunch sequence succeeded.
+                self._metrics.incr("browser_relaunch", result="ok")
                 return
+            # v1.7.0 (Wave 4A): all relaunch attempts exhausted.
+            self._metrics.incr("browser_relaunch", result="failed")
             raise BrowserError(
                 f"Browser crashed and {attempts} relaunch attempt(s) failed "
                 f"(browser.relaunch_max_attempts={attempts}). Last error: {last_exc}. "
@@ -613,6 +628,8 @@ class BrowserManager:
                     self._crashed = False
                     self._generation += 1
                     self._started = True
+                    # v1.7.0 (Wave 4A): count the (remote) browser bring-up.
+                    self._metrics.incr("browser_launch")
                     # v1.7.0: a remote disconnect is surfaced like a crash;
                     # ensure_running() then attempts a re-connect.
                     self._wire_crash_handlers()
@@ -787,6 +804,10 @@ class BrowserManager:
                 self._crashed = False
                 self._generation += 1
                 self._started = True
+                # v1.7.0 (Wave 4A): count the local browser bring-up. Placed
+                # after _started flips so a launch that threw (caught below
+                # and rolled back) is never counted as a successful launch.
+                self._metrics.incr("browser_launch")
                 self._wire_crash_handlers()
                 logger.info(
                     "Browser launched (headless={h}, isolation={iso}, cdp={cdp})",

@@ -39,6 +39,7 @@ from .challenge import CHALLENGE_CONFIDENCE_ACTION_THRESHOLD, detect_challenge
 from .config import AppConfig
 from .correlation import get_correlation_id
 from .debug import DebugCapture
+from .metrics import MetricsRegistry, get_metrics
 from .models import ChallengeInfo, FetchResult, FetchStatus, HtmlCaptureSource
 from .rate_limiter import RateLimiter
 from .robots import RobotsChecker
@@ -349,6 +350,7 @@ class WebFetcher:
         robots: Optional[RobotsChecker] = None,
         cache: Optional[Cache] = None,
         network_collector: Optional[Any] = None,
+        metrics: Optional[MetricsRegistry] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
@@ -362,6 +364,11 @@ class WebFetcher:
         # download_candidates_runtime on success. None when the Agent
         # didn't provide one (older test scaffolding).
         self._network_collector = network_collector
+        # v1.7.0 (Wave 4A): observability registry. Defaults to a shared
+        # no-op registry when the Agent doesn't pass one, so every increment
+        # is a single cheap call (no per-site None guard) and existing call
+        # sites are unaffected.
+        self._metrics = get_metrics(metrics)
 
     # ------------------------------------------------------------------
     # v1.6.12: shared 429 signalling helper
@@ -398,6 +405,46 @@ class WebFetcher:
         if self._rate_limiter is not None:
             self._rate_limiter.notify_429(host, retry_after)
         return retry_after
+
+    # ------------------------------------------------------------------
+    # v1.7.0 (Wave 4A): observability -- record at the outcome chokepoint
+    # ------------------------------------------------------------------
+
+    def _record_fetch_outcome(self, result: FetchResult) -> FetchResult:
+        """Stamp ``fetch_total`` + ``fetch_outcome{status}`` for one result.
+
+        Called at the single return chokepoint of :meth:`fetch` so every
+        finalized FetchResult is counted exactly once (cache hits, blocks,
+        successes, and the exception-to-FetchResult conversions all funnel
+        here). ``challenge_detected{vendor}`` is incremented when the result
+        carries challenge info -- the structural bot-wall signal. Counters
+        only; no control-flow or value changes. Returns ``result`` so callers
+        can ``return self._record_fetch_outcome(...)`` inline.
+        """
+        self._metrics.incr("fetch_total")
+        self._metrics.incr("fetch_outcome", status=result.status.value)
+        if result.challenge is not None:
+            self._metrics.incr("challenge_detected", vendor=result.challenge.vendor)
+        return result
+
+    def _observe_fetch_payload(self, result: FetchResult) -> None:
+        """Record ``bytes_downloaded`` / ``ttfb_ms`` distributions for a fetch.
+
+        Best-effort, success-path enrichment: ``bytes_downloaded`` prefers the
+        captured page weight (``total_bytes_downloaded``, present only when
+        network capture is on) and falls back to the rendered HTML length;
+        ``ttfb_ms`` is recorded when the navigation TTFB was captured. No-op
+        on the disabled registry. Never raises.
+        """
+        if not self._metrics.enabled:
+            return
+        size = result.total_bytes_downloaded
+        if size is None and result.html is not None:
+            size = len(result.html)
+        if size is not None:
+            self._metrics.observe("bytes_downloaded", float(size))
+        if result.ttfb_ms is not None:
+            self._metrics.observe("ttfb_ms", float(result.ttfb_ms))
 
     # ------------------------------------------------------------------
     # v1.7.0 (Wave 2F): coherent identity for the httpx side-paths
@@ -524,12 +571,14 @@ class WebFetcher:
         if not check_domain_allowed(url, self._config.safety):
             host = urlparse(url).hostname or ""
             logger.warning("Domain blocked by safety policy: {host}", host=host)
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.BLOCKED,
-                error_message=f"Domain not allowed by SafetyConfig: {host}",
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.BLOCKED,
+                    error_message=f"Domain not allowed by SafetyConfig: {host}",
+                    correlation_id=cid,
+                )
             )
 
         # Fast-path: detect file download URLs without launching a browser page
@@ -538,30 +587,34 @@ class WebFetcher:
                 "Skipping fetch for download URL: {url} (use agent.download() instead)",
                 url=url,
             )
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.NETWORK_ERROR,
-                error_message=(
-                    f"URL points to a downloadable file. "
-                    f"Use agent.download('{url}') instead of fetch."
-                ),
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.NETWORK_ERROR,
+                    error_message=(
+                        f"URL points to a downloadable file. "
+                        f"Use agent.download('{url}') instead of fetch."
+                    ),
+                    correlation_id=cid,
+                )
             )
 
         # Politeness layer: robots.txt check (before any network I/O)
         if self._robots is not None and not await self._robots.is_allowed(url):
             host = urlparse(url).hostname or ""
             logger.info("robots.txt disallows {url} for {ua}", url=url, ua=self._robots.user_agent)
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.BLOCKED,
-                error_message=(
-                    f"robots.txt for {host} disallows this URL "
-                    f"for User-Agent {self._robots.user_agent!r}"
-                ),
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.BLOCKED,
+                    error_message=(
+                        f"robots.txt for {host} disallows this URL "
+                        f"for User-Agent {self._robots.user_agent!r}"
+                    ),
+                    correlation_id=cid,
+                )
             )
 
         # Cache lookup. NOTE: robots.txt has already been checked above --
@@ -587,7 +640,7 @@ class WebFetcher:
                 logger.debug("Cache hit: {url}", url=url)
                 cached["correlation_id"] = cid
                 cached["from_cache"] = True
-                return FetchResult(**cached)
+                return self._record_fetch_outcome(FetchResult(**cached))
 
         # Politeness layer: per-host rate limit (may sleep).
         #
@@ -616,25 +669,34 @@ class WebFetcher:
             # Key matches the lookup above (session-namespaced, C-3).
             if self._cache is not None and result.status == FetchStatus.SUCCESS:
                 await self._cache.set(cache_key, result.model_dump(mode="json"))
-            return result
+            # v1.7.0 (Wave 4A): record the success/blocked/etc. outcome AND
+            # the bytes/ttfb distributions on the path that actually
+            # navigated. Counters only -- _do_fetch already finalized the
+            # result; we observe here so the no-op fast paths above don't pay.
+            self._observe_fetch_payload(result)
+            return self._record_fetch_outcome(result)
         except NonRetryableHTTPError as e:
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status_code=e.status_code,
-                status=FetchStatus.HTTP_ERROR,
-                error_message=str(e),
-                response_time_ms=timer.elapsed_ms,
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status_code=e.status_code,
+                    status=FetchStatus.HTTP_ERROR,
+                    error_message=str(e),
+                    response_time_ms=timer.elapsed_ms,
+                    correlation_id=cid,
+                )
             )
         except PlaywrightTimeout:
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.TIMEOUT,
-                error_message="Navigation timed out",
-                response_time_ms=timer.elapsed_ms,
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.TIMEOUT,
+                    error_message="Navigation timed out",
+                    response_time_ms=timer.elapsed_ms,
+                    correlation_id=cid,
+                )
             )
         except Exception as e:
             error_msg = str(e)
@@ -643,24 +705,28 @@ class WebFetcher:
                     "URL triggered a download: {url} (use agent.download() instead)",
                     url=url,
                 )
-                return FetchResult(
+                return self._record_fetch_outcome(
+                    FetchResult(
+                        url=url,
+                        final_url=url,
+                        status=FetchStatus.NETWORK_ERROR,
+                        error_message=(
+                            f"URL triggered a file download. "
+                            f"Use agent.download('{url}') instead of fetch."
+                        ),
+                        response_time_ms=timer.elapsed_ms,
+                        correlation_id=cid,
+                    )
+                )
+            return self._record_fetch_outcome(
+                FetchResult(
                     url=url,
                     final_url=url,
                     status=FetchStatus.NETWORK_ERROR,
-                    error_message=(
-                        f"URL triggered a file download. "
-                        f"Use agent.download('{url}') instead of fetch."
-                    ),
+                    error_message=error_msg,
                     response_time_ms=timer.elapsed_ms,
                     correlation_id=cid,
                 )
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.NETWORK_ERROR,
-                error_message=error_msg,
-                response_time_ms=timer.elapsed_ms,
-                correlation_id=cid,
             )
 
     async def _do_fetch(
@@ -1535,21 +1601,25 @@ class WebFetcher:
 
         if not check_domain_allowed(url, self._config.safety):
             host = urlparse(url).hostname or ""
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.BLOCKED,
-                error_message=f"Domain not allowed by SafetyConfig: {host}",
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.BLOCKED,
+                    error_message=f"Domain not allowed by SafetyConfig: {host}",
+                    correlation_id=cid,
+                )
             )
 
         if self._robots is not None and not await self._robots.is_allowed(url):
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.BLOCKED,
-                error_message="robots.txt disallows this URL for binary fetch",
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.BLOCKED,
+                    error_message="robots.txt disallows this URL for binary fetch",
+                    correlation_id=cid,
+                )
             )
 
         if self._rate_limiter is not None:
@@ -1627,29 +1697,33 @@ class WebFetcher:
                         if getattr(safety, "block_private_ips", False):
                             peer_ip = httpx_peer_ip(resp)
                             if peer_ip and is_private_address(peer_ip):
-                                return FetchResult(
-                                    url=url,
-                                    final_url=str(resp.url),
-                                    status=FetchStatus.BLOCKED,
-                                    error_message=(
-                                        f"Binary fetch connected to a private/loopback/"
-                                        f"link-local peer ({peer_ip}) for {url} "
-                                        f"(post-connect DNS-rebinding guard)"
-                                    ),
-                                    response_time_ms=timer.elapsed_ms,
-                                    correlation_id=cid,
+                                return self._record_fetch_outcome(
+                                    FetchResult(
+                                        url=url,
+                                        final_url=str(resp.url),
+                                        status=FetchStatus.BLOCKED,
+                                        error_message=(
+                                            f"Binary fetch connected to a private/loopback/"
+                                            f"link-local peer ({peer_ip}) for {url} "
+                                            f"(post-connect DNS-rebinding guard)"
+                                        ),
+                                        response_time_ms=timer.elapsed_ms,
+                                        correlation_id=cid,
+                                    )
                                 )
                         final_url = str(resp.url)
                         if final_url != url and not check_domain_allowed(
                             final_url, self._config.safety
                         ):
-                            return FetchResult(
-                                url=url,
-                                final_url=final_url,
-                                status=FetchStatus.BLOCKED,
-                                error_message=f"Redirected to disallowed URL: {final_url}",
-                                response_time_ms=timer.elapsed_ms,
-                                correlation_id=cid,
+                            return self._record_fetch_outcome(
+                                FetchResult(
+                                    url=url,
+                                    final_url=final_url,
+                                    status=FetchStatus.BLOCKED,
+                                    error_message=f"Redirected to disallowed URL: {final_url}",
+                                    response_time_ms=timer.elapsed_ms,
+                                    correlation_id=cid,
+                                )
                             )
                         if resp.status_code == 429:
                             # v1.6.12: signal the rate limiter so the
@@ -1660,31 +1734,35 @@ class WebFetcher:
                             # -- the caller decides whether to retry.
                             host = urlparse(url).hostname or ""
                             retry_after = self._signal_429(resp, url, host)
-                            return FetchResult(
-                                url=url,
-                                final_url=final_url,
-                                status_code=resp.status_code,
-                                status=FetchStatus.HTTP_ERROR,
-                                error_message=(
-                                    "HTTP 429 Too Many Requests"
-                                    + (
-                                        f" (Retry-After: {retry_after}s)"
-                                        if retry_after is not None
-                                        else ""
-                                    )
-                                ),
-                                response_time_ms=timer.elapsed_ms,
-                                correlation_id=cid,
+                            return self._record_fetch_outcome(
+                                FetchResult(
+                                    url=url,
+                                    final_url=final_url,
+                                    status_code=resp.status_code,
+                                    status=FetchStatus.HTTP_ERROR,
+                                    error_message=(
+                                        "HTTP 429 Too Many Requests"
+                                        + (
+                                            f" (Retry-After: {retry_after}s)"
+                                            if retry_after is not None
+                                            else ""
+                                        )
+                                    ),
+                                    response_time_ms=timer.elapsed_ms,
+                                    correlation_id=cid,
+                                )
                             )
                         if resp.status_code >= 400:
-                            return FetchResult(
-                                url=url,
-                                final_url=final_url,
-                                status_code=resp.status_code,
-                                status=FetchStatus.HTTP_ERROR,
-                                error_message=f"HTTP {resp.status_code}",
-                                response_time_ms=timer.elapsed_ms,
-                                correlation_id=cid,
+                            return self._record_fetch_outcome(
+                                FetchResult(
+                                    url=url,
+                                    final_url=final_url,
+                                    status_code=resp.status_code,
+                                    status=FetchStatus.HTTP_ERROR,
+                                    error_message=f"HTTP {resp.status_code}",
+                                    response_time_ms=timer.elapsed_ms,
+                                    correlation_id=cid,
+                                )
                             )
                         # Stream chunks with running cap. We can't trust
                         # Content-Length (some servers omit / lie); enforce
@@ -1694,60 +1772,74 @@ class WebFetcher:
                         async for chunk in resp.aiter_bytes(chunk_size=8192):
                             total += len(chunk)
                             if total > max_bytes:
-                                return FetchResult(
-                                    url=url,
-                                    final_url=final_url,
-                                    status_code=resp.status_code,
-                                    status=FetchStatus.HTTP_ERROR,
-                                    error_message=(
-                                        f"Binary exceeded "
-                                        f"{self._config.download.max_file_size_mb} MB cap "
-                                        f"(stopped at {total} bytes)"
-                                    ),
-                                    response_time_ms=timer.elapsed_ms,
-                                    correlation_id=cid,
+                                return self._record_fetch_outcome(
+                                    FetchResult(
+                                        url=url,
+                                        final_url=final_url,
+                                        status_code=resp.status_code,
+                                        status=FetchStatus.HTTP_ERROR,
+                                        error_message=(
+                                            f"Binary exceeded "
+                                            f"{self._config.download.max_file_size_mb} MB cap "
+                                            f"(stopped at {total} bytes)"
+                                        ),
+                                        response_time_ms=timer.elapsed_ms,
+                                        correlation_id=cid,
+                                    )
                                 )
                             chunks.append(chunk)
-                        return FetchResult(
-                            url=url,
-                            final_url=final_url,
-                            status_code=resp.status_code,
-                            status=FetchStatus.SUCCESS,
-                            binary=b"".join(chunks),
-                            content_type=resp.headers.get("content-type"),
-                            response_time_ms=timer.elapsed_ms,
-                            correlation_id=cid,
+                        # v1.7.0 (Wave 4A): record the bytes downloaded on the
+                        # binary success path (the HTML path observes via
+                        # _observe_fetch_payload; binary has the exact size).
+                        self._metrics.observe("bytes_downloaded", float(total))
+                        return self._record_fetch_outcome(
+                            FetchResult(
+                                url=url,
+                                final_url=final_url,
+                                status_code=resp.status_code,
+                                status=FetchStatus.SUCCESS,
+                                binary=b"".join(chunks),
+                                content_type=resp.headers.get("content-type"),
+                                response_time_ms=timer.elapsed_ms,
+                                correlation_id=cid,
+                            )
                         )
         except NavigationError as exc:
             # v1.6.16 FB-1: a redirect to a disallowed/private host raised
             # by the ``_check_redirect`` event hook above is a security stop,
             # not a transport failure -- surface it as BLOCKED (matching the
             # final-URL / peer-IP guards) rather than NETWORK_ERROR.
-            return FetchResult(
-                url=url,
-                final_url=getattr(exc, "url", "") or url,
-                status=FetchStatus.BLOCKED,
-                error_message=str(exc),
-                response_time_ms=timer.elapsed_ms,
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=getattr(exc, "url", "") or url,
+                    status=FetchStatus.BLOCKED,
+                    error_message=str(exc),
+                    response_time_ms=timer.elapsed_ms,
+                    correlation_id=cid,
+                )
             )
         except httpx.TimeoutException:
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.TIMEOUT,
-                error_message="Binary fetch timed out",
-                response_time_ms=timer.elapsed_ms,
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.TIMEOUT,
+                    error_message="Binary fetch timed out",
+                    response_time_ms=timer.elapsed_ms,
+                    correlation_id=cid,
+                )
             )
         except Exception as exc:
-            return FetchResult(
-                url=url,
-                final_url=url,
-                status=FetchStatus.NETWORK_ERROR,
-                error_message=str(exc),
-                response_time_ms=timer.elapsed_ms,
-                correlation_id=cid,
+            return self._record_fetch_outcome(
+                FetchResult(
+                    url=url,
+                    final_url=url,
+                    status=FetchStatus.NETWORK_ERROR,
+                    error_message=str(exc),
+                    response_time_ms=timer.elapsed_ms,
+                    correlation_id=cid,
+                )
             )
 
 
