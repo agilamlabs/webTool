@@ -804,10 +804,6 @@ class BrowserManager:
                 self._crashed = False
                 self._generation += 1
                 self._started = True
-                # v1.7.0 (Wave 4A): count the local browser bring-up. Placed
-                # after _started flips so a launch that threw (caught below
-                # and rolled back) is never counted as a successful launch.
-                self._metrics.incr("browser_launch")
                 self._wire_crash_handlers()
                 logger.info(
                     "Browser launched (headless={h}, isolation={iso}, cdp={cdp})",
@@ -856,6 +852,12 @@ class BrowserManager:
                 # v1.7.0: best-effort removal of orphaned ephemeral
                 # profiles left behind by crashed runs. Never raises.
                 await self._sweep_orphan_profiles()
+                # v1.7.0 (Wave 4A): count the local bring-up only after ALL
+                # launch work (CDP discovery, token issuance, profile sweep)
+                # has succeeded -- so a launch that threw and rolled back via
+                # the except below is never counted, regardless of which
+                # post-launch step fails.
+                self._metrics.incr("browser_launch")
             except Exception as exc:
                 # Roll back partial state and re-raise as BrowserError so callers
                 # can `except BrowserError` reliably.
