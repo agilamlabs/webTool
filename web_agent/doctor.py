@@ -21,6 +21,7 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -341,6 +342,105 @@ async def _check_config_file_parse(_cfg: AppConfig) -> DoctorCheck:
     )
 
 
+def _detect_container() -> str | None:
+    """Best-effort container detection WITHOUT launching anything.
+
+    Returns a short marker string naming the evidence
+    (``"/.dockerenv"`` / ``"cgroup"`` / ``"KUBERNETES_SERVICE_HOST"``)
+    or ``None`` when no container signal is present. Mirrors the
+    heuristics ``browser_manager._should_disable_chromium_sandbox`` uses
+    so the doctor's reported sandbox state matches the launch path.
+    """
+    with suppress(OSError):
+        if Path("/.dockerenv").exists():
+            return "/.dockerenv"
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        return "KUBERNETES_SERVICE_HOST"
+    with suppress(OSError):
+        cgroup = Path("/proc/1/cgroup")
+        if cgroup.exists():
+            text = cgroup.read_text(encoding="utf-8", errors="replace")
+            if any(marker in text for marker in ("docker", "kubepods", "containerd", "podman")):
+                return "cgroup"
+    return None
+
+
+async def _check_not_running_as_root(_cfg: AppConfig) -> DoctorCheck:
+    """Warn when the process runs as root (euid == 0).
+
+    Relevant to the container-hardening story: the shipped Docker image
+    runs as a non-root user. Running the toolkit (especially the
+    long-lived MCP server) as root needlessly widens the blast radius of
+    any browser/renderer compromise. This is a ``warn``, not a ``fail`` --
+    root still works.
+
+    ``os.geteuid`` does not exist on Windows, so the probe reports
+    ``skip`` (not applicable) there rather than crashing.
+    """
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return DoctorCheck(
+            name="not_running_as_root",
+            status="skip",
+            message="euid check not applicable on this platform (no os.geteuid)",
+        )
+    euid = geteuid()
+    if euid == 0:
+        return DoctorCheck(
+            name="not_running_as_root",
+            status="warn",
+            message=(
+                "Running as root (euid=0). Prefer a non-root user -- the shipped "
+                "Docker image runs as a non-root user. See docker/README.md."
+            ),
+        )
+    return DoctorCheck(
+        name="not_running_as_root",
+        status="ok",
+        message=f"Running as non-root (euid={euid})",
+    )
+
+
+async def _check_container_sandbox(cfg: AppConfig) -> DoctorCheck:
+    """Informational: report container detection + Chromium sandbox state.
+
+    Cross-references the configured ``browser.disable_chromium_sandbox``
+    with the same container heuristic the launch path uses, so an
+    operator can see at a glance whether Chromium will run with its
+    setuid sandbox on or off. Outside a container this is a no-op
+    ``skip``. Inside one it is ``ok`` (informational) -- the toolkit
+    auto-falls-back to ``--no-sandbox`` in containers by design, and the
+    more-secure cap-preserving alternative is documented in
+    docker/README.md. Never launches a browser.
+    """
+    marker = _detect_container()
+    cfg_value = getattr(cfg.browser, "disable_chromium_sandbox", None)
+
+    if cfg_value is True:
+        sandbox = "off (--no-sandbox; browser.disable_chromium_sandbox=true)"
+    elif cfg_value is False:
+        sandbox = "on (browser.disable_chromium_sandbox=false)"
+    elif marker is not None:
+        sandbox = "off (--no-sandbox; container auto-detected)"
+    else:
+        sandbox = "on (default)"
+
+    if marker is None:
+        return DoctorCheck(
+            name="container_sandbox",
+            status="skip",
+            message=f"No container detected; Chromium sandbox {sandbox}",
+        )
+    return DoctorCheck(
+        name="container_sandbox",
+        status="ok",
+        message=(
+            f"Container detected ({marker}); Chromium sandbox {sandbox}. "
+            "See docker/README.md for the cap-preserving secure-run option."
+        ),
+    )
+
+
 # ----------------------------------------------------------------------
 # Aggregator
 # ----------------------------------------------------------------------
@@ -421,6 +521,8 @@ async def run_doctor(config: AppConfig, *, quick: bool = False) -> DoctorReport:
     checks.append(await _timed("network_connectivity", _check_network_connectivity, config))
     checks.append(await _timed("robots_rate_sanity", _check_robots_rate_sanity, config))
     checks.append(await _timed("config_file_parse", _check_config_file_parse, config))
+    checks.append(await _timed("not_running_as_root", _check_not_running_as_root, config))
+    checks.append(await _timed("container_sandbox", _check_container_sandbox, config))
 
     total_ms = (time.perf_counter() - start) * 1000
     summary = _summarize(checks)

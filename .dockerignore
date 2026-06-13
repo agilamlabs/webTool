@@ -1,0 +1,70 @@
+# Lean Docker build context for docker/Dockerfile.
+# Only pyproject.toml, README.md (build metadata), LICENSE, and the
+# web_agent/ package are needed to `pip install .` -- everything below is
+# excluded so the build context stays small and cache-friendly.
+
+# Version control
+.git
+.gitignore
+.github
+
+# Tests (not installed; never needed in the runtime image)
+tests
+_verify_repro.py
+**/conftest.py
+
+# Python caches / build artifacts
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+**/*.egg-info
+.eggs
+build
+dist
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+htmlcov
+.tox
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# Toolkit runtime output (must never seed the image)
+output
+downloads
+screenshots
+debug
+cache
+audit.jsonl
+.webtool
+.webtool-skills
+.webtool-workspace
+.webtool-audit
+
+# Editor / OS cruft
+.vscode
+.idea
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docs + meta we don't need inside the image.
+# NOTE: README.md is intentionally NOT ignored -- pyproject's
+# build backend reads it as the long_description at install time.
+AGENTS.md
+CHANGELOG.md
+SECURITY.md
+CONTRIBUTING.md
+config.example.yaml
+sample_data
+
+# Docker bits themselves (the Dockerfile copies from the repo, not from
+# a nested docker/ context; keeping these out avoids a self-referential layer).
+docker
+.dockerignore

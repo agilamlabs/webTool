@@ -68,17 +68,42 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 >   page markers + `page_count`; scanned / image-only PDFs return an actionable
 >   "OCR required" error instead of a bare empty success. `pdfplumber` added to the
 >   `[binary]` extra.
+> * **Production observability + metrics** (new `web_agent/metrics.py`) — an
+>   in-process `MetricsRegistry` (counters + cheap count/sum/min/max
+>   distributions, a per-metric label-cardinality cap so a hostile label can't
+>   grow the registry unbounded, `disabled` = near-zero-cost no-op) instrumented
+>   at outcome points across fetch / search / browser-lifecycle hot paths. New
+>   `Agent.metrics() -> MetricsSnapshot`, MCP `web_metrics`, `MetricsConfig`
+>   (`WEB_AGENT_METRICS__`). Plus log hygiene: the MCP server now honours
+>   `config.log_level` and both MCP + CLI log formats surface the correlation id
+>   (`{extra[cid]}`).
+> * **Non-root Docker image + MCP container** — `docker/Dockerfile` on the
+>   official Playwright Python base (Chromium + deps + fonts baked in), running as
+>   the non-root `pwuser`, with a `HEALTHCHECK` (`web-agent doctor --quick`) and
+>   `ENTRYPOINT web-agent-mcp`; plus `docker/docker-compose.yml`,
+>   `docker/README.md`, and a `.dockerignore`. Two new `doctor` checks
+>   (`not_running_as_root`, `container_sandbox`). The image builds + runs verified.
+> * **Set-of-marks observe → act targeting** — `observe()` now returns a bounded,
+>   numbered list of **interactive** elements on `ObserveResult.elements` (each
+>   `InteractiveElement` carries a `ref`, role, accessible name, tag, enabled /
+>   visible, `bbox`, and a selector), and an action can target one by `ref` via a
+>   new `LocatorSpec(ref=...)` mode — so the model picks "element #N from what I
+>   just observed" instead of guessing a CSS selector. Reuses every existing
+>   locator + safety gate; the ref pattern is injection-proof. New
+>   `AutomationConfig.observe_max_elements` / `observe_tag_refs`.
 >
-> Adds **8 new MCP tools** (server now exposes **~47**), **12 new public exports**
+> Adds **9 new MCP tools** (server now exposes **~48**), **16 new public exports**
 > (`ChallengeInfo`, `StorageStateResult`, `ProxyConfig`, `SearchEngine`,
-> `SearchOutcome`, `InjectionReport`, `CollectedPage`, `CollectionResult`, and the
-> four injection helpers → **125** total), and grows the suite to **1423 passing**
-> (28 `integration` deselected, opt-in). Adversarial close-out reviews (a
-> 4-dimension review of the ~7,400-line diff, plus a Wave 3 injection +
-> collection/PDF pass) found **no critical/high issues**. **Behaviour
-> changes:** bot-challenge pages return `BLOCKED` (was SUCCESS); MCP content is
-> single-representation + capped; a bare `pytest` run now excludes integration
-> tests (`-m integration` to opt in). See [CHANGELOG.md](CHANGELOG.md#170---2026-06-13).
+> `SearchOutcome`, `InjectionReport`, `CollectedPage`, `CollectionResult`, the
+> four injection helpers, plus `MetricsRegistry`, `MetricsSnapshot`,
+> `MetricsConfig`, `InteractiveElement` → **129** total), and grows the suite to
+> **1506 passing** (28 `integration` deselected, opt-in). Adversarial close-out
+> reviews (a 4-dimension review of the ~7,400-line diff, a Wave 3 injection +
+> collection/PDF pass, and a Wave 4 observability / Docker / a11y-targeting pass)
+> found **no critical/high issues**. **Behaviour changes:** bot-challenge pages
+> return `BLOCKED` (was SUCCESS); MCP content is single-representation + capped; a
+> bare `pytest` run now excludes integration tests (`-m integration` to opt in).
+> See [CHANGELOG.md](CHANGELOG.md#170---2026-06-13).
 >
 > **What's new in 1.6.16** — *Review-hardening — 32 findings from a
 > full-codebase brutal review, adversarially verified.* Closes SSRF holes in
@@ -384,6 +409,7 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 - **Browser Sessions** — Persistent named contexts retain cookies/login across multi-call workflows.
 - **Tab Management** (v1.6.6) — `agent.list_tabs / new_tab / switch_tab / close_tab`. Popups auto-register without stealing focus.
 - **Observe Mode** (v1.6.6) — `Agent.observe()` returns screenshot path + viewport + page size + DPR + optional ARIA snapshot. Powers observe → act → verify loops.
+- **Set-of-Marks Targeting** (v1.7.0) — `observe()` also returns a bounded, numbered list of interactive elements on `ObserveResult.elements` (`ref` / role / name / tag / enabled / visible / `bbox` / selector); an action targets one by `ref` via `LocatorSpec(ref="e3")` instead of guessing a CSS selector. Reuses every locator + safety gate; the ref pattern is injection-proof.
 - **8 Top-Level Interaction Methods** (v1.6.7) — `handle_dialog`, `select_dropdown`, `upload_file`, `drag_and_drop`, `scroll_until_text`, `click_inside_iframe`, `click_shadow_dom`, `print_page_as_pdf`.
 
 ### Browser-control backends (v1.6.6 / v1.6.8)
@@ -412,13 +438,15 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 - **Disk Cache** — TTL cache for fetch + search results, LRU-by-mtime eviction (off by default).
 - **Retry Profiles** — Declarative `fast` / `balanced` / `paranoid` policies.
 - **Debug Mode** — Auto-capture HTML / screenshot / error JSON on failures.
-- **Correlation IDs** — Single-request tracing across all subsystems via auto-injected log fields.
+- **Correlation IDs** — Single-request tracing across all subsystems via auto-injected log fields (now surfaced in the MCP + CLI log formats via `{extra[cid]}`, v1.7.0).
+- **In-Process Metrics** (v1.7.0) — `MetricsRegistry` counters + count/sum/min/max distributions instrumented across fetch / search / browser-lifecycle hot paths, with a per-metric label-cardinality cap. `Agent.metrics() -> MetricsSnapshot`; MCP `web_metrics`. Enabled by default; `disabled` is a near-zero-cost no-op.
 - **Anti-Detection** — playwright-stealth, user-agent rotation, resource blocking.
 - **Structured Output** — All results are Pydantic v2 models serializable to JSON.
 
 ### Integration
 - **MCP Server** — search, fetch, download, browser automation, sessions, tabs, CDP, diagnostics, skills, and recipes exposed to Claude Desktop, Claude Code, Cursor, OpenAI Codex, OpenClaw, and any other MCP-compatible AI client.
 - **CLI** — `web-agent search / fetch / download / interact / screenshot / observe / skills / doctor / replay`.
+- **Docker Container** (v1.7.0) — `docker/Dockerfile` on the official Playwright Python base (Chromium + deps + fonts baked in), runs as the non-root `pwuser`, with a `HEALTHCHECK` and an `ENTRYPOINT` that launches the MCP server. See [`docker/README.md`](docker/README.md).
 
 ## Installation
 
@@ -656,6 +684,8 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `automation` | `scroll_stable_rounds` | `2` | Rounds `scrollHeight` must stay stable before `scroll_to_bottom` declares exhaustion |
 | `automation` | `scroll_settle_ms` | `1000` | Settle delay (ms) between scroll rounds |
 | `automation` | `pagination_next_texts` | (vocabulary) | Anchor-text vocabulary the `next_link` strategy matches (next / older / more / load-more / chevron) |
+| `automation` | `observe_max_elements` | `100` | Cap on interactive elements returned in `ObserveResult.elements` (`elements_truncated` flags overflow) |
+| `automation` | `observe_tag_refs` | `true` | Stamp a session-scoped `data-webtool-ref` per observed element so `LocatorSpec(ref=...)` can target it |
 | `browser` | `stealth_enabled` | `true` | Apply playwright-stealth per context |
 | `browser` | `auto_relaunch` | `true` | Transparently relaunch Chromium on disconnect/crash |
 | `browser` | `relaunch_max_attempts` | `3` | Bounded relaunch attempts |
@@ -669,6 +699,8 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `proxy` | `username` | `None` | Proxy auth username. Env `WEB_AGENT_PROXY__USERNAME` |
 | `proxy` | `password` | `None` | Proxy auth password. Env `WEB_AGENT_PROXY__PASSWORD` |
 | `proxy` | `bypass` | `None` | Comma-separated no-proxy hosts. Env `WEB_AGENT_PROXY__BYPASS` |
+| `metrics` | `enabled` | `true` | In-process `MetricsRegistry` on/off; disabled is a near-zero-cost no-op. Env `WEB_AGENT_METRICS__ENABLED` |
+| `metrics` | `max_label_cardinality` | `200` | Per-metric distinct-label cap; overflow folds into an `_other` bucket. Env `WEB_AGENT_METRICS__MAX_LABEL_CARDINALITY` |
 
 **Safety** (additional v1.6.5+ knobs):
 
@@ -756,6 +788,7 @@ class Agent:
     async def import_session_state(filename, *, name=None) -> StorageStateResult         # rehydrate in a later process
     async def scroll_to_bottom(*, session_id, tab_id=None) -> ActionResult              # exhaust lazy/infinite-scroll content
     async def collect_across_pages(url, *, strategy="next_link", max_pages=None, session_id=None) -> CollectionResult  # walk paginated listings
+    def metrics() -> MetricsSnapshot                                                     # in-process counters + distributions snapshot
 
     # --- Output ---
     async def save_results(result, output_path=None) -> Path
@@ -1343,7 +1376,7 @@ python -m web_agent serve-mcp
 
 The server uses stdio transport -- it's invoked by the MCP client, not run standalone.
 
-### Exposed Tools (~47 total)
+### Exposed Tools (~48 total)
 
 **Single-shot pipeline tools** — one URL or query, one result:
 
@@ -1401,8 +1434,9 @@ Content-returning tools (`web_fetch`, `web_search`, `web_search_best`, `web_rese
 
 | Tool | Description |
 |------|-------------|
-| `web_observe` | Screenshot + viewport + page-size + DPR + optional ARIA snapshot |
+| `web_observe` | Screenshot + viewport + page-size + DPR + optional ARIA snapshot; also returns a numbered list of interactive `elements` for the act-by-ref loop (`{"ref":"e3"}` as a selector, v1.7.0) |
 | `web_doctor` | Run 14 capability probes; returns `DoctorReport` |
+| `web_metrics` | Snapshot in-process counters + distributions (`MetricsSnapshot`, v1.7.0) |
 | `web_get_cdp_endpoint` | Return CDP ws:// URL when `cdp_enabled=True` |
 | `web_get_remote_cdp_url` | Return ws:// URL when `backend="remote_cdp"` |
 | `web_list_traces` | Session-ids of replay traces under `diagnostics.trace_dir` |
@@ -1452,7 +1486,7 @@ Add:
 }
 ```
 
-Restart Claude Desktop. All ~47 tools should appear in the tool picker.
+Restart Claude Desktop. All ~48 tools should appear in the tool picker.
 
 ### Claude Code Setup
 
@@ -1574,7 +1608,7 @@ WEB_AGENT_CACHE__ENABLED = "true"
 WEB_AGENT_CACHE__CACHE_DIR = "/var/cache/openclaw/web_agent"
 ```
 
-OpenClaw will auto-discover all ~47 tools (`web_search` / `web_search_links`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the recipes including `web_fill_form_and_extract` and `web_collect_pages`, the 5 session-management tools, plus the tab / coordinate / scroll / observe / domain-skill / interaction-library surfaces).
+OpenClaw will auto-discover all ~48 tools (`web_search` / `web_search_links`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the recipes including `web_fill_form_and_extract` and `web_collect_pages`, the 5 session-management tools, `web_metrics`, plus the tab / coordinate / scroll / observe / domain-skill / interaction-library surfaces).
 
 **Path B: As a Python library** (for OpenClaw skills / custom hooks where you need fine control):
 
@@ -1681,16 +1715,41 @@ WebAgentError
 
 ## Docker
 
-```dockerfile
-FROM python:3.13-slim
+A production container ships under [`docker/`](docker/) — `docker/Dockerfile` is built on the official Playwright Python base image (Chromium + system deps + fonts baked in), runs as the **non-root `pwuser`**, and has a `HEALTHCHECK` (`web-agent doctor --quick`) plus an `ENTRYPOINT` that launches the MCP server. The full guide (compose, config mounts, the sandbox trade-off) is in [`docker/README.md`](docker/README.md); the self-hosted SearXNG quickstart under [`docker/searxng/`](docker/searxng/) is separate and unaffected.
 
-WORKDIR /app
-COPY . .
+Build the image:
 
-RUN pip install -e . && playwright install --with-deps chromium
-
-CMD ["python", "-m", "web_agent", "search", "example query"]
+```bash
+docker build -f docker/Dockerfile -t web-agent-toolkit:latest .
 ```
+
+Sanity-check it, run the CLI, or start the MCP server (stdio):
+
+```bash
+# Health check (the same probe the HEALTHCHECK uses)
+docker run --rm web-agent-toolkit:latest doctor --quick
+
+# One-shot CLI search
+docker run --rm web-agent-toolkit:latest search "example query"
+
+# MCP server over stdio, with a persistent workspace volume
+docker run -i -v web-agent-workspace:/workspace web-agent-toolkit:latest
+```
+
+Wire it into an MCP client (`claude_desktop_config.json` etc.):
+
+```json
+{
+  "mcpServers": {
+    "web_agent": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "-v", "web-agent-workspace:/workspace", "web-agent-toolkit:latest"]
+    }
+  }
+}
+```
+
+**Non-root + the Chromium-sandbox trade-off.** Because the container runs as `pwuser` (not root), the Chromium sandbox is auto-disabled in-container (`--no-sandbox`). To keep the sandbox on, run with `--security-opt seccomp=unconfined` / `--cap-add=SYS_ADMIN` and set `WEB_AGENT_BROWSER__DISABLE_CHROMIUM_SANDBOX=false`. `WEB_AGENT_BASE_DIR=/workspace` (a `VOLUME`) holds downloads / screenshots / traces; the `HEALTHCHECK` keeps an orchestrator honest. See [`docker/README.md`](docker/README.md) for the honest stdio-vs-service note.
 
 ## Testing
 
@@ -1711,14 +1770,15 @@ CI runs `ruff check`, `ruff format --check`, `mypy`, and the unit-test job on Py
 ## Project Structure
 
 ```
-web_agent/                       # 32 modules, mypy strict-clean
-  __init__.py                    # v1.7.0 -- 125 public exports
+web_agent/                       # 33 modules, mypy strict-clean
+  __init__.py                    # v1.7.0 -- 129 public exports
   py.typed                       # PEP 561 marker
   exceptions.py                  # WebAgentError hierarchy
-  config.py                      # AppConfig + 13 sub-configs incl. ProxyConfig (programmatic / env / YAML)
+  config.py                      # AppConfig + 15 sub-configs incl. ProxyConfig + MetricsConfig (programmatic / env / YAML)
   models.py                      # 40+ Pydantic v2 models (single source of wire shape)
   utils.py                       # async_retry, safe_join_path, is_private_address, BudgetTracker
-  correlation.py                 # ContextVar correlation IDs + loguru patcher
+  correlation.py                 # ContextVar correlation IDs + loguru patcher (surfaced as {extra[cid]}, v1.7.0)
+  metrics.py                     # In-process MetricsRegistry: counters + distributions, label-cardinality cap (v1.7.0)
   debug.py                       # DebugCapture: HTML + screenshot + JSON on failure
   audit.py                       # Append-only JSONL audit log of every public Agent call (opt-in)
   cache.py                       # Disk-backed TTL cache for fetch + search (opt-in)
@@ -1743,10 +1803,11 @@ web_agent/                       # 32 modules, mypy strict-clean
   content_extractor.py           # trafilatura -> BS4 -> raw; PDF (pdfplumber -> pypdf) + tables / XLSX / DOCX / CSV via [binary] (v1.7.0)
   downloader.py                  # Three-strategy file/page download with safety + sessions
   recipes.py                     # search_and_open_best, find_and_download, web_research, fill_form_and_extract, collect_across_pages (v1.7.0)
-  mcp_server.py                  # FastMCP server -- ~47 tools
+  mcp_server.py                  # FastMCP server -- ~48 tools (honours log_level + correlation id, v1.7.0)
   main.py                        # CLI: search / fetch / download / interact / screenshot / observe / skills / doctor / replay
+docker/                          # Non-root Playwright-based image: Dockerfile + docker-compose.yml + README.md + .dockerignore (v1.7.0)
 docker/searxng/                  # Self-hosted SearXNG quickstart (compose + tuned settings)
-tests/                           # 56 test files; mirrors the package layout (28 integration-marked, opt-in)
+tests/                           # 59 test files; mirrors the package layout (28 integration-marked, opt-in)
 config.example.yaml              # Reference configuration (annotated)
 sample_data/                     # Test fixtures and example action sequences
 ```

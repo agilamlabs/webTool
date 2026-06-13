@@ -1,0 +1,97 @@
+# docker-compose for the web_agent MCP server container.
+#
+# IMPORTANT -- read this before assuming it's a web service:
+# The web_agent MCP server speaks the Model Context Protocol over STDIO
+# (`mcp.run(transport="stdio")`). It is NOT an HTTP/network daemon: there
+# are no ports to publish, and an MCP *client* (Claude Desktop / Claude
+# Code / Cursor) is what actually spawns and talks to the process over
+# stdin/stdout. A long-running `docker compose up` of a stdio server with
+# nothing attached to its stdin will simply sit idle (or exit at EOF).
+#
+# So this compose file is most useful as:
+#   1. A reproducible BUILD + config surface (volumes, env, caps) you can
+#      reference, then point an MCP client at via `docker run -i` (see
+#      docker/README.md "Wire into an MCP client").
+#   2. `docker compose run --rm web-agent-mcp` for a one-shot interactive
+#      attach, or with an overridden command to run the CLI:
+#        docker compose run --rm web-agent-mcp web-agent doctor
+#        docker compose run --rm web-agent-mcp web-agent search "query"
+#
+# It is deliberately NOT given a `restart: always` for the default stdio
+# server (restarting a client-driven stdio process in a loop is wrong).
+
+services:
+  web-agent-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: web-agent-toolkit:latest
+    # Keep stdin open + allocate a TTY so an interactive `compose run`
+    # can speak MCP over stdio. (Harmless for one-shot CLI overrides.)
+    stdin_open: true
+    tty: true
+
+    # Persist all runtime output (downloads / screenshots / debug / output
+    # / .webtool*) on the host. WEB_AGENT_BASE_DIR=/workspace (set in the
+    # image) resolves every relative output dir under here.
+    volumes:
+      - web-agent-workspace:/workspace
+      # Mount a host config directory read-only (optional). Pair with the
+      # WEB_AGENT_CONFIG env var below to load a YAML config.
+      # - ./config:/config:ro
+
+    environment:
+      # --- Logging ---
+      WEB_AGENT_LOG_LEVEL: INFO
+
+      # --- Config file (optional) ---
+      # Point at a YAML mounted via the ./config volume above. The doctor
+      # `config_file_parse` check validates it on `web-agent doctor`.
+      # WEB_AGENT_CONFIG: /config/web_agent.yaml
+
+      # --- Proxy (optional; inactive unless WEB_AGENT_PROXY__SERVER is set) ---
+      # WEB_AGENT_PROXY__SERVER: "http://proxy.internal:3128"
+      # WEB_AGENT_PROXY__USERNAME: "proxyuser"
+      # WEB_AGENT_PROXY__PASSWORD: "proxypass"
+      # WEB_AGENT_PROXY__BYPASS: "localhost,127.0.0.1,.internal"
+
+      # --- Any other WEB_AGENT_* override works here, e.g. ---
+      # WEB_AGENT_BROWSER__HEADLESS: "true"
+      # WEB_AGENT_SEARCH__MAX_RESULTS: "20"
+      # WEB_AGENT_SAFETY__RESPECT_ROBOTS_TXT: "true"
+
+    # Mirror the image HEALTHCHECK (doctor --quick: <1s, no browser launch,
+    # exits non-zero if Chromium is missing).
+    healthcheck:
+      test: ["CMD", "web-agent", "doctor", "--quick"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+    # ------------------------------------------------------------------
+    # Chromium sandbox trade-off (see docker/README.md for the full story)
+    # ------------------------------------------------------------------
+    # The image runs as NON-ROOT (pwuser). A non-root container cannot use
+    # Chromium's setuid sandbox without extra kernel capability, so the app
+    # auto-detects the container (/.dockerenv) and falls back to
+    # `--no-sandbox` out of the box -- it works with the settings as-is.
+    #
+    # To run with the Chromium sandbox PRESERVED instead of disabled,
+    # uncomment ONE of the options below AND set
+    # WEB_AGENT_BROWSER__DISABLE_CHROMIUM_SANDBOX=false in `environment:`.
+    #
+    # Option A -- Chromium's user-namespace sandbox (preferred; no SYS_ADMIN):
+    #   security_opt:
+    #     - seccomp=unconfined
+    #   # Requires the host to allow unprivileged user namespaces.
+    #
+    # Option B -- grant SYS_ADMIN (broader privilege; only if A is unavailable):
+    #   cap_add:
+    #     - SYS_ADMIN
+
+    # Default command is ENTRYPOINT ["web-agent-mcp"] from the Dockerfile.
+    # Override for the CLI, e.g.:  command: ["web-agent", "doctor"]
+
+volumes:
+  web-agent-workspace:

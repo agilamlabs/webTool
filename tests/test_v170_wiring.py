@@ -29,6 +29,8 @@ from web_agent.models import (
     ActionResult,
     ActionStatus,
     CollectionResult,
+    MetricsSnapshot,
+    ObserveResult,
     SearchResponse,
     SessionInfo,
     StorageStateResult,
@@ -39,6 +41,23 @@ def _ctx_for(agent: MagicMock) -> MagicMock:
     ctx = MagicMock()
     ctx.request_context.lifespan_context = {"agent": agent}
     return ctx
+
+
+def _observe_result(**overrides) -> ObserveResult:
+    """A minimal valid ObserveResult (all the required dimension fields)."""
+    base: dict[str, object] = {
+        "url": "https://e/x",
+        "screenshot_path": "/tmp/s.png",
+        "viewport_width": 1280,
+        "viewport_height": 720,
+        "page_width": 1280,
+        "page_height": 2000,
+        "scroll_x": 0,
+        "scroll_y": 0,
+        "device_pixel_ratio": 1.0,
+    }
+    base.update(overrides)
+    return ObserveResult(**base)
 
 
 # ----------------------------------------------------------------------
@@ -299,3 +318,76 @@ class TestMcpCollection:
         agent.scroll_to_bottom.assert_awaited_once()
         assert isinstance(out, dict)
         assert out["status"] == "success"
+
+
+# ----------------------------------------------------------------------
+# Wave 4A: metrics wiring (Agent + MCP)
+# ----------------------------------------------------------------------
+
+
+class TestMetricsWiring:
+    def test_agent_metrics_maps_registry_snapshot(self) -> None:
+        agent = _bare_agent()
+        agent._metrics = MagicMock()
+        agent._metrics.snapshot = MagicMock(
+            return_value={
+                "enabled": True,
+                "uptime_s": 12.5,
+                "counters": {"fetch_total": 3, "fetch_outcome{status=success}": 2},
+                "distributions": {"ttfb_ms": {"count": 2, "sum": 100.0, "avg": 50.0}},
+            }
+        )
+
+        snap = agent.metrics()
+
+        assert isinstance(snap, MetricsSnapshot)
+        assert snap.enabled is True
+        assert snap.counters["fetch_total"] == 3
+        assert snap.distributions["ttfb_ms"]["avg"] == 50.0
+        assert snap.uptime_s == 12.5
+
+    @pytest.mark.asyncio
+    async def test_web_metrics_calls_agent(self) -> None:
+        agent = MagicMock()
+        expected = MetricsSnapshot(enabled=True, counters={"fetch_total": 5})
+        agent.metrics = MagicMock(return_value=expected)
+
+        out = await mcp_server.web_metrics(_ctx_for(agent))
+
+        agent.metrics.assert_called_once()
+        assert out is expected
+
+
+# ----------------------------------------------------------------------
+# Wave 4C: observe set-of-marks passthrough
+# ----------------------------------------------------------------------
+
+
+class TestObserveElementsWiring:
+    @pytest.mark.asyncio
+    async def test_agent_observe_passes_include_elements(self) -> None:
+        agent = _bare_agent()
+        agent._actions = MagicMock()
+        agent._actions.observe = AsyncMock(return_value=_observe_result())
+
+        await agent.observe("https://e/x", session_id="s", include_elements=False)
+
+        _args, kwargs = agent._actions.observe.call_args
+        assert kwargs["include_elements"] is False
+
+    @pytest.mark.asyncio
+    async def test_web_observe_surfaces_elements(self) -> None:
+        agent = MagicMock()
+        agent._config = AppConfig()
+        obs = _observe_result(
+            elements=[
+                {"ref": "e1", "role": "button", "name": "Submit", "tag": "button"},
+            ],
+        )
+        agent.observe = AsyncMock(return_value=obs)
+
+        out = await mcp_server.web_observe(_ctx_for(agent), "https://e/x")
+
+        assert out["elements"][0]["ref"] == "e1"
+        _args, kwargs = agent.observe.call_args
+        assert kwargs["include_elements"] is True

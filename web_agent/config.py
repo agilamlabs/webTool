@@ -1132,6 +1132,35 @@ class AutomationConfig(BaseSettings):
         ),
     )
 
+    # v1.7.0 Wave 4C: set-of-marks observe knobs. ``observe(include_elements=True)``
+    # walks the DOM once and returns a BOUNDED, numbered list of the actionable
+    # elements in the viewport so the model targets "element #N" instead of
+    # guessing a selector. The cap stops a hostile / huge page from returning a
+    # multi-thousand-element list; the walk logs + flags
+    # (``ObserveResult.elements_truncated``) when it hits the ceiling.
+    observe_max_elements: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description=(
+            "Hard cap on the number of interactive elements observe() "
+            "enumerates. Excess elements are dropped and "
+            "ObserveResult.elements_truncated is set True (logged at WARNING)."
+        ),
+    )
+    observe_tag_refs: bool = Field(
+        default=True,
+        description=(
+            "When True (default), observe()'s enumeration stamps a "
+            'data-webtool-ref="eN" attribute on each element so it can be '
+            "targeted later via LocatorSpec(ref='eN') -- robust to dynamic "
+            "DOM but a small first-party mutation of the agent's own page. "
+            "When False, observe() still returns the elements list (with a "
+            "generated selector) but writes no attribute; ref-targeting then "
+            "relies on the generated selector instead."
+        ),
+    )
+
     # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_AUTOMATION__
     # so bare ``SCREENSHOT_DIR`` / ``STOP_ON_ERROR`` env vars can't override
     # automation settings. Nested ``WEB_AGENT_AUTOMATION__<FIELD>`` via
@@ -1860,6 +1889,60 @@ class ProxyConfig(BaseSettings):
     model_config = {"env_prefix": "WEB_AGENT_PROXY__"}
 
 
+class MetricsConfig(BaseSettings):
+    """v1.7.0 (Wave 4A): in-process observability metrics surface.
+
+    A long-running MCP daemon needs to answer "how many fetches, how many got
+    bot-walled, how many browser crashes/relaunches, which search providers
+    are blocked, what's my error rate" without grepping logs. The
+    :class:`~web_agent.metrics.MetricsRegistry` is that surface; this config
+    controls it.
+
+    The metrics are SAFE to leave on by default: counters are a single cheap
+    dict increment at outcome points only (no per-request timing scatter), and
+    the registry bounds its own size via a per-metric label-cardinality cap so
+    a hostile/high-cardinality label (per-URL host, per-correlation-id) cannot
+    grow it unbounded. When ``enabled`` is False every increment is a no-op
+    (one boolean check, no allocation) and the snapshot reports empty maps.
+
+    Env loading (matches the sub-config discipline)::
+
+        WEB_AGENT_METRICS__ENABLED=false
+        WEB_AGENT_METRICS__MAX_LABEL_CARDINALITY=500
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0 (Wave 4A): record in-process counters / distributions at "
+            "hot-path outcome points (fetch outcomes, search provider results, "
+            "browser launch/crash/relaunch). Counters are cheap and the whole "
+            "point is to have a surface, so default True. When False, every "
+            "registry increment is a no-op and the snapshot is empty."
+        ),
+    )
+    max_label_cardinality: int = Field(
+        default=200,
+        ge=1,
+        le=10000,
+        description=(
+            "v1.7.0 (Wave 4A): maximum distinct label-combinations tracked per "
+            "metric name. Once a metric reaches this many series, new "
+            "label-combos fold into a single ``_other`` overflow bucket so a "
+            "high-cardinality label (per-host / per-URL) cannot grow the "
+            "registry without bound. Raise it if you intentionally label by a "
+            "bounded, larger dimension."
+        ),
+    )
+
+    # v1.7.0 (Wave 4A): scope env-var lookup to WEB_AGENT_METRICS__ so a bare
+    # ``ENABLED`` env var can't toggle metrics, and a default ``AppConfig()``
+    # (which builds this via ``default_factory``) does not read unprefixed
+    # vars. Nested ``WEB_AGENT_METRICS__<FIELD>`` via AppConfig still works.
+    # Mirrors every other sub-config.
+    model_config = {"env_prefix": "WEB_AGENT_METRICS__"}
+
+
 class AppConfig(BaseSettings):
     """Top-level configuration for the web_agent toolkit.
 
@@ -1925,6 +2008,10 @@ class AppConfig(BaseSettings):
     # the httpx side-paths. Inactive by default (server unset -> no proxy
     # anywhere).
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
+    # v1.7.0 (Wave 4A): in-process observability metrics. Enabled by default
+    # (cheap counters at outcome points; size-bounded by a label-cardinality
+    # cap). Disable to make every registry increment a no-op.
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     # v1.6.16 deep-review fix: a Literal of loguru's level names so an unknown
     # value is rejected at config time instead of failing when logging is wired
     # (loguru's level lookup is case-sensitive / uppercase).

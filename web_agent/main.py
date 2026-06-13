@@ -46,6 +46,9 @@ def setup_logging(level: str) -> None:
         format=(
             "<green>{time:HH:mm:ss}</green> | "
             "<level>{level: <8}</level> | "
+            # v1.7.0 (Wave 4A): correlation id (set by correlation.patch_loguru;
+            # '-' outside a call scope) so CLI logs are traceable too.
+            "<magenta>{extra[cid]}</magenta> | "
             "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
             "<level>{message}</level>"
         ),

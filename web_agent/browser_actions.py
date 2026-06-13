@@ -36,6 +36,7 @@ from weakref import WeakKeyDictionary, WeakSet
 from loguru import logger
 from playwright.async_api import Dialog, Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeout
+from pydantic import ValidationError
 
 from .browser_manager import BrowserManager
 from .config import AppConfig
@@ -56,6 +57,7 @@ from .models import (
     FillInput,
     HoverInput,
     IframeClickInput,
+    InteractiveElement,
     KeyboardInput,
     LocatorSpec,
     NavigateDirection,
@@ -145,6 +147,124 @@ _ELEMENT_FROM_POINT_JS = """
 """
 
 
+# v1.7.0 Wave 4C: a set-of-marks element ref is always ``e`` + one or more
+# digits (minted by the enumeration JS below). Used to validate
+# ``LocatorSpec.ref`` before it is interpolated into a ``[data-webtool-ref]``
+# attribute selector -- a malformed value must never reach page.locator.
+_REF_PATTERN = re.compile(r"e[0-9]+")
+
+# JS snippet (set-of-marks): walk the DOM ONCE and return a bounded, numbered
+# list of the genuinely actionable elements that are VISIBLE in the viewport.
+# First-party tool instrumentation (NOT caller-supplied JS) -- gated like the
+# rest of observe()'s snapshot evaluates, i.e. allowed as internal capture, not
+# subject to safety.allow_js_evaluation (which fences EvaluateInput/wait_for
+# JS the *caller* supplies).
+#
+# Determinism: a single page.evaluate, no async, no network. ``max`` bounds the
+# returned list; ``tag`` controls whether a data-webtool-ref attribute is
+# written (set-of-marks mechanism (b)). Stale refs from a PRIOR observe are
+# cleared first so refs never accumulate or collide across calls.
+_ENUMERATE_INTERACTIVE_JS = r"""
+({ max, tag }) => {
+  const SEL = [
+    'a[href]', 'button', 'input', 'select', 'textarea',
+    '[role=button]', '[role=link]', '[role=tab]', '[role=menuitem]',
+    '[role=checkbox]', '[role=radio]', '[role=combobox]', '[role=textbox]',
+    '[role=switch]', '[role=option]', '[onclick]', '[contenteditable=""]',
+    '[contenteditable=true]',
+  ].join(',');
+
+  // Clear refs from a previous observe so eN never collides across calls.
+  if (tag) {
+    for (const old of document.querySelectorAll('[data-webtool-ref]')) {
+      old.removeAttribute('data-webtool-ref');
+    }
+  }
+
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  const seen = new Set();
+  const out = [];
+  let truncated = false;
+  let n = 0;
+
+  const roleOf = (el) => {
+    const explicit = el.getAttribute('role');
+    if (explicit) return explicit.toLowerCase();
+    const t = el.tagName.toLowerCase();
+    if (t === 'a') return 'link';
+    if (t === 'button') return 'button';
+    if (t === 'select') return 'combobox';
+    if (t === 'textarea') return 'textbox';
+    if (t === 'input') {
+      const it = (el.getAttribute('type') || 'text').toLowerCase();
+      if (it === 'checkbox') return 'checkbox';
+      if (it === 'radio') return 'radio';
+      if (it === 'button' || it === 'submit' || it === 'reset' || it === 'image')
+        return 'button';
+      return 'textbox';
+    }
+    return t;
+  };
+
+  const nameOf = (el) => {
+    const aria = el.getAttribute('aria-label');
+    if (aria && aria.trim()) return aria.trim();
+    const ph = el.getAttribute('placeholder');
+    const txt = (el.innerText || el.textContent || '').trim();
+    if (txt) return txt;
+    if (ph && ph.trim()) return ph.trim();
+    const val = (el.value || '').trim ? (el.value || '').trim() : '';
+    if (val) return val;
+    const title = el.getAttribute('title');
+    if (title && title.trim()) return title.trim();
+    return '';
+  };
+
+  for (const el of document.querySelectorAll(SEL)) {
+    if (seen.has(el)) continue;
+    seen.add(el);
+
+    const rect = el.getBoundingClientRect();
+    // Visible-first: skip zero-area and fully-offscreen elements.
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    if (rect.bottom <= 0 || rect.top >= vh) continue;
+    if (rect.right <= 0 || rect.left >= vw) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') continue;
+    if (parseFloat(style.opacity || '1') === 0) continue;
+
+    if (out.length >= max) { truncated = true; break; }
+
+    n += 1;
+    const ref = 'e' + n;
+    if (tag) el.setAttribute('data-webtool-ref', ref);
+
+    const disabled = !!(el.disabled) ||
+      el.getAttribute('aria-disabled') === 'true';
+
+    out.push({
+      ref,
+      role: roleOf(el),
+      name: nameOf(el).slice(0, 200),
+      tag: el.tagName.toLowerCase(),
+      enabled: !disabled,
+      visible: true,
+      bbox: [
+        Math.round(rect.x * 100) / 100,
+        Math.round(rect.y * 100) / 100,
+        Math.round(rect.width * 100) / 100,
+        Math.round(rect.height * 100) / 100,
+      ],
+      selector: tag ? ('[data-webtool-ref="' + ref + '"]') : null,
+    });
+  }
+
+  return { elements: out, truncated };
+}
+"""
+
+
 def _looks_like_submit(selector: SelectorLike | None) -> bool:
     """Best-effort, *advisory* heuristic: does this selector look like a
     submit button?
@@ -196,15 +316,35 @@ def _resolve_locator(page: Page, spec: SelectorLike) -> Locator:
     """Convert a CSS selector string or LocatorSpec into a Playwright Locator.
 
     Resolution priority for LocatorSpec (first non-None wins):
-        role > test_id > label > placeholder > text > selector
+        ref > role > test_id > label > placeholder > text > selector
+
+    The ``ref`` path (v1.7.0 Wave 4C set-of-marks) resolves the live
+    ``[data-webtool-ref="eN"]`` attribute that the most recent ``observe()``
+    stamped on the page. It re-resolves against the CURRENT DOM, so a stale
+    ref (element removed / page re-rendered) yields a zero-match Locator that
+    fails through the normal SelectorNotFoundError / ActionStatus.FAILED path.
 
     Raises:
-        SelectorNotFoundError: If ``spec`` is an empty LocatorSpec.
+        SelectorNotFoundError: If ``spec`` is an empty LocatorSpec, or carries
+            a ``ref`` that is not a well-formed ``eN`` token.
     """
     from .exceptions import SelectorNotFoundError
 
     if isinstance(spec, str):
         return page.locator(spec)
+
+    if spec.ref:
+        # Validate the ref shape before interpolating it into a CSS selector.
+        # observe() only ever mints ``e<digits>`` refs; anything else is a
+        # caller / prompt-injection error and must NOT reach page.locator,
+        # where a crafted value could break out of the attribute selector.
+        if not _REF_PATTERN.fullmatch(spec.ref):
+            raise SelectorNotFoundError(
+                f"LocatorSpec.ref {spec.ref!r} is malformed; expected an "
+                "observe() element ref like 'e5'.",
+                action="resolve_locator",
+            )
+        return page.locator(f'[data-webtool-ref="{spec.ref}"]')
 
     if spec.role:
         # Playwright types role as a Literal of ARIA roles; we accept any
@@ -2049,6 +2189,57 @@ class BrowserActions:
     # v1.6.6 Feature 5: observe mode
     # ------------------------------------------------------------------
 
+    async def _enumerate_interactive_elements(
+        self, page: Page
+    ) -> tuple[list[InteractiveElement], bool]:
+        """v1.7.0 Wave 4C set-of-marks: enumerate viewport-visible actionable
+        elements via a single ``page.evaluate`` DOM walk.
+
+        Bounded by ``automation.observe_max_elements`` and (when
+        ``automation.observe_tag_refs``) stamps a ``data-webtool-ref="eN"``
+        attribute on each so a later action can target it via
+        ``LocatorSpec(ref="eN")``. Returns ``(elements, truncated)``. Best
+        effort: a failed evaluate yields ``([], False)`` and logs at DEBUG --
+        observe()'s other fields still return.
+        """
+        automation = self._config.automation
+        max_elements = automation.observe_max_elements
+        tag_refs = automation.observe_tag_refs
+        try:
+            raw = await page.evaluate(
+                _ENUMERATE_INTERACTIVE_JS,
+                {"max": max_elements, "tag": tag_refs},
+            )
+        except Exception as exc:
+            logger.debug("observe element enumeration failed: {e}", e=exc)
+            return [], False
+
+        if not isinstance(raw, dict):
+            return [], False
+        raw_elements = raw.get("elements")
+        truncated = bool(raw.get("truncated"))
+        if not isinstance(raw_elements, list):
+            return [], truncated
+
+        elements: list[InteractiveElement] = []
+        for item in raw_elements:
+            if not isinstance(item, dict):
+                continue
+            try:
+                elements.append(InteractiveElement.model_validate(item))
+            except ValidationError as exc:  # pragma: no cover - defensive
+                logger.debug("observe element coercion skipped one entry: {e}", e=exc)
+
+        if truncated:
+            logger.warning(
+                "observe enumerated {n} interactive elements; truncated at "
+                "automation.observe_max_elements={cap}. Raise the cap or "
+                "narrow the viewport to see the rest.",
+                n=len(elements),
+                cap=max_elements,
+            )
+        return elements, truncated
+
     async def observe(
         self,
         url: Optional[str] = None,
@@ -2057,6 +2248,7 @@ class BrowserActions:
         tab_id: Optional[str] = None,
         include_text: bool = True,
         include_aria: bool = False,
+        include_elements: bool = True,
     ) -> ObserveResult:
         """Capture a page's visual and structural state for observe-act-verify loops.
 
@@ -2072,6 +2264,20 @@ class BrowserActions:
         ``safety.max_chars_per_call``. ``include_aria`` (default False)
         runs ``page.accessibility.snapshot()`` -- off by default because
         snapshots can be megabytes on complex pages.
+
+        ``include_elements`` (default True) runs the v1.7.0 Wave 4C
+        set-of-marks pass: one ``page.evaluate`` walks the DOM and returns a
+        BOUNDED, numbered list of the actionable elements visible in the
+        viewport on ``ObserveResult.elements`` (each an
+        :class:`InteractiveElement` with ref / role / name / tag / enabled /
+        visible / bbox / selector). Bounded by
+        ``automation.observe_max_elements``; ``ObserveResult.elements_truncated``
+        flags (and a WARNING logs) when the page exceeds the cap. When
+        ``automation.observe_tag_refs`` is True (default) each element is
+        stamped with a ``data-webtool-ref="eN"`` attribute so a later action
+        can target it via ``LocatorSpec(ref="eN")`` -- the observe -> act loop.
+        The ref re-resolves against the live tab and fails cleanly (the
+        established not-found path) if the element is gone.
         """
         cid = get_correlation_id()
         safety = self._config.safety
@@ -2193,6 +2399,11 @@ class BrowserActions:
                 except Exception as exc:
                     logger.debug("observe aria snapshot failed: {e}", e=exc)
 
+            elements: list[InteractiveElement] = []
+            elements_truncated = False
+            if include_elements:
+                elements, elements_truncated = await self._enumerate_interactive_elements(page)
+
             return ObserveResult(
                 url=page.url,
                 title=title,
@@ -2206,6 +2417,8 @@ class BrowserActions:
                 device_pixel_ratio=float(dims["dpr"]),
                 visible_text=visible_text,
                 aria_snapshot=aria_snapshot,
+                elements=elements,
+                elements_truncated=elements_truncated,
                 tab_id=used_tab_id,
                 session_id=session_id,
                 correlation_id=cid,
