@@ -272,6 +272,34 @@ an **explicit** conflicting `True` still errors.
   threads the configured proxy onto the downloader's httpx path so
   `Agent.download()` no longer leaks the host's real IP past a
   configured proxy.
+- **Crawl egress + scope (Wave 8).** Every page the `crawl_site`
+  walker fetches -- including each URL seeded from `sitemap.xml` -- goes
+  through `WebFetcher.fetch`, so the SSRF / private-IP / robots /
+  domain-allow / rate-limit gates apply to EVERY hop; the crawler has
+  no side channel to the network. Discovered links are scope-filtered
+  to the start host (or, opt-in, its registrable domain) before they
+  enter the frontier, and the crawl is hard-bounded by `max_pages` /
+  `max_depth` (clamped to the `CrawlConfig` ceilings) plus
+  `SafetyConfig.max_time_per_call_seconds`, so a hostile link graph
+  cannot drive an unbounded or off-site crawl. `sitemap.xml` is parsed
+  with a bounded REGEX scan (not an XML parser) so a malicious sitemap
+  cannot trigger XML entity-expansion (billion-laughs); URL count and
+  sitemap-index fan-out are both capped.
+- **Snapshot store confinement (Wave 8).** `snapshot_page` /
+  `diff_page` persist snapshots under `MonitoringConfig.snapshot_dir`
+  via the `SnapshotStore`, which sanitizes the caller's label to a safe
+  filename AND re-verifies the resolved path with `safe_join_path()` --
+  a crafted label (`"../../etc/passwd"`, absolute, separators) can never
+  read or write outside the snapshot dir, and a corrupt snapshot file
+  degrades to "no baseline" rather than raising.
+- **Login-handoff redirect relaxation (Wave 8).** `login_handoff`
+  deliberately does NOT re-gate the cross-domain redirects a human's
+  login flow bounces through (SSO / identity providers), because the
+  operator initiated the headed handoff and a human is driving the
+  window. The exported `storage_state` path is still
+  `safe_join_path()`-confined, and the hook is headed-only by design
+  (it flags when run headless). Do not point `login_handoff` at an
+  untrusted login URL.
 
 ### Known limitations / out of scope
 
