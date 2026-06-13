@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # 1423 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
+python -m pytest -v          # 1506 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -75,19 +75,22 @@ web_agent/             # The package. One module = one responsibility.
   audit.py             # JSONL audit log of every public Agent call (opt-in)
   rate_limiter.py      # Per-host token-bucket gate
   robots.py            # robots.txt obedience via stdlib urllib.robotparser
-  correlation.py       # contextvars-based correlation IDs for tracing
+  correlation.py       # contextvars-based correlation IDs for tracing (surfaced as {extra[cid]} in MCP/CLI logs, v1.7.0)
+  metrics.py           # In-process MetricsRegistry: counters + distributions + label-cardinality cap -> MetricsSnapshot (v1.7.0)
   utils.py             # async_retry, get_random_user_agent, safe_join_path,
                        # is_private_address, BudgetTracker, check_domain_allowed
   debug.py             # On-failure HTML+screenshot+JSON capture
-  mcp_server.py        # Model Context Protocol server entry point
+  mcp_server.py        # Model Context Protocol server entry point (honours log_level + emits correlation id, v1.7.0)
   main.py              # Click-based CLI entry point
 
+docker/                # Non-root Playwright-based image: Dockerfile + docker-compose.yml + README.md + .dockerignore (v1.7.0)
+  searxng/             # Self-hosted SearXNG quickstart (compose + tuned settings)
 tests/                 # All tests; mirrors the package layout 1:1
 ```
 
 ## Public API surface
 
-Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **125 names** as of v1.7.0):
+Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **129 names** as of v1.7.0):
 
 ```python
 from web_agent import (
@@ -103,9 +106,13 @@ from web_agent import (
     NetworkEvent, Citation, ToolMessage, ToolError, ToolWarning, ToolSeverity,
     ChallengeInfo, StorageStateResult, SearchOutcome,    # v1.7.0 (waves 0-2)
     InjectionReport, CollectedPage, CollectionResult,    # v1.7.0 (wave 3)
+    InteractiveElement,                                  # v1.7.0 (wave 4: set-of-marks)
 
     # Untrusted-content helpers (v1.7.0 wave 3)
     detect_injection, strip_hidden_dom, strip_invisible_chars, wrap_untrusted,
+
+    # Observability / metrics (v1.7.0 wave 4)
+    MetricsRegistry, MetricsSnapshot,
 
     # Action discriminated union + members
     Action, ActionType, ActionStatus, BaseAction,
@@ -118,12 +125,13 @@ from web_agent import (
     # Specs / helpers
     LocatorSpec, SelectorLike, FormFilterSpec,
 
-    # Configs (13 sub-configs)
+    # Configs (AppConfig + 15 BaseSettings sub-configs as of v1.7.0)
     BrowserConfig, FetchConfig, SearchConfig, SafetyConfig,
     CacheConfig, AuditConfig, AutomationConfig, ExtractionConfig, DownloadConfig,
     SkillsConfig, WorkspaceConfig,                         # v1.6.7
     DiagnosticsConfig,                                     # v1.6.8
-    ProxyConfig,                                           # v1.7.0
+    ProxyConfig,                                           # v1.7.0 (wave 2F)
+    MetricsConfig,                                         # v1.7.0 (wave 4A)
 
     # v1.6.8 diagnostic primitives
     NetworkCollector, SessionTraceRecorder,
@@ -164,6 +172,8 @@ These rules constrain every change:
 - **MCP responses are single-representation + capped (v1.7.0).** Content-returning MCP tools return ONE representation (markdown default, `html` only on explicit `format='html'`) capped at `extraction.default_max_chars` (40000), with `offset` / `next_offset` paging. This cap lives **at the MCP boundary only** — the Python API default stays unlimited, so the result-model contract is unchanged.
 - **Proxy + fingerprint are operator controls, off by default (v1.7.0).** `ProxyConfig` is inactive unless configured (zero behaviour change when unset) and threads through every Chromium launch + httpx side-path. `coherent_fingerprint` keeps the rotated UA's OS family consistent with the configured locale/timezone. Scope is compliant-access coherence, **not** a stealth-bypass promise.
 - **Fetched content is UNTRUSTED (v1.7.0).** Content from the open web is never an instruction source. Hidden-from-humans payloads (invisible / bidi-override Unicode + `display:none` / `aria-hidden` / off-screen DOM) are **stripped deterministically before extraction** (`safety.sanitize_fetched_content`, the strong layer; `ExtractionResult.content_sanitized` records it); visible prompt-injection is **flagged advisorily** on `ExtractionResult.injection` (`InjectionReport` from `injection.py`) and **never blocked by default** — only `safety.injection_action='redact'`/`'block'` changes that. `structured_data` (JSON-LD) is read from the pre-strip HTML so sanitization never empties it. This is defense-in-depth against the "lethal trifecta", **not** a structural solution to injection: it does not defend against plausible injection in visible prose. Multi-page collection (`collect_across_pages`) routes every page through `fetch`, so sanitize + SSRF + robots + rate-limit re-gate on every navigation.
+- **Observability is in-process and free when off (v1.7.0).** `metrics.py`'s `MetricsRegistry` records counters + count/sum/min/max distributions at outcome points across the fetch / search / browser-lifecycle hot paths; it is enabled by default but `disabled` is a near-zero-cost no-op (no allocation on the hot path). A per-metric label-cardinality cap (`metrics.max_label_cardinality`, default 200) folds overflow into an `_other` bucket so a hostile high-cardinality label can never grow the registry unbounded. Read it via `Agent.metrics() -> MetricsSnapshot` / MCP `web_metrics`; metrics never gate or alter request behaviour.
+- **Set-of-marks targeting is opt-in-by-ref and gate-preserving (v1.7.0).** `observe()` returns a bounded numbered list of interactive elements (`ObserveResult.elements`, capped by `automation.observe_max_elements`); an action can target one by `LocatorSpec(ref="e3")`, resolved through a session-scoped `data-webtool-ref` attribute stamped during `observe`. The ref path reuses **every** existing locator + safety gate (domain re-gate, submit tripwire, timeouts); stale / malformed refs fail cleanly; the ref pattern is **injection-proof** (`_REF_PATTERN.fullmatch`), so a ref can never smuggle a selector or expression.
 
 ## Coding conventions
 
@@ -207,17 +217,19 @@ actually hit on the live 2026 web.** A market-research +
 full-codebase gap analysis drove additive waves: bot-wall
 detection, token-blowout / failure-opacity fixes, production
 lifecycle hardening, auth persistence, search resilience, proxy
-support, and a Wave-3 continuation (prompt-injection containment,
+support, a Wave-3 continuation (prompt-injection containment,
 infinite-scroll / pagination collection, richer PDF / table
-extraction). **No breaking changes to documented Python public
+extraction), and a Wave-4 continuation (production observability /
+metrics, a non-root Docker image, and set-of-marks accessibility-tree
+action targeting). **No breaking changes to documented Python public
 APIs** — the only visible behaviour shifts are called out at the
 end. Closed out by adversarial multi-agent reviews — a 4-dimension
 review (security / fetch correctness / concurrency / search+wiring)
-of the ~7,400-line diff, plus a Wave-3 injection + collection/PDF
-pass — that found **no critical/high issues** and confirmed the
-SSRF, path-traversal, cookie-domain, and session-isolation
-guarantees survive the refactor. Gates: **1423 passed / 28
-deselected**, ruff clean, mypy strict clean.
+of the ~7,400-line diff, a Wave-3 injection + collection/PDF pass, and
+a Wave-4 observability / Docker / a11y-targeting pass — that found
+**no critical/high issues** and confirmed the SSRF, path-traversal,
+cookie-domain, and session-isolation guarantees survive the refactor.
+Gates: **1506 passed / 28 deselected**, ruff clean, mypy strict clean.
 
 **Wave 0 — Hermetic suite + toolchain.** 28 live-network /
 real-browser tests are now quarantined behind the `integration`
@@ -364,6 +376,59 @@ image-only PDFs return an actionable "OCR required and unsupported"
 `pdfplumber>=0.11.0` added to the `[binary]` extra (pypdf kept as
 fallback).
 
+**Wave 4A — Production observability + metrics** (new
+`web_agent/metrics.py`). An in-process `MetricsRegistry`: counters via
+`incr(name, **labels)`; cheap count / sum / min / max distributions via
+`observe()`; a per-metric label-cardinality cap (default 200) folds
+overflow into an `_other` bucket so a hostile high-cardinality label
+can't grow the registry unbounded; `disabled` = near-zero-cost no-op.
+Instrumented at outcome points across the hot paths: `fetch_total`,
+`fetch_outcome{status}`, `challenge_detected{vendor}`,
+`bytes_downloaded`, `ttfb_ms` (`web_fetcher`); `search_total`,
+`search_provider_outcome{provider,outcome}`,
+`search_circuit_trip{provider}` (`search_engine`); `browser_launch`,
+`browser_crash`, `browser_relaunch{result}` (`browser_manager`). New
+`MetricsSnapshot` model (`counters` / `distributions` / `uptime_s` /
+`correlation_id`); new `MetricsConfig` sub-config (`WEB_AGENT_METRICS__`;
+`enabled` default `True`, `max_label_cardinality`). New
+`Agent.metrics() -> MetricsSnapshot`; new MCP tool `web_metrics`. Log
+hygiene: the MCP server now honours `config.log_level` (was hard-coded
+INFO) and both the MCP + CLI log formats surface the correlation id
+(`{extra[cid]}`, populated by `correlation.patch_loguru`).
+
+**Wave 4B — Non-root Docker image + MCP container.** Replaces the old
+root + `--no-sandbox` snippet with a production container:
+`docker/Dockerfile` (official Playwright Python base — Chromium + system
+deps + fonts baked in; runs as the non-root `pwuser`; OCI labels;
+`WEB_AGENT_BASE_DIR=/workspace` with a `VOLUME`;
+`HEALTHCHECK = web-agent doctor --quick`; `ENTRYPOINT web-agent-mcp`),
+`docker/docker-compose.yml` (build + volume + env passthrough incl. the
+sandbox `security-opt` / `cap_add` options), `docker/README.md`, and a
+`.dockerignore`. The image **builds + runs** (verified non-root, doctor
+healthy, MCP stdio handshake). Two new cross-platform `doctor` checks:
+`not_running_as_root` (warns at `euid==0`; skips on Windows where
+`geteuid` is absent) and `container_sandbox` (informational: detects a
+container + reports whether the Chromium sandbox is on/off).
+
+**Wave 4C — Accessibility-tree action targeting** (set-of-marks
+observe → act loop). `observe()` now returns a bounded, numbered list of
+**interactive** elements in `ObserveResult.elements` (each
+`InteractiveElement` has a `ref` (`"e1"`, `"e2"`, …), `role`, accessible
+`name`, `tag`, `enabled`, `visible`, `bbox` `[x,y,w,h]` CSS px, and a
+`selector`). An action targets an element by ref via a new
+`LocatorSpec(ref=...)` mode (resolved through a session-scoped
+`data-webtool-ref` attribute stamped during `observe`) — the model picks
+"element #N from what I just observed" instead of guessing a CSS selector
+(brittle / hallucinated selectors are a top WebArena / WebVoyager failure
+mode). Reuses **all** existing locator + safety gates (domain re-gate,
+submit tripwire, timeouts); stale / malformed refs fail cleanly; the ref
+pattern is injection-proof (`_REF_PATTERN.fullmatch`). New
+`InteractiveElement` model; `ObserveResult` gains `elements` +
+`elements_truncated`; `LocatorSpec` gains `ref` (counted in
+`is_empty()`); `AutomationConfig` gains `observe_max_elements` (100) +
+`observe_tag_refs` (`True`). MCP `web_observe` surfaces `elements`;
+`web_observe` + `web_interact` docstrings document the act-by-ref loop.
+
 **Close-out fixes.** MEDIUM: short HTTP-200 login/signup pages
 embedding reCAPTCHA were wrongly `BLOCKED` — a CAPTCHA script on a
 200 now only counts with an access-denial `<title>`. LOW:
@@ -383,17 +448,27 @@ exfil-intent detection gated behind the discussion-context veto so
 security prose ("malware can exfiltrate the system prompt") lands
 MEDIUM not HIGH, while a literal command still scores HIGH.
 
+**Close-out review fixes (Wave 4).** An adversarial close-out review of
+the observability / Docker / a11y-targeting diff found **no high/critical
+issues**, and definitively cleared two security questions: the
+`{extra[cid]}` log format cannot crash logging, and the set-of-marks ref
+path is injection-proof via `_REF_PATTERN.fullmatch`.
+
 **New public surface (additive).** Waves 0–2F added 5 exports —
 `ChallengeInfo`, `StorageStateResult`, `ProxyConfig`, `SearchEngine`,
 `SearchOutcome`. Wave 3 adds 7 more — `InjectionReport`,
 `CollectedPage`, `CollectionResult`, and the four injection helpers
 (`detect_injection`, `strip_hidden_dom`, `strip_invisible_chars`,
-`wrap_untrusted`) — so the root goes 118 → **125**. 8 new MCP tools
-total (`web_search_links` + 5 session tools + `web_scroll_to_bottom`
-+ `web_collect_pages`); MCP server count ~39 → **~47**. New optional
+`wrap_untrusted`). Wave 4 adds 4 more — `MetricsRegistry`,
+`MetricsSnapshot`, `MetricsConfig`, `InteractiveElement` — so the root
+goes 118 → **129**. 9 new MCP tools total (`web_search_links` + 5
+session tools + `web_scroll_to_bottom` + `web_collect_pages` +
+`web_metrics`); MCP server count ~39 → **~48**. New sub-config
+`MetricsConfig` (Wave 4A) — `config.py` now has **15** `BaseSettings`
+sub-configs (was 14). New module `web_agent/metrics.py`. New optional
 dep: `pdfplumber` in the `[binary]` extra.
 
-**Tests.** ~1133 → **1423 passing** (28 `integration` deselected,
+**Tests.** ~1133 → **1506 passing** (28 `integration` deselected,
 opt-in). Earlier-wave files: `test_challenge_detection`,
 `test_failure_transparency`, `test_token_efficiency`,
 `test_lifecycle`, `test_auth_persistence`, `test_search_resilience`,
@@ -401,7 +476,8 @@ opt-in). Earlier-wave files: `test_challenge_detection`,
 `test_v166_cdp` / `test_v166_isolation` / `test_v168_remote_cdp` /
 `test_v169_persistent_profile` for the new launch path. Wave 3 adds
 `test_injection_containment` / `test_collection` /
-`test_pdf_extraction` plus additions to `test_v170_wiring`.
+`test_pdf_extraction` plus additions to `test_v170_wiring`. Wave 4 adds
+`test_metrics` / `test_v4_docker` / `test_a11y_targeting`.
 
 **Behaviour changes (non-breaking but visible).** (1) A bot-challenge
 page that used to return `SUCCESS` now returns `FetchStatus.BLOCKED`.
