@@ -1927,7 +1927,7 @@ class MetricsSnapshot(BaseModel):
         default_factory=dict,
         description=(
             "Distribution series: ``{series_key: {count, sum, min, max, avg}}``. "
-            "A cheap four-number summary (no histogram buckets)."
+            "A cheap five-number summary (no histogram buckets)."
         ),
     )
     uptime_s: float = Field(

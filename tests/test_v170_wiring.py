@@ -27,6 +27,7 @@ from web_agent.agent import Agent
 from web_agent.config import AppConfig
 from web_agent.models import (
     ActionResult,
+    ActionSequenceResult,
     ActionStatus,
     CollectionResult,
     MetricsSnapshot,
@@ -318,6 +319,37 @@ class TestMcpCollection:
         agent.scroll_to_bottom.assert_awaited_once()
         assert isinstance(out, dict)
         assert out["status"] == "success"
+
+
+# ----------------------------------------------------------------------
+# B1 gap-fix: act-in-place (omitted url) so set-of-marks refs survive
+# ----------------------------------------------------------------------
+
+
+class TestInteractActInPlace:
+    @pytest.mark.asyncio
+    async def test_web_interact_omitted_url_passes_empty_string(self) -> None:
+        agent = MagicMock()
+        agent.interact = AsyncMock(return_value=ActionSequenceResult(url=""))
+        await mcp_server.web_interact(
+            _ctx_for(agent),
+            actions=[{"action": "click", "selector": {"ref": "e3"}}],
+            session_id="s1",
+        )
+        # url omitted -> Agent.interact receives "" (act-in-place), not None.
+        assert agent.interact.call_args[0][0] == ""
+        assert agent.interact.call_args.kwargs["session_id"] == "s1"
+
+    @pytest.mark.asyncio
+    async def test_agent_interact_defaults_url_to_empty(self) -> None:
+        agent = _bare_agent()
+        agent._debug = MagicMock()
+        agent._actions = MagicMock()
+        agent._actions.execute_sequence = AsyncMock(return_value=ActionSequenceResult(url=""))
+        await agent.interact(session_id="s1")  # no url, no actions
+        _args, kwargs = agent._actions.execute_sequence.call_args
+        passed_url = kwargs.get("url", _args[0] if _args else None)
+        assert passed_url == ""
 
 
 # ----------------------------------------------------------------------

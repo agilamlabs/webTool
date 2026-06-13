@@ -618,6 +618,10 @@ class BrowserActions:
         net_events: list = []
         api_cands: list[str] = []
         dl_intents: list[str] = []
+        # v1.7.0 (gap-fix B1): early-bind so the no-url in-place branch and the
+        # ephemeral path both see a defined value (it's only set True inside the
+        # session-tab-reuse branch below).
+        reused = False
 
         try:
             if session_id and self._sessions is not None:
@@ -659,10 +663,25 @@ class BrowserActions:
             # All branches above set ``page``; mypy can't follow the
             # cross-branch reassignment so we narrow here.
             assert page is not None
-            await page.goto(url, wait_until="domcontentloaded")
+            # v1.7.0 (gap-fix B1): an empty ``url`` means "act on the session's
+            # CURRENT tab in place" -- do NOT navigate. This is what makes the
+            # set-of-marks loop work: web_observe stamps data-webtool-ref on the
+            # live DOM, then interact(url="", session_id=...) acts on it without
+            # a goto that would wipe the stamps. Requires a reused session tab;
+            # acting "in place" on a fresh blank page is a misuse.
+            if url:
+                await page.goto(url, wait_until="domcontentloaded")
+            elif not reused:
+                return _block_all(
+                    "interact called with no url and no existing session tab to act on. "
+                    "Provide a url to navigate, or a session_id whose current tab is already "
+                    "open (e.g. after web_observe / a prior interact)."
+                )
 
             # Post-navigation re-check: the initial goto may have followed a
-            # redirect to a denied / private-IP host. Defense-in-depth.
+            # redirect to a denied / private-IP host. Defense-in-depth. Also
+            # runs on the no-navigation path so an in-place action on a tab that
+            # drifted to a disallowed domain is still blocked.
             if not check_domain_allowed(page.url, safety):
                 host = urlparse(page.url).hostname or ""
                 return _block_all(f"Initial navigation redirected to disallowed domain: {host}")

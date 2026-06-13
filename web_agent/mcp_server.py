@@ -588,12 +588,12 @@ async def web_screenshot(
 @mcp.tool()
 async def web_interact(
     ctx: Context,
-    url: str,
     actions: list[dict],
+    url: Optional[str] = None,
     stop_on_error: Optional[bool] = None,
     session_id: Optional[str] = None,
 ) -> ActionSequenceResult:
-    """Execute a scripted sequence of browser actions on a URL.
+    """Execute a scripted sequence of browser actions.
 
     Supports 19 action types: click, type, fill, scroll, screenshot, navigate,
     dialog, hover, select, keyboard, wait, evaluate, click_xy, type_text,
@@ -622,6 +622,14 @@ async def web_interact(
         # Set-of-marks ref from web_observe (most reliable; v1.7.0):
         {"action": "click", "selector": {"ref": "e3"}}
 
+    SET-OF-MARKS LOOP (v1.7.0): to act on an element you just observed, OMIT
+    ``url`` and pass the ``session_id`` -- this acts on that session's CURRENT
+    tab IN PLACE without navigating, so the ``ref`` stamps from web_observe
+    survive. Navigating (passing a ``url``) rebuilds the DOM and invalidates
+    refs. So the reliable loop is:
+        web_create_session() -> web_observe(session_id=S) [reads refs] ->
+        web_interact(session_id=S, actions=[{"action":"click","selector":{"ref":"e3"}}])
+
     Example sequence::
 
         [
@@ -633,8 +641,10 @@ async def web_interact(
         ]
 
     Args:
-        url: Starting URL.
         actions: Ordered list of action dicts.
+        url: URL to navigate to first. OPTIONAL -- omit it (with a session_id)
+            to act on the session's current tab in place (set-of-marks loop).
+            Required when there is no existing session tab to act on.
         stop_on_error: Halt the sequence on the first failed action (skip the
             rest). ``None`` (default) defers to ``automation.stop_on_error`` in
             the operator's config; pass a bool to override it. (v1.6.16
@@ -649,7 +659,7 @@ async def web_interact(
     adapter = TypeAdapter(list[Action])
     parsed_actions = adapter.validate_python(actions)
     return await agent.interact(
-        url, parsed_actions, stop_on_error=stop_on_error, session_id=session_id
+        url or "", parsed_actions, stop_on_error=stop_on_error, session_id=session_id
     )
 
 
@@ -891,69 +901,13 @@ async def web_fill_form_and_extract(
 
 
 # ---------------------------------------------------------------------------
-# Browser session management
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def create_browser_session(
-    ctx: Context,
-    name: Optional[str] = None,
-) -> dict:
-    """Create a persistent browser session that retains cookies/localStorage across calls.
-
-    Pass the returned ``session_id`` as the ``session_id`` parameter to
-    web_fetch / web_interact / web_download / web_screenshot / web_search /
-    web_research / web_search_best / web_find_and_download to reuse the same
-    logged-in context.
-
-    Sessions persist until ``close_browser_session`` is called or the MCP
-    server shuts down.
-
-    Args:
-        name: Optional human-friendly label (default: random token).
-
-    Returns:
-        Dict with ``session_id`` (the value to pass to other tools).
-    """
-    agent: Agent = ctx.request_context.lifespan_context["agent"]
-    sid = await agent.create_session(name=name)
-    return {"session_id": sid, "name": name}
-
-
-@mcp.tool()
-async def close_browser_session(ctx: Context, session_id: str) -> dict:
-    """Close a persistent browser session and free its resources.
-
-    Args:
-        session_id: The session_id returned by create_browser_session.
-
-    Returns:
-        Dict with ``closed: True`` on success.
-    """
-    agent: Agent = ctx.request_context.lifespan_context["agent"]
-    await agent.close_session(session_id)
-    return {"closed": True, "session_id": session_id}
-
-
-@mcp.tool()
-async def list_browser_sessions(ctx: Context) -> dict:
-    """List all live browser sessions for the current MCP server.
-
-    Returns:
-        Dict with ``count`` and ``sessions`` (list of SessionInfo as dicts:
-        session_id, name, created_at, last_used_at, page_count, user_agent).
-    """
-    agent: Agent = ctx.request_context.lifespan_context["agent"]
-    sessions = agent.list_sessions()
-    return {
-        "count": len(sessions),
-        "sessions": [s.model_dump(mode="json") for s in sessions],
-    }
-
-
-# ---------------------------------------------------------------------------
 # v1.7.0: Session management + authentication handoff
+#
+# (The pre-v1.7.0 create_browser_session / close_browser_session /
+# list_browser_sessions tools were removed in the v1.7.0 gap-fix pass: they
+# duplicated the canonical web_create_session / web_close_session /
+# web_list_sessions trio below, doubling the session surface and contradicting
+# the documented tool names. Use the web_* tools.)
 # ---------------------------------------------------------------------------
 
 
@@ -1057,7 +1011,7 @@ async def web_list_tabs(ctx: Context, session_id: str) -> dict:
     target by default.
 
     Args:
-        session_id: The session_id from ``create_browser_session``.
+        session_id: The session_id from ``web_create_session``.
 
     Returns:
         Dict with ``count`` and ``tabs`` (list of TabInfo dicts).
@@ -1227,6 +1181,9 @@ async def web_observe(
             described above). Default True.
         include_aria: Capture page.accessibility.snapshot(). Default
             False (snapshots can be megabytes).
+        include_elements: Capture the numbered interactive ``elements`` list
+            for set-of-marks act-by-ref. Default True; set False to skip the
+            element-enumeration cost when you only need text / a screenshot.
         max_chars: Cap for ``visible_text`` in characters. None = server
             default (``extraction.default_max_chars``).
     """

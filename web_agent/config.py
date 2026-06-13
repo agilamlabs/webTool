@@ -149,13 +149,18 @@ class BrowserConfig(BaseSettings):
       ``profile_dir`` + ``cleanup_on_exit`` let webTool launch Chromium
       against its own dedicated user-data-dir, isolating cookies /
       localStorage / cache / downloads from the user's real Chrome.
-      Defaults: ``isolation_mode=False`` (preserves v1.6.5 launch path).
+      Default (v1.7.0): ``isolation_mode=True`` (each Agent gets its own
+      ephemeral profile). Set False for the plain non-isolated launch.
     * **CDP attach** -- ``cdp_enabled`` + ``cdp_host`` + ``cdp_port`` +
       ``backend`` let external tools observe a webTool-launched browser
       over the Chrome DevTools Protocol. CDP requires isolation
-      (DevToolsActivePort lives under the user-data-dir). Defaults:
-      ``cdp_enabled=False``. ``attach_existing_browser=True`` is
-      explicitly rejected -- webTool only controls browsers it launched.
+      (DevToolsActivePort lives under the user-data-dir). Default
+      (v1.7.0): ``cdp_enabled=True`` -- opens a LOOPBACK-only,
+      UNAUTHENTICATED debug port (any local process can drive the
+      browser; see the ``cdp_enabled`` field docstring). Set
+      ``cdp_enabled=False`` on shared hosts or with sensitive sessions.
+      ``attach_existing_browser=True`` is explicitly rejected -- webTool
+      only controls browsers it launched.
     """
 
     headless: bool = True
