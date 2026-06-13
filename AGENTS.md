@@ -20,7 +20,7 @@ playwright install chromium
 # Optional: MCP server (v1.6.9+; mcp[cli] is now an extra)
 pip install -e ".[mcp]"
 
-# Optional: PDF/XLSX/DOCX extractors
+# Optional: PDF (pdfplumber + pypdf) / XLSX / DOCX extractors
 pip install -e ".[binary]"
 ```
 
@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # 1324 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
+python -m pytest -v          # 1423 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -54,14 +54,15 @@ web_agent/             # The package. One module = one responsibility.
   exceptions.py        # WebAgentError hierarchy (used in strict=True paths)
   browser_manager.py   # Chromium lifecycle + per-context stealth + UA rotation + crash auto-relaunch (v1.7.0)
   challenge.py         # Bot-wall / CAPTCHA structural detection -> ChallengeInfo (v1.7.0)
+  injection.py         # Untrusted-content containment: hidden-DOM/Unicode strip + detect_injection -> InjectionReport (v1.7.0)
   search_engine.py     # SearchEngine -- chains providers + per-provider circuit breaker (v1.7.0)
   search_providers.py  # SearXNGProvider / DDGSProvider / PlaywrightProvider
   web_fetcher.py       # WebFetcher.fetch / fetch_many / fetch_binary + challenge settle-recheck (v1.7.0)
-  content_extractor.py # trafilatura -> bs4 -> raw, plus PDF / XLSX; max_chars/offset slicing (v1.7.0)
+  content_extractor.py # trafilatura -> bs4 -> raw, plus PDF (pdfplumber -> pypdf) + tables / XLSX; max_chars/offset slicing (v1.7.0)
   downloader.py        # 3-strategy file download with safety gates
-  browser_actions.py   # 19 action types incl. coord-click + iframe + shadow-DOM + upload + drag (v1.6.6 + v1.6.7)
+  browser_actions.py   # 19 action types incl. coord-click + iframe + shadow-DOM + upload + drag + scroll_to_bottom (v1.6.6 + v1.6.7 + v1.7.0)
   recipes.py           # search_and_open_best_result, find_and_download_file,
-                       # web_research, fill_form_and_extract
+                       # web_research, fill_form_and_extract, collect_across_pages (v1.7.0)
   session_manager.py   # Persistent browser sessions (cookies, storage) + storage_state export/import + idle reaper (v1.7.0)
   tab_manager.py       # Per-session tab lifecycle (v1.6.6)
   doctor.py            # Self-diagnostic capability probes (v1.6.6)
@@ -86,7 +87,7 @@ tests/                 # All tests; mirrors the package layout 1:1
 
 ## Public API surface
 
-Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **118 names** as of v1.7.0):
+Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **125 names** as of v1.7.0):
 
 ```python
 from web_agent import (
@@ -100,7 +101,11 @@ from web_agent import (
     SessionInfo, TabInfo, ObserveResult, DoctorReport, DoctorCheck,
     DomainSkill, SkillInputSpec, SkillApplicationResult,
     NetworkEvent, Citation, ToolMessage, ToolError, ToolWarning, ToolSeverity,
-    ChallengeInfo, StorageStateResult, SearchOutcome,    # v1.7.0
+    ChallengeInfo, StorageStateResult, SearchOutcome,    # v1.7.0 (waves 0-2)
+    InjectionReport, CollectedPage, CollectionResult,    # v1.7.0 (wave 3)
+
+    # Untrusted-content helpers (v1.7.0 wave 3)
+    detect_injection, strip_hidden_dom, strip_invisible_chars, wrap_untrusted,
 
     # Action discriminated union + members
     Action, ActionType, ActionStatus, BaseAction,
@@ -158,6 +163,7 @@ These rules constrain every change:
 - **Bot-walls are surfaced, not swallowed (v1.7.0).** Challenge detection (`challenge.py`) adds `FetchStatus.BLOCKED`: a detected bot-wall / CAPTCHA — even one served on HTTP 200 — returns `BLOCKED` with an actionable `error_message` and `FetchResult.challenge`, never SUCCESS-with-garbage. `BLOCKED` results are never cached. Detection is **structural** (page markers), so prose vendor mentions must not trigger it.
 - **MCP responses are single-representation + capped (v1.7.0).** Content-returning MCP tools return ONE representation (markdown default, `html` only on explicit `format='html'`) capped at `extraction.default_max_chars` (40000), with `offset` / `next_offset` paging. This cap lives **at the MCP boundary only** — the Python API default stays unlimited, so the result-model contract is unchanged.
 - **Proxy + fingerprint are operator controls, off by default (v1.7.0).** `ProxyConfig` is inactive unless configured (zero behaviour change when unset) and threads through every Chromium launch + httpx side-path. `coherent_fingerprint` keeps the rotated UA's OS family consistent with the configured locale/timezone. Scope is compliant-access coherence, **not** a stealth-bypass promise.
+- **Fetched content is UNTRUSTED (v1.7.0).** Content from the open web is never an instruction source. Hidden-from-humans payloads (invisible / bidi-override Unicode + `display:none` / `aria-hidden` / off-screen DOM) are **stripped deterministically before extraction** (`safety.sanitize_fetched_content`, the strong layer; `ExtractionResult.content_sanitized` records it); visible prompt-injection is **flagged advisorily** on `ExtractionResult.injection` (`InjectionReport` from `injection.py`) and **never blocked by default** — only `safety.injection_action='redact'`/`'block'` changes that. `structured_data` (JSON-LD) is read from the pre-strip HTML so sanitization never empties it. This is defense-in-depth against the "lethal trifecta", **not** a structural solution to injection: it does not defend against plausible injection in visible prose. Multi-page collection (`collect_across_pages`) routes every page through `fetch`, so sanitize + SSRF + robots + rate-limit re-gate on every navigation.
 
 ## Coding conventions
 
@@ -198,17 +204,20 @@ These rules constrain every change:
 
 **Real-world hardening — solve the problems autonomous agents
 actually hit on the live 2026 web.** A market-research +
-full-codebase gap analysis drove six additive waves: bot-wall
+full-codebase gap analysis drove additive waves: bot-wall
 detection, token-blowout / failure-opacity fixes, production
-lifecycle hardening, auth persistence, search resilience, and proxy
-support. **No breaking changes to documented Python public APIs** —
-the only visible behaviour shifts are called out at the end. Closed
-out by a 4-dimension adversarial multi-agent review (security /
-fetch correctness / concurrency / search+wiring) of the
-~7,400-line diff that found **no critical/high issues** and
-confirmed the SSRF, path-traversal, cookie-domain, and
-session-isolation guarantees survive the refactor. Gates: **1324
-passed / 28 deselected**, ruff clean, mypy strict clean.
+lifecycle hardening, auth persistence, search resilience, proxy
+support, and a Wave-3 continuation (prompt-injection containment,
+infinite-scroll / pagination collection, richer PDF / table
+extraction). **No breaking changes to documented Python public
+APIs** — the only visible behaviour shifts are called out at the
+end. Closed out by adversarial multi-agent reviews — a 4-dimension
+review (security / fetch correctness / concurrency / search+wiring)
+of the ~7,400-line diff, plus a Wave-3 injection + collection/PDF
+pass — that found **no critical/high issues** and confirmed the
+SSRF, path-traversal, cookie-domain, and session-isolation
+guarantees survive the refactor. Gates: **1423 passed / 28
+deselected**, ruff clean, mypy strict clean.
 
 **Wave 0 — Hermetic suite + toolchain.** 28 live-network /
 real-browser tests are now quarantined behind the `integration`
@@ -295,23 +304,104 @@ side-paths send a browser-coherent `User-Agent` + `Accept-Language`.
 Honest scope: **operator controls for compliant access, not a
 stealth-bypass promise.**
 
+**Wave 3A — Prompt-injection containment for fetched content** (new
+`web_agent/injection.py`; defense-in-depth against the "lethal
+trifecta", **not** a claim to "solve" injection). Four public
+helpers: `strip_invisible_chars` strips zero-width / bidi-override /
+BOM / soft-hyphen / word-joiner / tag-block Unicode but **preserves
+U+200C/U+200D (ZWNJ/ZWJ)** — required in Persian/Arabic/Indic +
+ZWJ emoji; `strip_hidden_dom` removes elements a human can't see
+(`display:none` / `visibility:hidden` / `opacity:0` / off-screen /
+`aria-hidden` / `hidden` / comments / `script` / `style`) **before**
+extraction; `detect_injection` returns a framing-gated advisory
+`InjectionReport` (**HIGH** only when an unquoted override is
+*commanded* at the assistant — imperative "you must ignore…" or a
+forged "SYSTEM:" turn; prose that merely quotes/discusses attack
+phrases stays LOW/MEDIUM); `wrap_untrusted` fences provenance. New
+`InjectionReport` model; `ExtractionResult` gains `injection` +
+`content_sanitized`. `SafetyConfig` gains `sanitize_fetched_content`
+(`True`), `detect_prompt_injection` (`True`), `injection_action`
+(`'flag'` default; `'redact'`/`'block'` opt-in). Hidden-from-humans
+stripping is **deterministic**; visible injection is **flagged, not
+blocked**. JSON-LD/`structured_data` is read from the **pre-strip**
+HTML. MCP: the `web_fetch` docstring + server instructions carry an
+**UNTRUSTED-CONTENT** directive.
+
+**Wave 3B — Infinite-scroll + pagination collection.**
+`BrowserActions.scroll_to_bottom`: bounded scroll-to-exhaustion
+(stops when `scrollHeight` is stable for N rounds or hits the
+`<=1000` clamp; returns `scrolls_used` + `reached_bottom`) so a
+following observe/fetch sees the full assembled DOM.
+`Recipes.collect_across_pages(url, strategy=...)` walks a multi-page
+listing — `'next_link'` (rel=next / aria-label*=next / next-vocab
+anchor), `'page_param'` (increment `?page=`/`?p=`), `'scroll'`
+(single infinite-scroll URL; requires a session). Every page is
+fetched+extracted through `WebFetcher.fetch`, so robots, rate-limit,
+bot-wall, **injection-sanitize, and SSRF re-gating all apply**;
+URL+content de-dup with a cycle guard; bounded by `max_pages` + the
+per-call budget; `stopped_reason` explains the exit (`no_next` /
+`max_pages` / `budget` / `cycle` / `blocked` / `empty_page` /
+`scroll_complete` / `error`). New `CollectedPage` +
+`CollectionResult`; `AutomationConfig` gains `pagination_max_pages`
+(10), `scroll_stable_rounds` (2), `scroll_settle_ms` (1000),
+`pagination_next_texts`; new `Agent.scroll_to_bottom` +
+`collect_across_pages`; MCP `web_scroll_to_bottom` +
+`web_collect_pages`.
+
+**Wave 3C — Richer PDF / table extraction.** The PDF path now
+**prefers `pdfplumber`** (per-page text + tables) → `pypdf` →
+`extraction_method="none"` + install-hint (the no-`[binary]` install
+still works). Page markers (`===== Page N =====`) + `page_count`;
+tables rendered as GFM markdown, interleaved in `content` and on
+`ExtractionResult.tables`, bounded by `pdf_max_tables` (50) +
+`pdf_max_table_cells` (2000) with truncation flagged; scanned /
+image-only PDFs return an actionable "OCR required and unsupported"
+`error_message` instead of a bare empty success;
+`extraction_method` surfaces the winning engine
+(`"pdfplumber"` | `"pdf"`). `ExtractionResult` gains `page_count` +
+`tables`; `ExtractionConfig` gains `pdf_extract_tables`,
+`pdf_page_markers`, `pdf_max_tables`, `pdf_max_table_cells`;
+`pdfplumber>=0.11.0` added to the `[binary]` extra (pypdf kept as
+fallback).
+
 **Close-out fixes.** MEDIUM: short HTTP-200 login/signup pages
 embedding reCAPTCHA were wrongly `BLOCKED` — a CAPTCHA script on a
 200 now only counts with an access-denial `<title>`. LOW:
 `import_state` 8 MB size cap.
 
-**New public surface (additive).** 5 new exports — `ChallengeInfo`,
-`StorageStateResult`, `ProxyConfig`, `SearchEngine`, `SearchOutcome`
-(root now 118). 6 new MCP tools (`web_search_links` + 5 session
-tools); MCP server count ~39 → 45.
+**Close-out review fixes (Wave 3).** An adversarial 2-dimension
+review (injection Unicode-safety + detection precision; collection /
+PDF correctness + SSRF). Collection + PDF: **no high/critical
+findings** (SSRF re-gating on every navigation confirmed; walks
+bounded; PDF engine fallback + caps + scanned detection confirmed).
+Three injection fixes landed with regression tests: (1) **HIGH
+i18n** — `strip_invisible_chars` no longer strips ZWNJ/ZWJ (was
+corrupting emoji + Persian/Arabic/Indic); (2) **MEDIUM** — JSON-LD
+now read from the pre-strip HTML (script-stripping was silently
+emptying `structured_data` on the default path); (3) **MEDIUM** —
+exfil-intent detection gated behind the discussion-context veto so
+security prose ("malware can exfiltrate the system prompt") lands
+MEDIUM not HIGH, while a literal command still scores HIGH.
 
-**Tests.** ~1133 → **1324 passing** (+28 `integration`-marked,
-opt-in). New files: `test_challenge_detection`,
+**New public surface (additive).** Waves 0–2F added 5 exports —
+`ChallengeInfo`, `StorageStateResult`, `ProxyConfig`, `SearchEngine`,
+`SearchOutcome`. Wave 3 adds 7 more — `InjectionReport`,
+`CollectedPage`, `CollectionResult`, and the four injection helpers
+(`detect_injection`, `strip_hidden_dom`, `strip_invisible_chars`,
+`wrap_untrusted`) — so the root goes 118 → **125**. 8 new MCP tools
+total (`web_search_links` + 5 session tools + `web_scroll_to_bottom`
++ `web_collect_pages`); MCP server count ~39 → **~47**. New optional
+dep: `pdfplumber` in the `[binary]` extra.
+
+**Tests.** ~1133 → **1423 passing** (28 `integration` deselected,
+opt-in). Earlier-wave files: `test_challenge_detection`,
 `test_failure_transparency`, `test_token_efficiency`,
 `test_lifecycle`, `test_auth_persistence`, `test_search_resilience`,
 `test_proxy_fingerprint`, `test_v170_wiring`; plus rewrites of
 `test_v166_cdp` / `test_v166_isolation` / `test_v168_remote_cdp` /
-`test_v169_persistent_profile` for the new launch path.
+`test_v169_persistent_profile` for the new launch path. Wave 3 adds
+`test_injection_containment` / `test_collection` /
+`test_pdf_extraction` plus additions to `test_v170_wiring`.
 
 **Behaviour changes (non-breaking but visible).** (1) A bot-challenge
 page that used to return `SUCCESS` now returns `FetchStatus.BLOCKED`.
@@ -320,7 +410,12 @@ default) capped at `extraction.default_max_chars` (40000) per call —
 was up to ~1 MB, often duplicated; pass `format='html'` for raw
 HTML, a larger `max_chars`, or page via `offset` / `next_offset`.
 (3) A bare `pytest` run now excludes integration tests (opt in with
-`-m integration`).
+`-m integration`). (4) Fetched content is sanitized by default
+(hidden-from-humans DOM + invisible Unicode stripped before
+extraction; `content_sanitized` flags when it ran) and visible
+injection is flagged advisorily on `ExtractionResult.injection` —
+never blocked unless `safety.injection_action` is raised to
+`'redact'` / `'block'`.
 
 ## What v1.6.14 added
 

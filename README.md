@@ -12,8 +12,9 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 
 > **What's new in 1.7.0** — *Real-world hardening — make the toolkit solve
 > the problems autonomous agents actually hit on the live 2026 web.* Driven by
-> a market-research + full-codebase gap analysis, shipped in six waves, all
-> **additive** (no breaking changes to documented Python APIs):
+> a market-research + full-codebase gap analysis, shipped in waves (a Wave 3
+> continuation folded in without a version bump), all **additive** (no breaking
+> changes to documented Python APIs):
 >
 > * **Honest bot-wall detection** (new `web_agent/challenge.py`) — structural
 >   (not prose-keyword) markers for Cloudflare / DataDome / Akamai / PerimeterX /
@@ -45,12 +46,36 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 >   launch + httpx side-path; `coherent_fingerprint` pins the rotated UA's OS
 >   family to the configured locale. Honest scope: operator controls for
 >   compliant access, **not** a stealth-bypass promise.
+> * **Prompt-injection containment for fetched content** (new
+>   `web_agent/injection.py`) — hidden-from-humans text is **stripped
+>   deterministically** (invisible / bidi-override Unicode + `display:none` /
+>   `aria-hidden` / off-screen DOM, before extraction) and visible injection is
+>   **flagged, not blocked** via an advisory `ExtractionResult.injection`
+>   (`InjectionReport`). New `SafetyConfig.sanitize_fetched_content` /
+>   `detect_prompt_injection` / `injection_action`. Defense-in-depth against the
+>   "lethal trifecta" — explicitly **not** a claim to solve injection.
+> * **Infinite-scroll + pagination collection** —
+>   `Agent.scroll_to_bottom` loads lazy / infinite-scroll content so the next
+>   observe / fetch sees the full DOM; `Agent.collect_across_pages(url,
+>   strategy='next_link' | 'page_param' | 'scroll')` walks a multi-page listing
+>   and assembles content across pages, every page re-gated through `fetch`
+>   (robots / rate-limit / bot-wall / SSRF / injection-sanitize), bounded by
+>   `max_pages` + budget with a `stopped_reason`. New `CollectedPage` /
+>   `CollectionResult`; MCP `web_scroll_to_bottom` / `web_collect_pages`.
+> * **Richer PDF / table extraction** — the PDF path now prefers `pdfplumber`
+>   (per-page text + tables) → `pypdf` → install-hint. Tables render as GFM
+>   markdown, interleaved in `content` and exposed on `ExtractionResult.tables`;
+>   page markers + `page_count`; scanned / image-only PDFs return an actionable
+>   "OCR required" error instead of a bare empty success. `pdfplumber` added to the
+>   `[binary]` extra.
 >
-> Adds **6 new MCP tools** (server now exposes **45**), **5 new public exports**
+> Adds **8 new MCP tools** (server now exposes **~47**), **12 new public exports**
 > (`ChallengeInfo`, `StorageStateResult`, `ProxyConfig`, `SearchEngine`,
-> `SearchOutcome` → **118** total), and grows the suite to **1324 passing**
-> (+28 `integration`-marked, opt-in). A 4-dimension adversarial close-out review
-> of the ~7,400-line diff found **no critical/high issues**. **Behaviour
+> `SearchOutcome`, `InjectionReport`, `CollectedPage`, `CollectionResult`, and the
+> four injection helpers → **125** total), and grows the suite to **1423 passing**
+> (28 `integration` deselected, opt-in). Adversarial close-out reviews (a
+> 4-dimension review of the ~7,400-line diff, plus a Wave 3 injection +
+> collection/PDF pass) found **no critical/high issues**. **Behaviour
 > changes:** bot-challenge pages return `BLOCKED` (was SUCCESS); MCP content is
 > single-representation + capped; a bare `pytest` run now excludes integration
 > tests (`-m integration` to opt in). See [CHANGELOG.md](CHANGELOG.md#170---2026-06-13).
@@ -347,9 +372,11 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 - **Web Search** — Free-first provider chain: SearXNG → DDGS → Playwright fallback. URL-as-query short-circuits to direct fetch. Per-provider circuit breaker + a links-only `Agent.search()` primitive (v1.7.0).
 - **Bot-Wall Detection** (v1.7.0) — Structural Cloudflare / DataDome / Akamai / PerimeterX / reCAPTCHA / hCaptcha detection; a challenge on HTTP 200 returns `FetchStatus.BLOCKED` with an actionable message instead of garbage.
 - **Page Fetching** — Renders JavaScript, retries with exponential backoff, detects download URLs. Optional disk cache (TTL-based).
-- **Content Extraction** — Three-tier fallback: trafilatura (F1 ≈ 0.958) → BeautifulSoup4 → raw text. CSV / PDF / XLSX / DOCX extraction via the `[binary]` extra.
+- **Content Extraction** — Three-tier fallback: trafilatura (F1 ≈ 0.958) → BeautifulSoup4 → raw text. CSV / PDF / XLSX / DOCX extraction via the `[binary]` extra. PDF now prefers `pdfplumber` for per-page text + GFM-markdown tables on `ExtractionResult.tables` (v1.7.0).
+- **Untrusted-Content Containment** (v1.7.0) — Fetched content is treated as untrusted: invisible / bidi-override Unicode and hidden DOM (`display:none` / `aria-hidden` / off-screen) are stripped **before** extraction; visible prompt-injection is flagged advisorily on `ExtractionResult.injection`, never blocked by default.
+- **Pagination + Infinite-Scroll Collection** (v1.7.0) — `scroll_to_bottom` exhausts lazy/infinite-scroll content; `collect_across_pages` walks multi-page listings (`next_link` / `page_param` / `scroll`), every page re-gated through `fetch` and bounded by `max_pages` + budget.
 - **File Download** — Three strategies: httpx streaming → Playwright page save → Playwright JS download. Per-strategy size caps enforced.
-- **High-Level Recipes** — `search_and_open_best_result`, `find_and_download_file`, `web_research`, `fill_form_and_extract`.
+- **High-Level Recipes** — `search_and_open_best_result`, `find_and_download_file`, `web_research`, `fill_form_and_extract`, `collect_across_pages` (v1.7.0).
 
 ### Browser automation (v1.6.5 – v1.6.7)
 - **19 Action Types** — composable into scripted sequences. Includes `click_xy / type_text / press_key` (coordinate fallbacks for canvas/shadow/iframe), `upload_file`, `drag_and_drop`, `iframe_click`, `shadow_dom_click`.
@@ -415,7 +442,7 @@ On Linux, use `--with-deps` to auto-install Chromium's system dependencies:
 playwright install --with-deps chromium
 ```
 
-**Optional binary-document extractors** (PDF / XLSX / DOCX; CSV is stdlib):
+**Optional binary-document extractors** (PDF via `pdfplumber` + `pypdf` / XLSX / DOCX; CSV is stdlib):
 
 ```bash
 pip install -e ".[dev,binary]"
@@ -618,6 +645,17 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `fetch` | `challenge_settle_ms` | `3500` | Settle delay before re-capturing a managed-JS challenge the browser may auto-pass |
 | `fetch` | `challenge_max_rechecks` | `2` | Max settle-and-recheck attempts before giving up as `BLOCKED` |
 | `extraction` | `default_max_chars` | `40000` | Per-response content cap **at the MCP boundary only** (Python API stays unlimited) |
+| `extraction` | `pdf_extract_tables` | `true` | Extract PDF tables (via `pdfplumber`) as GFM markdown into `content` + `ExtractionResult.tables` |
+| `extraction` | `pdf_page_markers` | `true` | Emit `===== Page N =====` markers + populate `page_count` so callers can cite pages |
+| `extraction` | `pdf_max_tables` | `50` | Cap on tables extracted per PDF (truncation flagged) |
+| `extraction` | `pdf_max_table_cells` | `2000` | Cap on total table cells per PDF (truncation flagged) |
+| `safety` | `sanitize_fetched_content` | `true` | Strip hidden-from-humans DOM + invisible/bidi Unicode before extraction |
+| `safety` | `detect_prompt_injection` | `true` | Run advisory `detect_injection` → `ExtractionResult.injection` (`InjectionReport`) |
+| `safety` | `injection_action` | `"flag"` | `"flag"` (default) / `"redact"` / `"block"`; never blocks legitimate content by default |
+| `automation` | `pagination_max_pages` | `10` | Max pages `collect_across_pages` walks before stopping (`stopped_reason="max_pages"`) |
+| `automation` | `scroll_stable_rounds` | `2` | Rounds `scrollHeight` must stay stable before `scroll_to_bottom` declares exhaustion |
+| `automation` | `scroll_settle_ms` | `1000` | Settle delay (ms) between scroll rounds |
+| `automation` | `pagination_next_texts` | (vocabulary) | Anchor-text vocabulary the `next_link` strategy matches (next / older / more / load-more / chevron) |
 | `browser` | `stealth_enabled` | `true` | Apply playwright-stealth per context |
 | `browser` | `auto_relaunch` | `true` | Transparently relaunch Chromium on disconnect/crash |
 | `browser` | `relaunch_max_attempts` | `3` | Bounded relaunch attempts |
@@ -716,6 +754,8 @@ class Agent:
     async def search(query, max_results=None, *, strict=False) -> SearchResponse        # links-only; sets search_blocked
     async def export_session_state(session_id, filename) -> StorageStateResult          # save logged-in storage_state
     async def import_session_state(filename, *, name=None) -> StorageStateResult         # rehydrate in a later process
+    async def scroll_to_bottom(*, session_id, tab_id=None) -> ActionResult              # exhaust lazy/infinite-scroll content
+    async def collect_across_pages(url, *, strategy="next_link", max_pages=None, session_id=None) -> CollectionResult  # walk paginated listings
 
     # --- Output ---
     async def save_results(result, output_path=None) -> Path
@@ -749,8 +789,12 @@ result.date              # str | None
 result.sitename          # str | None
 result.content           # str | None - main text content
 result.language          # str | None
-result.extraction_method # "trafilatura" | "bs4" | "raw" | "none"
+result.extraction_method # "trafilatura" | "bs4" | "raw" | "none" | "pdfplumber" | "pdf" | "api_json"
 result.content_length    # int
+result.injection         # InjectionReport | None - advisory prompt-injection finding (v1.7.0)
+result.content_sanitized # bool - hidden-DOM / invisible-Unicode stripping ran (v1.7.0)
+result.page_count        # int | None - PDF page count (v1.7.0)
+result.tables            # list - extracted tables as GFM markdown, e.g. from PDF (v1.7.0)
 ```
 
 **DownloadResult** (from `download`):
@@ -1299,7 +1343,7 @@ python -m web_agent serve-mcp
 
 The server uses stdio transport -- it's invoked by the MCP client, not run standalone.
 
-### Exposed Tools (45 total)
+### Exposed Tools (~47 total)
 
 **Single-shot pipeline tools** — one URL or query, one result:
 
@@ -1322,6 +1366,7 @@ Content-returning tools (`web_fetch`, `web_search`, `web_search_best`, `web_rese
 | `web_search_best` | Search, rank, return extracted top hit |
 | `web_find_and_download` | Search + download first matching file |
 | `web_research` | Multi-page research with citations |
+| `web_collect_pages` | Walk a paginated/infinite-scroll listing and assemble content across pages (v1.7.0) |
 
 **Browser session management** (cookies / login continuity; create/export/import new in v1.7.0):
 
@@ -1350,6 +1395,7 @@ Content-returning tools (`web_fetch`, `web_search`, `web_search_best`, `web_rese
 | `web_click_xy` | Click at CSS-pixel coordinates |
 | `web_type_text` | Type via keyboard at the current focus |
 | `web_press_key` | Press a single key combo (e.g. `Shift+Enter`) |
+| `web_scroll_to_bottom` | Scroll a session tab to exhaustion to load lazy/infinite-scroll content (v1.7.0) |
 
 **Observe + diagnostics** (v1.6.6 + v1.6.8):
 
@@ -1406,7 +1452,7 @@ Add:
 }
 ```
 
-Restart Claude Desktop. All 45 tools should appear in the tool picker.
+Restart Claude Desktop. All ~47 tools should appear in the tool picker.
 
 ### Claude Code Setup
 
@@ -1528,7 +1574,7 @@ WEB_AGENT_CACHE__ENABLED = "true"
 WEB_AGENT_CACHE__CACHE_DIR = "/var/cache/openclaw/web_agent"
 ```
 
-OpenClaw will auto-discover all 45 tools (`web_search` / `web_search_links`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the recipes including `web_fill_form_and_extract`, the 5 session-management tools, plus the tab / coordinate / observe / domain-skill / interaction-library surfaces).
+OpenClaw will auto-discover all ~47 tools (`web_search` / `web_search_links`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the recipes including `web_fill_form_and_extract` and `web_collect_pages`, the 5 session-management tools, plus the tab / coordinate / scroll / observe / domain-skill / interaction-library surfaces).
 
 **Path B: As a Python library** (for OpenClaw skills / custom hooks where you need fine control):
 
@@ -1665,8 +1711,8 @@ CI runs `ruff check`, `ruff format --check`, `mypy`, and the unit-test job on Py
 ## Project Structure
 
 ```
-web_agent/                       # 31 modules, mypy strict-clean
-  __init__.py                    # v1.7.0 -- 118 public exports
+web_agent/                       # 32 modules, mypy strict-clean
+  __init__.py                    # v1.7.0 -- 125 public exports
   py.typed                       # PEP 561 marker
   exceptions.py                  # WebAgentError hierarchy
   config.py                      # AppConfig + 13 sub-configs incl. ProxyConfig (programmatic / env / YAML)
@@ -1681,7 +1727,8 @@ web_agent/                       # 31 modules, mypy strict-clean
   agent.py                       # Public Agent orchestrator (entry point)
   browser_manager.py             # Chromium lifecycle + per-context stealth + crash auto-relaunch + 3 backends (playwright | cdp_owned | remote_cdp)
   challenge.py                   # Bot-wall / CAPTCHA detection -> ChallengeInfo (v1.7.0)
-  browser_actions.py             # 19 action handlers + per-action verify screenshot + trace recording
+  injection.py                   # Untrusted-content containment: hidden-DOM/Unicode strip + InjectionReport (v1.7.0)
+  browser_actions.py             # 19 action handlers + per-action verify screenshot + trace recording + scroll_to_bottom (v1.7.0)
   session_manager.py             # Persistent named BrowserContext sessions + storage_state export/import + idle reaper (v1.7.0)
   tab_manager.py                 # Per-session tab lifecycle + popup auto-register (v1.6.6)
   doctor.py                      # 14 capability probes + DoctorReport (v1.6.6)
@@ -1693,10 +1740,10 @@ web_agent/                       # 31 modules, mypy strict-clean
   search_engine.py               # Multi-provider search chain + per-provider circuit breaker (v1.7.0)
   search_providers.py            # SearchProvider ABC + SearXNG / DDGS / Playwright impls
   web_fetcher.py                 # Page + binary fetch with retry, safety, debug, sessions, cache
-  content_extractor.py           # trafilatura -> BS4 -> raw; PDF / XLSX / DOCX / CSV via [binary]
+  content_extractor.py           # trafilatura -> BS4 -> raw; PDF (pdfplumber -> pypdf) + tables / XLSX / DOCX / CSV via [binary] (v1.7.0)
   downloader.py                  # Three-strategy file/page download with safety + sessions
-  recipes.py                     # search_and_open_best, find_and_download, web_research, fill_form_and_extract
-  mcp_server.py                  # FastMCP server -- 45 tools
+  recipes.py                     # search_and_open_best, find_and_download, web_research, fill_form_and_extract, collect_across_pages (v1.7.0)
+  mcp_server.py                  # FastMCP server -- ~47 tools
   main.py                        # CLI: search / fetch / download / interact / screenshot / observe / skills / doctor / replay
 docker/searxng/                  # Self-hosted SearXNG quickstart (compose + tuned settings)
 tests/                           # 56 test files; mirrors the package layout (28 integration-marked, opt-in)
