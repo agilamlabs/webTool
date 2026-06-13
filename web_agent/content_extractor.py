@@ -11,6 +11,7 @@ hint -- it never crashes the pipeline.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import re
 from typing import Any, Optional
@@ -21,7 +22,8 @@ from bs4 import BeautifulSoup
 from loguru import logger
 
 from .config import AppConfig
-from .models import ExtractionResult, FetchResult, FetchStatus
+from .injection import detect_injection, strip_hidden_dom, strip_invisible_chars
+from .models import ExtractionResult, FetchResult, FetchStatus, InjectionReport
 
 # v1.6.16 CE-3: URL fragments that mark a captured response as
 # analytics/telemetry rather than the page's real data API. Used to
@@ -34,6 +36,97 @@ _ANALYTICS_URL_RE = re.compile(
     r"|/stats\b|/metrics\b|/rum\b|/log(?:s|ging)?\b)",
     re.IGNORECASE,
 )
+
+
+def _module_available(name: str) -> bool:
+    """v1.7.0 Wave 3C: True when an optional module can be imported.
+
+    Probes via :func:`importlib.util.find_spec` without importing the
+    module, so the no-``[binary]``-extra install is unaffected. Used to
+    choose the PDF engine (pdfplumber preferred, pypdf fallback). Tests
+    patch this to exercise each branch.
+    """
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):  # pragma: no cover -- defensive
+        # ImportError: a parent package is itself broken/missing.
+        # ValueError: ``name`` has no spec machinery (e.g. __main__).
+        return False
+
+
+def _pdf_title_from_metadata(metadata: Any) -> Optional[str]:
+    """Pull a non-empty ``/Title`` from pypdf/pdfplumber metadata.
+
+    pypdf exposes a ``DocumentInformation`` object (``.title`` attr);
+    pdfplumber exposes a plain dict (``{'Title': ...}``). Handle both
+    shapes; never raise -- a missing/garbage title just yields None.
+    """
+    if metadata is None:
+        return None
+    candidate: Any = None
+    try:
+        if isinstance(metadata, dict):
+            candidate = metadata.get("Title")
+        else:
+            candidate = getattr(metadata, "title", None)
+    except Exception:  # pragma: no cover -- defensive
+        return None
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    return None
+
+
+def _render_markdown_table(
+    table: list[list[Any]],
+    *,
+    page_index: int,
+    url: str,
+    max_cells: int,
+) -> Optional[str]:
+    """Render a pdfplumber table (list of rows) as a GFM markdown table.
+
+    The first row becomes the header. ``None`` cells (very common in
+    pdfplumber output) render as empty; pipes / newlines inside a cell
+    are escaped so they don't break the table grid. Bounded by
+    ``max_cells`` (rows * columns): when exceeded, whole trailing rows
+    are dropped to stay under budget and a WARNING is logged. Returns
+    ``None`` for an empty/degenerate table.
+    """
+    rows = [r for r in table if r is not None]
+    if not rows:
+        return None
+    width = max(len(r) for r in rows)
+    if width == 0:
+        return None
+
+    if max_cells > 0 and width * len(rows) > max_cells:
+        keep_rows = max(1, max_cells // width)
+        if keep_rows < len(rows):
+            logger.warning(
+                "PDF table on page {n} exceeds cell cap ({cap}); keeping "
+                "{kept}/{total} rows for {url}",
+                n=page_index,
+                cap=max_cells,
+                kept=keep_rows,
+                total=len(rows),
+                url=url,
+            )
+            rows = rows[:keep_rows]
+
+    def _cell(value: Any) -> str:
+        text = "" if value is None else str(value)
+        # Collapse newlines (a cell spanning lines would break the row)
+        # and escape pipes so the grid stays intact.
+        return text.replace("\r", " ").replace("\n", " ").replace("|", "\\|").strip()
+
+    def _row(cells: list[Any]) -> str:
+        padded = list(cells) + [None] * (width - len(cells))
+        return "| " + " | ".join(_cell(c) for c in padded) + " |"
+
+    header = _row(rows[0])
+    separator = "| " + " | ".join(["---"] * width) + " |"
+    body = [_row(r) for r in rows[1:]]
+    return "\n".join([header, separator, *body])
 
 
 def _extract_json_ld(html: str) -> list[dict[str, Any]]:
@@ -362,6 +455,10 @@ class ContentExtractor:
         # Python-API callers see byte-identical behaviour.
         if max_chars is not None or offset > 0:
             result = _apply_content_window(result, offset=offset, max_chars=max_chars)
+        # v1.7.0 Wave 3A: strip invisible/bidi chars + run advisory injection
+        # detection on the final VISIBLE text. Runs last so the scan sees
+        # exactly what a caller would consume. Gated on the safety flags.
+        result = self._apply_injection_containment(result)
         return result
 
     async def extract_async(
@@ -415,6 +512,116 @@ class ContentExtractor:
                 result.total_content_chars = len(result.markdown)
             result.markdown = result.markdown[:cap]
             result.truncated = True
+        return result
+
+    def _apply_injection_containment(self, result: ExtractionResult) -> ExtractionResult:
+        """v1.7.0 Wave 3A: strip invisible chars + run advisory injection scan.
+
+        Composes with the rest of the pipeline (runs AFTER cap + window so it
+        sees exactly the text a caller consumes). Two independent gates:
+
+        - ``SafetyConfig.sanitize_fetched_content`` (default on): strip
+          zero-width / bidi-control / invisible characters from ``content``
+          and ``markdown``, accumulate the removed count onto the report, and
+          set ``content_sanitized=True``. (Hidden-DOM stripping already ran
+          pre-extraction; its count is carried on ``result.injection`` here.)
+        - ``SafetyConfig.detect_prompt_injection`` (default on): run
+          :func:`detect_injection` on the visible text and merge the risk /
+          indicators / score into the report. On a HIGH detection the
+          configured ``injection_action`` is applied (``flag`` = no change;
+          ``redact`` = mask matched spans; ``block`` = empty the content and
+          stamp an actionable ``error_message``).
+
+        When BOTH gates are off this is a near no-op: any hidden-element count
+        captured pre-extraction is preserved, but no new report is created
+        and ``content_sanitized`` stays False.
+        """
+        safety = self._config.safety
+        sanitize = safety.sanitize_fetched_content
+        detect = safety.detect_prompt_injection
+
+        # Preserve any hidden-element count stamped pre-extraction.
+        existing = result.injection
+        stripped_hidden = existing.stripped_hidden_elements if existing is not None else 0
+
+        if not sanitize and not detect:
+            return result
+
+        invisible_removed = 0
+        if sanitize:
+            if result.content is not None:
+                cleaned, n = strip_invisible_chars(result.content)
+                if n:
+                    result.content = cleaned
+                    result.content_length = len(cleaned)
+                    invisible_removed += n
+            if result.markdown is not None:
+                cleaned_md, n = strip_invisible_chars(result.markdown)
+                if n:
+                    result.markdown = cleaned_md
+                    invisible_removed += n
+            result.content_sanitized = True
+
+        if detect:
+            visible = result.content if result.content is not None else (result.markdown or "")
+            report = detect_injection(visible)
+            report.stripped_hidden_elements = stripped_hidden
+            report.stripped_invisible_chars = invisible_removed
+            result.injection = report
+            if report.risk == "high":
+                result = self._apply_injection_action(result, report)
+        elif sanitize and (stripped_hidden or invisible_removed):
+            # Detection off but sanitization ran and removed something --
+            # keep a counts-only report so the strip is observable.
+            result.injection = InjectionReport(
+                stripped_hidden_elements=stripped_hidden,
+                stripped_invisible_chars=invisible_removed,
+            )
+
+        return result
+
+    def _apply_injection_action(
+        self, result: ExtractionResult, report: InjectionReport
+    ) -> ExtractionResult:
+        """Apply ``SafetyConfig.injection_action`` to a HIGH-risk result.
+
+        ``flag`` (default) leaves content untouched -- the report alone is the
+        signal. ``redact`` masks the matched indicator phrases in the visible
+        text. ``block`` empties the content and stamps an actionable
+        ``error_message`` (explicit opt-in only).
+        """
+        action = self._config.safety.injection_action
+        if action == "flag":
+            return result
+        if action == "redact":
+            for field in ("content", "markdown"):
+                text = getattr(result, field)
+                if not text:
+                    continue
+                for snippet in report.indicators:
+                    # Redact the indicator's leading phrase. Snippets are
+                    # truncated/whitespace-collapsed, so redact the longest
+                    # contiguous run that still appears verbatim; fall back to
+                    # nothing when no verbatim run is found (collapsed context).
+                    needle = snippet.split("...")[0].strip()
+                    if needle and needle in text:
+                        text = text.replace(needle, "[redacted: possible injection]")
+                setattr(result, field, text)
+            if result.content is not None:
+                result.content_length = len(result.content)
+            return result
+        # action == "block"
+        result.content = None
+        result.markdown = None
+        result.content_length = 0
+        result.error_message = (
+            "content blocked: high-confidence prompt-injection indicators "
+            f"detected (risk={report.risk}, score={report.score}); "
+            "SafetyConfig.injection_action='block'. Inspect "
+            "injection.indicators to see why, or set injection_action='flag' "
+            "to receive the content with an advisory flag instead"
+        )
+        result.failure_stage = "injection_blocked"
         return result
 
     def _extract_dispatch(
@@ -492,6 +699,29 @@ class ContentExtractor:
         html = fetch_result.html
         min_len = self._config.extraction.min_content_length
 
+        # v1.7.0 Wave 3A: strip hidden-from-humans DOM BEFORE extraction so
+        # the injected text a human can't see (display:none divs, off-screen
+        # spans, aria-hidden, comments, script/style) never reaches
+        # trafilatura/bs4/markdown. Deterministic, zero false-positive harm.
+        # The removed-element count is stashed on the result via an early
+        # InjectionReport so ``extract`` can complete the report after the
+        # invisible-char pass. Gated on the sanitize flag.
+        # Keep the original HTML for JSON-LD extraction below: strip_hidden_dom
+        # removes ALL <script> tags, which would also drop
+        # <script type="application/ld+json"> metadata. JSON-LD is structured
+        # DATA the caller wants, not hidden injection TEXT, so it is read from
+        # the pre-strip HTML (it is surfaced in structured_data, never executed,
+        # and the main-content injection scan still runs on the stripped text).
+        original_html = html
+        stripped_hidden = 0
+        if self._config.safety.sanitize_fetched_content:
+            html, stripped_hidden = strip_hidden_dom(html)
+
+        def _stamp_hidden(res: ExtractionResult) -> ExtractionResult:
+            if stripped_hidden:
+                res.injection = InjectionReport(stripped_hidden_elements=stripped_hidden)
+            return res
+
         # v1.6.12: JSON-LD enrichment. The helper swallows malformed
         # JSON (including ``RecursionError`` from deeply-nested
         # adversarial payloads). Cost: one extra BS4+lxml parse per
@@ -500,8 +730,9 @@ class ContentExtractor:
         # already do; a future patch can share the parsed soup, but
         # the duplication is acceptable for now (small absolute cost,
         # keeps the JSON-LD path decoupled from the fallback chain).
-        # Compute once; attach to whichever extractor wins.
-        structured = _extract_json_ld(html)
+        # Compute once; attach to whichever extractor wins. Read from the
+        # pre-strip HTML so hidden-DOM stripping doesn't drop JSON-LD scripts.
+        structured = _extract_json_ld(original_html)
 
         # v1.6.12: prefer_api path -- when the caller opted in AND the
         # FetchResult carries a captured JSON response body, route
@@ -521,14 +752,14 @@ class ContentExtractor:
         result = self._extract_trafilatura(html, url)
         if result and result.content and len(result.content) >= min_len:
             result.structured_data = structured
-            return result
+            return _stamp_hidden(result)
         logger.debug("Trafilatura insufficient for {url}, trying BS4", url=url)
 
         # Layer 2: BeautifulSoup
         result = self._extract_bs4(html, url)
         if result and result.content and len(result.content) >= min_len:
             result.structured_data = structured
-            return result
+            return _stamp_hidden(result)
         logger.debug("BS4 insufficient for {url}, falling back to raw", url=url)
 
         # Layer 3: raw text (always-success unless catastrophic)
@@ -541,7 +772,7 @@ class ContentExtractor:
                 f"(content_length={raw_result.content_length})"
             )
         raw_result.structured_data = structured
-        return raw_result
+        return _stamp_hidden(raw_result)
 
     # ------------------------------------------------------------------
     # v1.6.12: API-candidates extraction (prefer_api=True path)
@@ -675,64 +906,271 @@ class ContentExtractor:
     # Binary branches: PDF + XLSX
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_pdf(blob: bytes, url: str) -> ExtractionResult:
-        """Extract text from PDF bytes using pypdf.
+    def _extract_pdf(self, blob: bytes, url: str) -> ExtractionResult:
+        """Extract text (and tables) from PDF bytes.
 
-        Returns an ExtractionResult with extraction_method='pdf' on success
-        or 'none' on missing-library / encrypted / malformed PDF.
+        Engine preference chain (v1.7.0 Wave 3C):
+
+        1. **pdfplumber** when installed -- per-page text with better
+           layout fidelity AND per-page table extraction rendered as
+           markdown. ``extraction_method='pdfplumber'``.
+        2. **pypdf** fallback when pdfplumber is missing -- page text
+           only, no tables. ``extraction_method='pdf'``.
+        3. Neither installed -> ``extraction_method='none'`` with an
+           install hint (the pre-Wave-3C missing-extra contract).
+
+        Both engines emit per-page markers (``===== Page N =====``) when
+        ``ExtractionConfig.pdf_page_markers`` is on so an agent can cite
+        pages, and set ``page_count``. When a PDF has pages but no
+        embedded text layer (scanned / image-only), the result is NOT a
+        bare empty success -- ``error_message`` names the OCR reason and
+        ``failure_stage='extract'``.
+
+        Availability is probed with :func:`importlib.util.find_spec`
+        (mirrors how the optional-extra paths detect their library
+        without a hard top-level import) so the no-extra install keeps
+        working; tests patch ``_module_available`` to exercise each branch.
+        """
+        if _module_available("pdfplumber"):
+            return self._extract_pdf_pdfplumber(blob, url)
+        if _module_available("pypdf"):
+            return self._extract_pdf_pypdf(blob, url)
+        logger.warning(
+            "Neither pdfplumber nor pypdf installed; PDF extraction skipped. "
+            "Install with: pip install 'web-agent-toolkit[binary]'"
+        )
+        return ExtractionResult(
+            url=url,
+            extraction_method="none",
+            content=None,
+            error_message=(
+                "PDF extraction requires the [binary] extra (pdfplumber "
+                "preferred, pypdf fallback); neither is installed. Install "
+                "with: pip install 'web-agent-toolkit[binary]'"
+            ),
+            failure_stage="extract",
+        )
+
+    @staticmethod
+    def _scanned_pdf_result(url: str, page_count: int) -> ExtractionResult:
+        """Build the actionable result for an image-only / scanned PDF.
+
+        A PDF with pages but no embedded text layer needs OCR, which
+        web_agent does not perform. Rather than a bare empty success,
+        surface why and what to do next.
+        """
+        logger.info(
+            "PDF appears image-only / scanned (no text layer) for {url} "
+            "({n} pages)",
+            url=url,
+            n=page_count,
+        )
+        return ExtractionResult(
+            url=url,
+            extraction_method="none",
+            content=None,
+            page_count=page_count,
+            error_message=(
+                "PDF appears to be image-only / scanned (no embedded text "
+                "layer); OCR is required and is not supported by web_agent -- "
+                "try a different source or an OCR tool."
+            ),
+            failure_stage="extract",
+        )
+
+    def _extract_pdf_pdfplumber(self, blob: bytes, url: str) -> ExtractionResult:
+        """Preferred PDF path: per-page text + markdown tables via pdfplumber.
+
+        Bounds table extraction by ``pdf_max_tables`` (total tables) and
+        ``pdf_max_table_cells`` (per-table cells); both truncate with a
+        WARNING and set ``truncated`` rather than silently dropping. The
+        document is streamed page-by-page; only the rendered strings are
+        retained, keeping peak memory bounded by the content cap rather
+        than the raw page objects.
+        """
+        from io import BytesIO
+
+        import pdfplumber
+
+        ext_cfg = self._config.extraction
+        emit_markers = ext_cfg.pdf_page_markers
+        want_tables = ext_cfg.pdf_extract_tables and ext_cfg.pdf_max_tables > 0
+        max_tables = ext_cfg.pdf_max_tables
+        max_cells = ext_cfg.pdf_max_table_cells
+
+        page_parts: list[str] = []
+        tables_md: list[str] = []
+        any_text = False
+        tables_truncated = False
+        title: Optional[str] = None
+        try:
+            with pdfplumber.open(BytesIO(blob)) as pdf:
+                title = _pdf_title_from_metadata(getattr(pdf, "metadata", None))
+                page_count = len(pdf.pages)
+                for index, page in enumerate(pdf.pages, start=1):
+                    segments: list[str] = []
+                    if emit_markers:
+                        segments.append(f"===== Page {index} =====")
+                    try:
+                        page_text = page.extract_text() or ""
+                    except Exception as page_exc:
+                        logger.debug(
+                            "pdfplumber page {n} text extract failed: {e}",
+                            n=index,
+                            e=page_exc,
+                        )
+                        page_text = ""
+                    if page_text.strip():
+                        any_text = True
+                        segments.append(page_text.strip())
+                    if want_tables:
+                        remaining = max_tables - len(tables_md)
+                        page_tables, dropped = self._render_pdf_tables(
+                            page,
+                            page_index=index,
+                            url=url,
+                            remaining=remaining,
+                            max_cells=max_cells,
+                        )
+                        if dropped:
+                            tables_truncated = True
+                        for md in page_tables:
+                            tables_md.append(md)
+                            segments.append(md)
+                    if len(segments) > (1 if emit_markers else 0):
+                        page_parts.append("\n\n".join(segments))
+                    elif emit_markers:
+                        # Keep the marker even for an empty page so page
+                        # numbers stay aligned for citation.
+                        page_parts.append(segments[0])
+        except Exception as exc:
+            logger.warning(
+                "pdfplumber extraction failed for {url}: {e}", url=url, e=exc
+            )
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+
+        if page_count == 0:
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+        if not any_text and not tables_md:
+            # Pages exist but carry no extractable text layer or tables.
+            return self._scanned_pdf_result(url, page_count)
+
+        text = "\n\n".join(page_parts).strip()
+        result = ExtractionResult(
+            url=url,
+            title=title,
+            content=text if text else None,
+            extraction_method="pdfplumber",
+            content_length=len(text),
+            page_count=page_count,
+            tables=tables_md,
+        )
+        if tables_truncated:
+            result.truncated = True
+        return result
+
+    def _render_pdf_tables(
+        self,
+        page: Any,
+        *,
+        page_index: int,
+        url: str,
+        remaining: int,
+        max_cells: int,
+    ) -> tuple[list[str], int]:
+        """Extract a page's tables and render each as a markdown table.
+
+        ``remaining`` is the global per-document table budget still
+        available (``pdf_max_tables`` minus tables already rendered).
+        Renders at most ``remaining`` tables from this page; returns
+        ``(markdown_tables, dropped)`` where ``dropped`` is the number of
+        this page's tables that were NOT rendered because the budget ran
+        out (so the caller can flag ``truncated``). Per-table cell count
+        is bounded by ``max_cells`` (whole trailing rows dropped) with a
+        WARNING; an over-budget table is still emitted, just truncated.
         """
         try:
-            from pypdf import PdfReader
-        except ImportError:
+            raw_tables = page.extract_tables() or []
+        except Exception as exc:
+            logger.debug(
+                "pdfplumber table extract failed on page {n}: {e}",
+                n=page_index,
+                e=exc,
+            )
+            return [], 0
+
+        # Render only non-degenerate tables, capped by the remaining budget.
+        renderable = [
+            md
+            for md in (
+                _render_markdown_table(
+                    t, page_index=page_index, url=url, max_cells=max_cells
+                )
+                for t in raw_tables
+            )
+            if md
+        ]
+        budget = max(0, remaining)
+        if len(renderable) > budget:
+            dropped = len(renderable) - budget
             logger.warning(
-                "pypdf not installed; PDF extraction skipped. "
-                "Install with: pip install 'web-agent-toolkit[binary]'"
-            )
-            return ExtractionResult(
+                "PDF table cap reached for {url}; dropping {dropped} table(s) "
+                "(page {n})",
                 url=url,
-                extraction_method="none",
-                content=None,
+                dropped=dropped,
+                n=page_index,
             )
+            return renderable[:budget], dropped
+        return renderable, 0
 
+    def _extract_pdf_pypdf(self, blob: bytes, url: str) -> ExtractionResult:
+        """Fallback PDF path: page text via pypdf (no tables).
+
+        Adds per-page markers (when enabled) and ``page_count`` so the
+        fallback still supports page citation, and the same scanned /
+        no-text-layer detection as the pdfplumber path. ``extraction_
+        method='pdf'`` so callers/telemetry can see pypdf won (vs
+        ``'pdfplumber'``).
+        """
+        from io import BytesIO
+
+        from pypdf import PdfReader
+
+        emit_markers = self._config.extraction.pdf_page_markers
         try:
-            from io import BytesIO
-
             reader = PdfReader(BytesIO(blob))
             if reader.is_encrypted:
                 logger.info("PDF is encrypted, skipping: {url}", url=url)
-                return ExtractionResult(
-                    url=url,
-                    extraction_method="none",
-                    content=None,
-                )
-            parts: list[str] = []
-            for page in reader.pages:
+                return ExtractionResult(url=url, extraction_method="none", content=None)
+            page_parts: list[str] = []
+            any_text = False
+            page_count = len(reader.pages)
+            for index, page in enumerate(reader.pages, start=1):
                 try:
-                    parts.append(page.extract_text() or "")
+                    page_text = (page.extract_text() or "").strip()
                 except Exception as page_exc:
                     logger.debug("PDF page extract failed: {e}", e=page_exc)
-            text = "\n\n".join(p for p in parts if p).strip()
-            if not text:
-                return ExtractionResult(
-                    url=url,
-                    extraction_method="none",
-                    content=None,
-                )
-            # Pull /Title from the document info dict if available
-            title: Optional[str] = None
-            try:
-                info = reader.metadata
-                if info is not None and getattr(info, "title", None):
-                    title = str(info.title)
-            except Exception:
-                pass
+                    page_text = ""
+                if page_text:
+                    any_text = True
+                if emit_markers:
+                    marker = f"===== Page {index} ====="
+                    page_parts.append(f"{marker}\n\n{page_text}" if page_text else marker)
+                elif page_text:
+                    page_parts.append(page_text)
+            if page_count == 0:
+                return ExtractionResult(url=url, extraction_method="none", content=None)
+            if not any_text:
+                return self._scanned_pdf_result(url, page_count)
+            text = "\n\n".join(page_parts).strip()
+            title = _pdf_title_from_metadata(reader.metadata)
             return ExtractionResult(
                 url=url,
                 title=title,
-                content=text,
+                content=text if text else None,
                 extraction_method="pdf",
                 content_length=len(text),
+                page_count=page_count,
             )
         except Exception as exc:
             logger.warning("PDF extraction failed for {url}: {e}", url=url, e=exc)

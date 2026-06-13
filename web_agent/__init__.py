@@ -78,6 +78,12 @@ from .exceptions import (
     SelectorNotFoundError,
     WebAgentError,
 )
+from .injection import (
+    detect_injection,
+    strip_hidden_dom,
+    strip_invisible_chars,
+    wrap_untrusted,
+)
 from .models import (
     Action,
     ActionResult,
@@ -91,6 +97,8 @@ from .models import (
     Citation,
     ClickInput,
     ClickXYInput,
+    CollectedPage,
+    CollectionResult,
     DialogInput,
     DialogResponse,
     DoctorCheck,
@@ -108,6 +116,7 @@ from .models import (
     HoverInput,
     HtmlCaptureSource,
     IframeClickInput,
+    InjectionReport,
     KeyboardInput,
     LocatorSpec,
     MouseButton,
@@ -198,6 +207,11 @@ __all__ = [
     "parse_retry_after",
     # Page-content capture helpers (v1.6.13)
     "safe_page_content",
+    # Injection-containment helpers (v1.7.0 Wave 3A)
+    "detect_injection",
+    "strip_hidden_dom",
+    "strip_invisible_chars",
+    "wrap_untrusted",
     # Politeness + audit
     "AuditLogger",
     "RateLimiter",
@@ -241,6 +255,8 @@ __all__ = [
     "Citation",
     "ClickInput",
     "ClickXYInput",
+    "CollectedPage",
+    "CollectionResult",
     "DialogInput",
     "DialogResponse",
     "DoctorCheck",
@@ -258,6 +274,7 @@ __all__ = [
     "HoverInput",
     "HtmlCaptureSource",
     "IframeClickInput",
+    "InjectionReport",
     "KeyboardInput",
     "LocatorSpec",
     "MouseButton",
