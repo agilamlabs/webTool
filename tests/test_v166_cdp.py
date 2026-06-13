@@ -45,7 +45,7 @@ async def test_cdp_off_no_remote_debugging_port_in_args(tmp_path: Path) -> None:
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_pw_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_pw_cm):
         await bm.start()
 
     args = fake_chromium.launch.call_args.kwargs["args"]
@@ -76,28 +76,36 @@ async def test_cdp_on_appends_arg_and_resolves_endpoint(tmp_path: Path) -> None:
     bm = BrowserManager(config)
     fake_browser = MagicMock()
     fake_browser.close = AsyncMock()
+    fake_root_ctx = MagicMock(name="EphemeralRootContext")
+    fake_root_ctx.browser = fake_browser
+    fake_root_ctx.close = AsyncMock()
     fake_chromium = MagicMock()
 
     async def _launch_and_write_port_file(**_kwargs):
-        # Simulate Chromium's behavior: write DevToolsActivePort into
-        # the user-data-dir as soon as it's launched.
+        # v1.7.0: ephemeral isolation dispatches to
+        # launch_persistent_context (Playwright rejects --user-data-dir
+        # on chromium.launch). Simulate Chromium writing
+        # DevToolsActivePort into the user-data-dir as soon as it starts.
         assert bm._effective_profile_dir is not None
         (bm._effective_profile_dir / "DevToolsActivePort").write_text(
             "54321\n/devtools/browser/abc-123-uuid\n",
             encoding="utf-8",
         )
-        return fake_browser
+        return fake_root_ctx
 
-    fake_chromium.launch = AsyncMock(side_effect=_launch_and_write_port_file)
+    fake_chromium.launch_persistent_context = AsyncMock(side_effect=_launch_and_write_port_file)
+    fake_chromium.launch = AsyncMock(
+        side_effect=AssertionError("ephemeral isolation must use launch_persistent_context")
+    )
     fake_pw = MagicMock(chromium=fake_chromium)
     fake_pw_cm = MagicMock()
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_pw_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_pw_cm):
         await bm.start()
 
-    args = fake_chromium.launch.call_args.kwargs["args"]
+    args = fake_chromium.launch_persistent_context.call_args.kwargs["args"]
     assert "--remote-debugging-port=0" in args
     assert "--remote-debugging-address=127.0.0.1" in args
 
@@ -179,6 +187,9 @@ async def test_cdp_fixed_port_still_discovers_endpoint(tmp_path: Path) -> None:
     bm = BrowserManager(config)
     fake_browser = MagicMock()
     fake_browser.close = AsyncMock()
+    fake_root_ctx = MagicMock(name="EphemeralRootContext")
+    fake_root_ctx.browser = fake_browser
+    fake_root_ctx.close = AsyncMock()
     fake_chromium = MagicMock()
 
     async def _launch_and_write_port_file(**_kwargs):
@@ -188,18 +199,21 @@ async def test_cdp_fixed_port_still_discovers_endpoint(tmp_path: Path) -> None:
             "9222\n/devtools/browser/fixed-port-uuid\n",
             encoding="utf-8",
         )
-        return fake_browser
+        return fake_root_ctx
 
-    fake_chromium.launch = AsyncMock(side_effect=_launch_and_write_port_file)
+    fake_chromium.launch_persistent_context = AsyncMock(side_effect=_launch_and_write_port_file)
+    fake_chromium.launch = AsyncMock(
+        side_effect=AssertionError("ephemeral isolation must use launch_persistent_context")
+    )
     fake_pw = MagicMock(chromium=fake_chromium)
     fake_pw_cm = MagicMock()
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_pw_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_pw_cm):
         await bm.start()
 
-    args = fake_chromium.launch.call_args.kwargs["args"]
+    args = fake_chromium.launch_persistent_context.call_args.kwargs["args"]
     assert "--remote-debugging-port=9222" in args
     endpoint = bm.get_cdp_endpoint()
     assert endpoint == "ws://127.0.0.1:9222/devtools/browser/fixed-port-uuid"

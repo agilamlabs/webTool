@@ -277,14 +277,15 @@ async def test_save_page_aborts_when_rendered_dom_too_big(tmp_path: Path):
 
 
 # ----------------------------------------------------------------------
-# Sanity: version is on the 1.6.x family (bumped to 1.6.5 in v1.6.5)
+# Sanity: version is on the 1.x line (loose on purpose -- a minor bump
+# must not churn historical per-version test files).
 # ----------------------------------------------------------------------
 
 
 def test_version_on_16_family():
     from web_agent import __version__
 
-    assert __version__.startswith("1.6.")
+    assert __version__.startswith("1.")
 
 
 # Skipped on Windows -- the original failure was on Linux. We document

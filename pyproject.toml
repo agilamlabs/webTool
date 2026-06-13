@@ -82,6 +82,11 @@ web-agent-mcp = "web_agent.mcp_server:main"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Default suite is hermetic: live-network / real-browser tests sit behind the
+# `integration` marker and are deselected unless explicitly requested. A CLI
+# `-m integration` overrides this addopts value (argparse keeps the last -m),
+# so the documented opt-in `pytest -m integration` still works.
+addopts = '-m "not integration"'
 markers = [
     "integration: tests requiring network access and a real browser",
 ]

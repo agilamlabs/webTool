@@ -20,8 +20,9 @@ from web_agent.recipes import RANKING_PROFILES, Recipes, _resolve_domain_hints
 
 
 def test_version_bump():
-    # v1.6.x family; v1.6.3 added user-extensible ranking profiles + smart routing fixes.
-    assert __version__.startswith("1.6.")
+    # Loose family sanity check: the 1.x line (broad on purpose so a minor
+    # bump doesn't churn historical per-version test files).
+    assert __version__.startswith("1.")
 
 
 # ----------------------------------------------------------------------

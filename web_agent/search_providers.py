@@ -36,6 +36,56 @@ from .models import SearchResponse, SearchResultItem
 from .rate_limiter import RateLimiter
 
 
+def _is_ddgs_ratelimit(exc: BaseException) -> bool:
+    """True if ``exc`` is a ddgs rate-limit / block signal.
+
+    Matched structurally (by class name across the MRO) rather than via
+    ``isinstance(exc, ddgs.exceptions.RatelimitException)`` so this guard
+    stays import-free: ``ddgs`` is an optional dependency loaded lazily, and
+    a wrong/renamed import here would itself raise while we are already
+    handling an exception. ddgs names the class ``RatelimitException``; we
+    also accept any class whose name mentions both "rate" and "limit" to
+    survive minor upstream renames, plus a substring probe on the message as
+    a last resort (HTTP 202/429 CAPTCHA challenges).
+    """
+    for klass in type(exc).__mro__:
+        cname = klass.__name__.lower()
+        if cname == "ratelimitexception" or ("rate" in cname and "limit" in cname):
+            return True
+    msg = str(exc).lower()
+    return "ratelimit" in msg or "rate limit" in msg or "202 ratelimit" in msg
+
+
+class ProviderBlockedError(Exception):
+    """A provider was actively blocked (CAPTCHA / rate-limit / anomaly).
+
+    v1.7.0 (Wave 2E): distinguishes "the upstream refused us" from "the
+    upstream answered with zero hits". A provider that gets CAPTCHA'd or
+    HTTP-429'd previously returned an empty :class:`SearchResponse`, which
+    is indistinguishable from a genuine no-results answer -- so the
+    :class:`~web_agent.search_engine.SearchEngine` could neither tell the
+    caller *why* a search came back empty nor trip a circuit breaker on the
+    offending provider. Providers now raise this instead of returning a
+    silent empty list when they detect an active block.
+
+    The engine catches it to (a) feed its per-provider circuit breaker and
+    (b) surface a blocked-vs-empty distinction to the caller. It is NOT a
+    :class:`~web_agent.exceptions.WebAgentError`: it is an internal control
+    signal between providers and the engine, never raised out of the public
+    API (the engine maps it to ``SearchError`` only under ``strict=True``).
+
+    Args:
+        provider: ``name`` of the provider that was blocked.
+        reason: Short machine-ish reason string (e.g. ``"captcha"``,
+            ``"ratelimit"``), surfaced in logs and diagnostics.
+    """
+
+    def __init__(self, provider: str, reason: str = "blocked") -> None:
+        self.provider = provider
+        self.reason = reason
+        super().__init__(f"Search provider {provider!r} blocked ({reason})")
+
+
 class SearchProvider(ABC):
     """Abstract base for one search backend.
 
@@ -44,8 +94,11 @@ class SearchProvider(ABC):
     - Override ``is_available`` if the provider has preconditions
       (config keys, optional dependencies). Default returns True.
     - Implement ``search`` to return a :class:`SearchResponse`. May
-      return an empty response (chain falls through) or raise on
-      transient errors (chain logs and falls through).
+      return an empty response (chain falls through on a genuine
+      zero-results answer), raise :class:`ProviderBlockedError` when
+      actively blocked (CAPTCHA / rate-limit -- engine trips the circuit
+      breaker), or raise any other exception on a transient error (chain
+      logs and falls through).
     """
 
     name: ClassVar[str] = "<unset>"
@@ -209,6 +262,17 @@ class DDGSProvider(SearchProvider):
         try:
             raw = await asyncio.to_thread(_do_search)
         except Exception as exc:
+            # v1.7.0 (Wave 2E): distinguish an active block from a generic
+            # failure. ddgs raises RatelimitException when DuckDuckGo
+            # CAPTCHA's / IP-blocks us (it happens reliably above ~1 req/s);
+            # surfacing that as ProviderBlockedError lets the engine trip its
+            # circuit breaker and tell the caller "blocked" rather than
+            # silently swallowing it as zero results. The class is matched by
+            # name (not import) so a missing/renamed ddgs.exceptions module
+            # never turns this guard itself into a crash.
+            if _is_ddgs_ratelimit(exc):
+                logger.warning("DDGS rate-limited / blocked: {e}", e=exc)
+                raise ProviderBlockedError(self.name, "ratelimit") from exc
             logger.warning("DDGS failed: {e}", e=exc)
             return SearchResponse(query=query)
 
@@ -264,23 +328,42 @@ class PlaywrightProvider(SearchProvider):
         self._rate_limiter = rate_limiter
 
     async def search(self, query: str, max_results: int) -> SearchResponse:
-        # Try Google SERP first
+        # Try Google SERP first.
         if self._rate_limiter is not None:
             await self._rate_limiter.acquire("www.google.com")
-        result = await self._search_google(query, max_results)
+        result, google_blocked = await self._search_google(query, max_results)
         if result.results:
             return result
 
         logger.info("Playwright Google empty, falling back to DDG HTML")
         if self._rate_limiter is not None:
             await self._rate_limiter.acquire("html.duckduckgo.com")
-        return await self._search_duckduckgo(query, max_results)
+        ddg_result, ddg_blocked = await self._search_duckduckgo(query, max_results)
+        if ddg_result.results:
+            return ddg_result
+
+        # v1.7.0 (Wave 2E): both engines came back empty. If EITHER was an
+        # active block (CAPTCHA / sorry page / anomaly) rather than a genuine
+        # zero-results answer, signal it so the engine trips the circuit
+        # breaker and the caller can tell blocked from empty. A clean
+        # zero-results pass through both engines returns the empty response.
+        if google_blocked or ddg_blocked:
+            reason = "captcha" if google_blocked else "blocked"
+            raise ProviderBlockedError(self.name, reason)
+        return ddg_result
 
     # ------------------------------------------------------------------
     # Google SERP
     # ------------------------------------------------------------------
 
-    async def _search_google(self, query: str, max_results: int) -> SearchResponse:
+    async def _search_google(self, query: str, max_results: int) -> tuple[SearchResponse, bool]:
+        """Scrape Google's SERP.
+
+        Returns ``(response, blocked)`` where ``blocked`` is True when an
+        active anti-bot block (CAPTCHA / ``/sorry/`` interstitial) was
+        detected -- as opposed to a genuine empty result set or a transient
+        navigation failure.
+        """
         params: dict[str, str | int] = {
             "q": query,
             "hl": self._config.search.language,
@@ -299,7 +382,7 @@ class PlaywrightProvider(SearchProvider):
 
                 if await self._is_blocked(page):
                     logger.warning("Google blocked the request (CAPTCHA detected)")
-                    return SearchResponse(query=query)
+                    return SearchResponse(query=query), True
 
                 await self._handle_google_consent(page)
 
@@ -307,14 +390,14 @@ class PlaywrightProvider(SearchProvider):
                     await page.wait_for_selector("div#search, div#rso", timeout=15000)
                 except Exception:
                     logger.warning("Google SERP selectors not found")
-                    return SearchResponse(query=query)
+                    return SearchResponse(query=query), False
 
                 items = await self._parse_google_results(page, max_results)
 
-            return SearchResponse(query=query, total_results=len(items), results=items)
+            return SearchResponse(query=query, total_results=len(items), results=items), False
         except Exception as exc:
             logger.warning("Google search failed: {e}", e=exc)
-            return SearchResponse(query=query)
+            return SearchResponse(query=query), False
 
     async def _is_blocked(self, page: Page) -> bool:
         blocked_indicators = [
@@ -400,7 +483,15 @@ class PlaywrightProvider(SearchProvider):
     # DuckDuckGo HTML (no JS, scraping-friendly)
     # ------------------------------------------------------------------
 
-    async def _search_duckduckgo(self, query: str, max_results: int) -> SearchResponse:
+    async def _search_duckduckgo(
+        self, query: str, max_results: int
+    ) -> tuple[SearchResponse, bool]:
+        """Scrape DuckDuckGo's JS-free HTML endpoint.
+
+        Returns ``(response, blocked)`` where ``blocked`` is True when DDG
+        served its anti-bot anomaly/challenge page instead of results (as
+        opposed to a genuine empty result set).
+        """
         params = {"q": query}
         if self._config.search.safe_search:
             params["kp"] = "1"
@@ -418,15 +509,46 @@ class PlaywrightProvider(SearchProvider):
                     try:
                         await page.wait_for_selector("div.results a.result__a", timeout=10000)
                     except Exception:
-                        logger.warning("DuckDuckGo HTML returned no results")
-                        return SearchResponse(query=query)
+                        # No results selector. Disambiguate an active block
+                        # (DDG anomaly / challenge interstitial) from a true
+                        # zero-results page before reporting.
+                        blocked = await self._ddg_is_blocked(page)
+                        if blocked:
+                            logger.warning("DuckDuckGo HTML served an anomaly/block page")
+                        else:
+                            logger.warning("DuckDuckGo HTML returned no results")
+                        return SearchResponse(query=query), blocked
 
                 items = await self._parse_duckduckgo_results(page, max_results)
 
-            return SearchResponse(query=query, total_results=len(items), results=items)
+            return SearchResponse(query=query, total_results=len(items), results=items), False
         except Exception as exc:
             logger.error("DuckDuckGo HTML search failed: {e}", e=exc)
-            return SearchResponse(query=query)
+            return SearchResponse(query=query), False
+
+    async def _ddg_is_blocked(self, page: Page) -> bool:
+        """True if the DDG HTML page is an anti-bot anomaly / challenge page.
+
+        DDG serves an "anomaly" interstitial (rather than an HTTP error)
+        when it rate-limits / bot-flags a client. Detected via the URL and a
+        cheap body-text probe so the engine can tell blocked from empty.
+        """
+        if "anomaly" in page.url.lower() or "/sorry" in page.url.lower():
+            return True
+        for selector in ("form#challenge-form", "input[name='anomaly_token']"):
+            try:
+                if await page.query_selector(selector):
+                    return True
+            except Exception:
+                # Best-effort probe on a possibly-dying page; never fatal.
+                return False
+        try:
+            body_text = (await page.inner_text("body"))[:600].lower()
+        except Exception:
+            # Body may be unavailable on a dead/navigating page.
+            return False
+        markers = ("anomaly in your", "unfortunately, bots", "if this error persists")
+        return any(m in body_text for m in markers)
 
     @staticmethod
     def _extract_ddg_url(redirect_href: str) -> str:

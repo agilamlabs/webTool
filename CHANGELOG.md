@@ -1,5 +1,152 @@
 # Changelog
 
+## [1.7.0] - 2026-06-13
+
+### Real-world hardening: solve the problems autonomous agents actually hit on the live 2026 web
+
+A market-research + full-codebase gap analysis identified the failure modes that
+break agentic web tools in production — bot walls, token blowout, opaque
+failures, fragile sessions/auth, search fragility, no proxy, crash-prone long
+runs — and this release closes each one. Everything is **additive**: there are
+**no breaking changes to documented Python public APIs**. Delivered in waves
+behind a 4-dimension adversarial multi-agent close-out review (security / fetch
+correctness / concurrency / search+wiring) of the full ~7,400-line diff that
+found **no critical or high issues** and confirmed the existing SSRF,
+path-traversal, cookie-domain, and session-isolation guarantees hold across the
+refactor. Gates: **1324 passed / 28 deselected**, ruff clean, mypy strict clean.
+
+**Wave 0 — Hermetic test suite + toolchain**
+- 28 live-network / real-browser tests are now quarantined behind the
+  `integration` pytest marker. The marker was declared but selected **0 tests**,
+  and several "passing" tests were silently launching real Chromium. The default
+  suite now runs `-m "not integration"` via `pyproject` `addopts`; the CI
+  integration job switched to `-m integration` and the unit job's ad-hoc
+  ignore-flags were dropped. **Behaviour change:** a bare `pytest` run no longer
+  executes integration tests — opt in with `-m integration`.
+- Fixed 6 mypy strict drift errors (config `default_factory` `Literal` typing,
+  `web_fetcher` `Sequence` variance, stale `type: ignore`s).
+
+**Wave 1A — Honest bot-wall / challenge detection** (new `web_agent/challenge.py`)
+- `detect_challenge(html, status_code, headers, final_url) -> ChallengeInfo | None`
+  uses high-precision **structural** markers for Cloudflare, DataDome, Akamai,
+  PerimeterX/HUMAN, and generic reCAPTCHA/hCaptcha. Bare vendor mentions in prose
+  never trigger — only challenge-page structure does. New `ChallengeInfo` model
+  (`vendor` / `kind` / `confidence` / `evidence` / `auto_settle_likely`).
+- New `FetchStatus.BLOCKED` + `FetchResult.challenge`. **Behaviour change:** a
+  bot-challenge page served with HTTP 200 used to return
+  `FetchStatus.SUCCESS`-with-garbage; it now returns `BLOCKED` with an
+  **actionable** `error_message` telling the calling LLM its options (retry
+  later / reuse an authenticated session / headed handoff / alternative source).
+- Bounded settle-and-recheck in `web_fetcher`: a Cloudflare managed-JS challenge
+  that a real browser auto-passes is re-captured (via `safe_page_content`) and
+  re-detected up to `challenge_max_rechecks` times before giving up. `BLOCKED`
+  is **never cached**; `FetchDiagnostic` carries `block_reason='bot_challenge'`
+  for multi-URL flows.
+- New `FetchConfig` knobs: `challenge_detection_enabled` (`True`),
+  `challenge_settle_ms` (`3500`), `challenge_max_rechecks` (`2`).
+
+**Wave 1B — Token-blowout + failure-opacity fixes** (the #1 complaint class against agentic web tools)
+- `ExtractionResult` gained additive failure-transparency fields
+  `fetch_status` / `status_code` / `error_message` / `failure_stage` — a failed
+  fetch now tells the model **why** (403 bot-wall vs robots-disallowed vs timeout
+  vs blocked-domain) instead of returning an opaque empty result — plus paged-read
+  fields `truncated` / `total_content_chars` / `content_offset` / `next_offset`.
+- `content_extractor.extract` gained `max_chars` / `offset` slicing
+  (newline-snapped). New `ExtractionConfig.default_max_chars` (`40000`) caps
+  responses **at the MCP boundary only** — the Python API default stays unlimited,
+  so this is not a breaking change.
+- **Behaviour change:** the MCP tools (`web_fetch`, `web_search`,
+  `web_search_best`, `web_research`, `web_fill_form_and_extract`) now return
+  **one** content representation (markdown when available, else text; html only on
+  explicit `format='html'`), killing the content+markdown duplication that
+  previously returned up to ~1 MB per call. Each accepts per-call
+  `max_chars` / `offset` / `format` and emits a truncation continuation hint.
+- `recipes.fill_form_and_extract` now stamps a distinct `failure_stage`
+  (`navigation` / `query_fill` / `filter_fill` / `submit` / `wait_for` /
+  `ssrf_redirect` / `capture`) + actionable `error_message` at each failure exit.
+
+**Wave 1C — Production lifecycle hardening**
+- **Fixed a real launch break:** playwright-stealth 2.x's hooked `launch`
+  rejected the ephemeral-isolation `--user-data-dir` arg. The launch path is now
+  raw `async_playwright()` with stealth applied per-context (`_apply_stealth`),
+  and **both** isolation flavours (ephemeral + named) dispatch through
+  `launch_persistent_context`.
+- **Crash recovery:** a Chromium disconnect/crash is detected and the next
+  browser acquisition transparently relaunches it (bounded attempts + backoff)
+  instead of bricking a long-running MCP daemon.
+- **Session hygiene:** an idle reaper + a hard session cap stop the classic
+  long-running-daemon context leak.
+- Orphaned ephemeral profile dirs from crashed runs are **swept on start**.
+- `doctor --quick` now actually catches a missing Chromium executable (the #1
+  misconfig it exists to catch — it previously false-reported "healthy").
+- New `BrowserConfig` knobs: `stealth_enabled` (`True`), `auto_relaunch`
+  (`True`), `relaunch_max_attempts` (`3`), `relaunch_backoff_base_s` (`1.0`),
+  `session_max_count` (`32`), `session_idle_ttl_s` (`1800`),
+  `profile_sweep_max_age_h` (`24`).
+
+**Wave 2D — Auth persistence + login handoff** (where agent automations die)
+- `SessionManager.export_state` / `import_state` round-trip a logged-in session's
+  Playwright `storage_state` (cookies + origins) to a JSON file and rehydrate it
+  in a later process — **"log in once (human does password / 2FA / CAPTCHA),
+  automate afterwards."** The path is confined to the download dir via the
+  existing `safe_join_path` chokepoint (traversal / absolute / UNC rejected) and
+  import refuses files **over 8 MB**.
+- New `StorageStateResult` model; `SessionInfo.has_storage_state`. New
+  `Agent.export_session_state` / `import_session_state`.
+- **New MCP session surface** — there was previously **no way to create a session
+  over MCP**, despite the tab tools needing a `session_id`: `web_create_session`,
+  `web_list_sessions`, `web_close_session`, `web_export_session`,
+  `web_import_session`.
+- Limitation: cookies rehydrate fully; per-origin `localStorage` is best-effort.
+
+**Wave 2E — Search resilience + a cheap search-only surface**
+- `SearchEngine` gained a per-provider **circuit breaker**: a just-blocked /
+  just-errored provider is skipped for a bounded cooldown then re-probed
+  (injectable clock). It now distinguishes "all providers blocked" (CAPTCHA /
+  rate-limit / cooldown) from "genuine zero hits" via a new `SearchOutcome` +
+  `ProviderBlockedError`, surfaced on the new `SearchResponse.search_blocked`
+  field.
+- New `Agent.search(query, max_results, strict) -> SearchResponse` is
+  **links-only** (no fetch/extract) — the most-used primitive was missing, so
+  "search → read snippets → fetch the 1-2 you want" used to cost N full browser
+  fetches. New MCP tool `web_search_links`.
+- New `SearchConfig.circuit_cooldown_s` (`60.0`).
+
+**Wave 2F — Proxy support + fingerprint coherence** (the web is closing to agents)
+- New `ProxyConfig` sub-config (env `WEB_AGENT_PROXY__SERVER` / `__USERNAME` /
+  `__PASSWORD` / `__BYPASS`; scheme `http` / `https` / `socks5` validated;
+  **inactive by default → zero behaviour change**), threaded into all three
+  Chromium launch dispatches **and** the httpx side-paths (HEAD probe,
+  `fetch_binary`) using httpx 0.28's `proxy=` kwarg with URL-encoded credentials.
+- New `BrowserConfig.coherent_fingerprint` (`True`): the UA pool in `utils.py` is
+  now keyed by OS family and the rotated UA's OS family is pinned to the
+  configured locale, so a context never advertises a UA whose OS contradicts its
+  platform / locale / timezone; the bare httpx side-paths now send a
+  browser-coherent `User-Agent` + `Accept-Language` instead of httpx's Python
+  default. Honest scope: this is **coherence + operator controls for compliant
+  access, not a stealth-bypass promise.**
+
+**Close-out review fixes**
+- **MEDIUM — challenge false-positive:** short HTTP-200 login / signup pages
+  embedding reCAPTCHA were wrongly `BLOCKED`. A CAPTCHA script on a 200 now only
+  counts when paired with an access-denial `<title>`.
+- **LOW:** `import_state` enforces an 8 MB size cap.
+
+**New public surface (all additive)**
+- `web_agent` exports 5 new names — `ChallengeInfo`, `StorageStateResult`,
+  `ProxyConfig`, `SearchEngine`, `SearchOutcome` — bringing the package root to
+  **118 exports**.
+- 6 new MCP tools (`web_search_links` + the five session tools); the MCP server
+  tool count goes from ~39 to **45**.
+
+**Tests**
+- Suite went from ~1133 to **1324 passing** (+28 `integration`-marked, opt-in).
+  New files: `test_challenge_detection`, `test_failure_transparency`,
+  `test_token_efficiency`, `test_lifecycle`, `test_auth_persistence`,
+  `test_search_resilience`, `test_proxy_fingerprint`, `test_v170_wiring`; plus
+  rewrites of `test_v166_cdp` / `test_v166_isolation` / `test_v168_remote_cdp` /
+  `test_v169_persistent_profile` for the new launch path.
+
 ## [1.6.16] - 2026-06-02
 
 ### Review-hardening: 32 confirmed findings from a full-codebase brutal review

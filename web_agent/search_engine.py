@@ -17,11 +17,36 @@ Default chain (configurable):
 
 To opt out of one or more providers, pass a custom ``providers`` list,
 e.g. ``providers=["playwright"]`` to use only browser-based search.
+
+**v1.7.0 (Wave 2E) resilience.** Search is the agent's entry point to
+the web and structurally fragile (DDGS gets CAPTCHA'd above ~1 req/s,
+Google SERP scraping rots). Two hardening features live here:
+
+- **Provider health memory / circuit breaker** -- a provider that just
+  got blocked or raised is skipped for a short, bounded cooldown
+  (:class:`_ProviderCircuitBreaker`) and then probed again, instead of
+  being hammered on every call. In-memory, per-engine, monotonic-clock
+  based with the clock injectable for tests.
+- **Blocked-vs-empty distinction** -- :meth:`search_with_outcome`
+  returns a :class:`SearchOutcome` that tells the caller *why* a search
+  came back empty: all providers blocked (CAPTCHA / rate-limit / circuit
+  open) vs. providers answered with genuinely zero hits. :meth:`search`
+  preserves the legacy ``SearchResponse`` return shape.
+
+**Links-only.** :meth:`search` (and :meth:`search_with_outcome`) are
+LINKS-ONLY: they return SERP items (title / url / snippet) from the
+providers and perform NO page fetch or extraction. The expensive
+fetch+extract step lives in :class:`~web_agent.agent.Agent` /
+:class:`~web_agent.recipes.Recipes`, never here -- so wiring a cheap
+search-only entry point is just exposing this engine.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -35,9 +60,17 @@ from .rate_limiter import RateLimiter
 from .search_providers import (
     DDGSProvider,
     PlaywrightProvider,
+    ProviderBlockedError,
     SearchProvider,
     SearXNGProvider,
 )
+
+# Default circuit-breaker cooldown (seconds). A provider that blocks or
+# raises is skipped for this window, then probed again. Deliberately short
+# and bounded so a transient block does not knock a provider out for long.
+# Not a config.py knob (SearchConfig is frozen this wave); override via the
+# ``circuit_cooldown_s`` constructor arg.
+DEFAULT_CIRCUIT_COOLDOWN_S = 60.0
 
 
 def _result_host_is_private(url: str) -> bool:
@@ -59,6 +92,124 @@ def _result_host_is_private(url: str) -> bool:
     return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
+@dataclass
+class SearchOutcome:
+    """Structured result of a chain walk -- the blocked-vs-empty signal.
+
+    v1.7.0 (Wave 2E): :class:`SearchResponse` (models.py) cannot tell a
+    caller *why* a search returned nothing. This dataclass carries that
+    context so the integrator (``Agent.search``) can surface it. The
+    ``response`` is always a valid :class:`SearchResponse` (possibly empty);
+    the remaining fields explain it.
+
+    Attributes:
+        response: The winning provider's :class:`SearchResponse`, or an
+            empty one when the chain produced no hits.
+        blocked: True when the chain produced zero results AND at least one
+            provider was actively blocked (CAPTCHA / rate-limit / anomaly)
+            or skipped because its circuit was open. Distinguishes "every
+            provider was refused" from "providers answered, zero hits".
+            Always False when ``response.results`` is non-empty.
+        providers_tried: Names of providers actually invoked this call (in
+            order). Excludes providers skipped because they were
+            unavailable or had an open circuit.
+        providers_skipped_cooldown: Names of providers skipped because their
+            circuit breaker was open (recently blocked / failed).
+        provider_errors: ``{provider_name: reason}`` for every provider that
+            blocked or raised this call. ``reason`` is a short string
+            (e.g. ``"ratelimit"``, ``"captcha"``, the exception text).
+    """
+
+    response: SearchResponse
+    blocked: bool = False
+    providers_tried: list[str] = field(default_factory=list)
+    providers_skipped_cooldown: list[str] = field(default_factory=list)
+    provider_errors: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def degraded(self) -> bool:
+        """True when the empty result is due to provider trouble, not zero hits.
+
+        Broader than :attr:`blocked`: True whenever the chain produced no
+        results AND at least one provider was blocked, in cooldown, OR raised
+        a generic error. ``blocked`` is the narrower "actively refused
+        (CAPTCHA / rate-limit / cooldown)" signal; a lone transient provider
+        error is ``degraded`` but not ``blocked``. Use this to decide whether
+        an empty answer is trustworthy ("genuinely nothing out there") or
+        should be retried / surfaced as a soft failure.
+        """
+        if self.response.results:
+            return False
+        return self.blocked or bool(self.provider_errors) or bool(self.providers_skipped_cooldown)
+
+
+class _ProviderCircuitBreaker:
+    """Per-provider failure memory with a bounded cooldown.
+
+    Mirrors ``SessionManager``'s injectable monotonic-clock pattern so tests
+    drive cooldown expiry with a fake clock (no sleeps). A provider that
+    blocks or raises is "tripped": :meth:`is_open` returns True for it until
+    ``cooldown`` seconds of monotonic time elapse, after which the provider
+    is probed again (half-open -- the next call is allowed through, and a
+    success clears the trip while another failure re-arms it).
+
+    Circuits are keyed by provider *instance identity* (``id(provider)``),
+    not by ``name``: the engine's catalog gives every live provider a unique
+    name, but keying by identity is the correct, drift-proof choice (a
+    provider's health is about that object, and two distinct objects -- even
+    if they happened to share a name -- have independent circuits). The
+    ``name`` is used only for human-readable log lines.
+
+    State is in-memory and per-:class:`SearchEngine` instance.
+    """
+
+    def __init__(
+        self,
+        cooldown: float = DEFAULT_CIRCUIT_COOLDOWN_S,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._cooldown = max(0.0, float(cooldown))
+        self._clock: Callable[[], float] = clock or time.monotonic
+        # provider identity -> monotonic timestamp at which it was tripped.
+        self._tripped_at: dict[int, float] = {}
+
+    def is_open(self, provider: SearchProvider) -> bool:
+        """True if ``provider``'s circuit is open (it should be skipped).
+
+        Once ``cooldown`` seconds elapse the circuit moves to half-open and
+        this returns False (a re-probe is allowed). The trip marker is left
+        in place so a fresh failure re-trips cleanly; :meth:`record_success`
+        clears it once the provider proves healthy again.
+        """
+        tripped = self._tripped_at.get(id(provider))
+        if tripped is None or self._cooldown <= 0:
+            return False
+        return self._clock() - tripped < self._cooldown
+
+    def trip(self, provider: SearchProvider, reason: str = "blocked") -> None:
+        """Record a failure for ``provider`` and (re)start its cooldown."""
+        key = id(provider)
+        was_open = key in self._tripped_at
+        self._tripped_at[key] = self._clock()
+        if not was_open:
+            logger.info(
+                "Search provider {p} circuit tripped ({reason}); cooling down {c:.0f}s",
+                p=provider.name,
+                reason=reason,
+                c=self._cooldown,
+            )
+        else:
+            logger.debug(
+                "Search provider {p} re-tripped ({reason})", p=provider.name, reason=reason
+            )
+
+    def record_success(self, provider: SearchProvider) -> None:
+        """Clear ``provider``'s trip marker after a healthy call."""
+        if self._tripped_at.pop(id(provider), None) is not None:
+            logger.info("Search provider {p} circuit recovered", p=provider.name)
+
+
 class SearchEngine:
     """Chain orchestrator over a list of :class:`SearchProvider` instances.
 
@@ -74,6 +225,17 @@ class SearchEngine:
             controls which providers run and in what order.
         rate_limiter: Optional per-host rate gate, applied uniformly
             inside every provider that performs network I/O.
+        cache: Optional result cache. Non-empty responses are cached so a
+            repeat query skips the whole chain.
+        circuit_cooldown_s: Seconds a provider stays "tripped" (skipped)
+            after it blocks or raises, before being probed again. Defaults
+            to :data:`DEFAULT_CIRCUIT_COOLDOWN_S`. ``0`` disables the
+            breaker. Not read from config (SearchConfig is frozen this
+            wave); the integrator may add a SearchConfig field later and
+            thread it here.
+        clock: Injectable monotonic clock for the circuit breaker. Tests
+            pass a fake clock to exercise cooldown expiry without sleeping;
+            production uses ``time.monotonic``.
     """
 
     def __init__(
@@ -82,9 +244,13 @@ class SearchEngine:
         config: AppConfig,
         rate_limiter: Optional[RateLimiter] = None,
         cache: Optional[Cache] = None,
+        *,
+        circuit_cooldown_s: float = DEFAULT_CIRCUIT_COOLDOWN_S,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self._config = config
         self._cache = cache
+        self._breaker = _ProviderCircuitBreaker(circuit_cooldown_s, clock=clock)
 
         # Build the full catalog. Only providers listed in
         # config.search.providers (in that order) actually run.
@@ -133,19 +299,44 @@ class SearchEngine:
         *,
         strict: bool = False,
     ) -> SearchResponse:
-        """Walk the provider chain until one returns results.
+        """Walk the provider chain until one returns results (LINKS-ONLY).
+
+        Returns SERP items only -- title / url / snippet -- and performs NO
+        page fetch or extraction. This is the cheap search-only path; the
+        expensive fetch+extract step lives in ``Agent`` / ``Recipes``.
 
         Args:
             query: Search query string.
             max_results: Maximum results per provider. ``None`` reads
                 from ``config.search.max_results``.
-            strict: If True and ALL providers return empty / fail,
-                raise :class:`SearchError`. Default False (return empty
-                ``SearchResponse``).
+            strict: If True and ALL providers return empty / fail / are
+                blocked, raise :class:`SearchError`. Default False (return
+                empty ``SearchResponse``).
 
         Raises:
             SearchError: Only when ``strict=True`` and the entire chain
                 exhausted without producing any results.
+        """
+        outcome = await self.search_with_outcome(query, max_results, strict=strict)
+        return outcome.response
+
+    async def search_with_outcome(
+        self,
+        query: str,
+        max_results: int | None = None,
+        *,
+        strict: bool = False,
+    ) -> SearchOutcome:
+        """Like :meth:`search`, but returns the blocked-vs-empty context.
+
+        The returned :class:`SearchOutcome` carries the winning
+        ``SearchResponse`` plus *why* it is shaped that way: which providers
+        were tried, which were skipped for cooldown, which blocked/errored,
+        and a single ``blocked`` flag that is True only when zero results
+        came back AND at least one provider was actively refused. The
+        integrator (``Agent.search``) maps this onto the public result.
+
+        LINKS-ONLY: no page is fetched or extracted (see :meth:`search`).
         """
         max_r = max_results or self._config.search.max_results
         # v1.6.16 SP-2: clamp at the choke point so an unbounded max_results
@@ -174,9 +365,15 @@ class SearchEngine:
                 # v1.6.16 SE-1: copy before mutating -- an in-memory cache
                 # backend may hand back a reference to its stored dict, so
                 # mutating ``cached`` in place would corrupt the cached entry.
-                return SearchResponse(**{**cached, "from_cache": True})
+                response = SearchResponse(**{**cached, "from_cache": True})
+                return SearchOutcome(response=response, providers_tried=[])
 
         last_response = SearchResponse(query=query)
+        tried: list[str] = []
+        skipped_cooldown: list[str] = []
+        errors: dict[str, str] = {}
+        any_blocked = False
+
         for provider in self._providers:
             if not provider.is_available:
                 # Unavailable providers are reported once at construction
@@ -184,10 +381,37 @@ class SearchEngine:
                 # that isn't set up (e.g. SearXNG with no base_url) doesn't
                 # spam DEBUG on every search.
                 continue
+
+            # v1.7.0 (Wave 2E): provider health memory. A provider that
+            # recently blocked / raised is in cooldown -- skip it silently
+            # (don't spam logs every call) and remember it for the
+            # blocked-vs-empty signal. It is re-probed once the cooldown
+            # elapses (is_open flips to False).
+            if self._breaker.is_open(provider):
+                skipped_cooldown.append(provider.name)
+                any_blocked = True
+                continue
+
+            tried.append(provider.name)
             try:
                 response = await provider.search(query, max_r)
+            except ProviderBlockedError as exc:
+                # Active block (CAPTCHA / rate-limit / anomaly). Trip the
+                # breaker and record it so the caller can tell blocked from
+                # empty. Then fall through to the next provider.
+                logger.warning("Provider {p} blocked: {r}", p=provider.name, r=exc.reason)
+                self._breaker.trip(provider, exc.reason)
+                errors[provider.name] = exc.reason
+                any_blocked = True
+                continue
             except Exception as exc:
+                # Transient/unknown failure. Treat as a circuit-tripping
+                # signal too (a provider throwing arbitrary errors is unhealthy
+                # for the cooldown window), but it does NOT by itself mean
+                # "blocked" for the caller-facing flag unless nothing succeeds.
                 logger.warning("Provider {p} raised: {e}", p=provider.name, e=exc)
+                self._breaker.trip(provider, "error")
+                errors[provider.name] = str(exc) or exc.__class__.__name__
                 continue
 
             # v1.6.16 SP-1: drop any result whose host is a literal private IP,
@@ -205,23 +429,67 @@ class SearchEngine:
                     p=provider.name,
                     n=response.total_results,
                 )
+                # Provider answered cleanly -- clear any prior trip.
+                self._breaker.record_success(provider)
                 # Cache non-empty responses so repeat searches skip the
                 # entire chain. Empty responses are NOT cached -- a real
                 # "no results" lock-in is more annoying than re-querying.
                 if self._cache is not None:
                     await self._cache.set(cache_key, response.model_dump(mode="json"))
-                return response
+                return SearchOutcome(
+                    response=response,
+                    blocked=False,
+                    providers_tried=tried,
+                    providers_skipped_cooldown=skipped_cooldown,
+                    provider_errors=errors,
+                )
+
+            # Genuine zero-results answer from a reachable provider: it is
+            # healthy, so clear any stale trip and remember the empty response.
+            self._breaker.record_success(provider)
             last_response = response
+
+        # Chain exhausted with no results. ``blocked`` is True only if at
+        # least one provider was actively refused (blocked or in cooldown);
+        # a clean pass of providers all answering "zero hits" is empty-not-
+        # blocked.
+        if any_blocked:
+            logger.warning(
+                "Search for {q!r} returned no results -- all reachable providers "
+                "blocked/in-cooldown (tried={t}, cooldown={c}, errors={e})",
+                q=query,
+                t=tried,
+                c=skipped_cooldown,
+                e=errors,
+            )
+        else:
+            logger.info(
+                "Search for {q!r} returned no results -- providers reachable, zero hits "
+                "(tried={t})",
+                q=query,
+                t=tried,
+            )
 
         if strict:
             from .exceptions import SearchError
 
             attempted = [p.name for p in self._providers if p.is_available]
+            cause = (
+                "search engines blocking the request (CAPTCHA / rate-limit) or all "
+                "providers in cooldown"
+                if any_blocked
+                else "providers reachable but returned zero results"
+            )
             raise SearchError(
                 f"All search providers exhausted ({attempted}) returned no "
-                f"results for {query!r}. Possible causes: "
+                f"results for {query!r}. Most likely: {cause}. Other possible causes: "
                 "missing searxng_base_url, ddgs package not installed, "
-                "search engines blocking the request (CAPTCHA / rate-limit), "
                 "or no network reachability."
             )
-        return last_response
+        return SearchOutcome(
+            response=last_response,
+            blocked=any_blocked,
+            providers_tried=tried,
+            providers_skipped_cooldown=skipped_cooldown,
+            provider_errors=errors,
+        )

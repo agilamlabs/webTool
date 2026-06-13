@@ -107,6 +107,148 @@ def _extract_json_ld(html: str) -> list[dict[str, Any]]:
     return blocks
 
 
+def slice_text_window(
+    text: str,
+    *,
+    offset: int = 0,
+    max_chars: Optional[int] = None,
+) -> tuple[str, Optional[int]]:
+    """v1.7.0: return a ``(window, next_offset)`` slice of ``text``.
+
+    The continuation primitive behind ``ExtractionResult.truncated`` /
+    ``next_offset``: ``window = text[offset : offset + max_chars]`` with a
+    newline-boundary adjustment, and ``next_offset`` is the absolute offset
+    to pass on the next call (``None`` when the window reaches the end of
+    ``text``).
+
+    Semantics:
+
+    - ``offset`` is clamped to ``>= 0``. An offset at/past the end of
+      ``text`` yields ``("", None)``.
+    - ``max_chars=None`` means unlimited (window runs to the end).
+    - ``max_chars`` is clamped to ``>= 1`` so a hostile/buggy value can
+      never produce a zero-progress paging loop.
+    - When the window would cut mid-text, the cut snaps back to the last
+      newline found within the final 200 chars of the window (the newline
+      is INCLUDED in the window) so chunks rejoin losslessly and the cut
+      lands on a line boundary when one is near.
+    """
+    total = len(text)
+    start = max(0, offset)
+    if start >= total:
+        return "", None
+    if max_chars is None:
+        return text[start:], None
+    cap = max(1, max_chars)
+    end = start + cap
+    if end >= total:
+        return text[start:], None
+    nl = text.rfind("\n", max(start, end - 200), end)
+    if nl != -1:
+        end = nl + 1
+    return text[start:end], end
+
+
+def _synthesize_fetch_failure_message(status_value: str, status_code: Optional[int]) -> str:
+    """v1.7.0: actionable error text when the fetcher supplied none.
+
+    Keyed off the FetchStatus VALUE string and the HTTP status code so it
+    stays valid for any status the enum grows. Every message names a next
+    step the calling agent can take.
+    """
+    if status_code == 403:
+        return "server returned 403; consider an authenticated session or a different source"
+    if status_code == 404:
+        return "server returned 404 (not found); the URL may be stale -- search for a fresh link"
+    if status_code == 429:
+        return "server returned 429 (rate limited); wait before retrying or reduce request rate"
+    if status_code is not None:
+        return f"server returned HTTP {status_code}; try a different source"
+    if status_value == "timeout":
+        return "page load timed out; retry once, or try a different source if it persists"
+    if status_value == "blocked":
+        return (
+            "robots.txt or the domain allow/deny policy forbids fetching this path; "
+            "do not retry this URL"
+        )
+    if status_value == "network_error":
+        return "network error while fetching; verify the URL is reachable or try a different source"
+    return f"fetch failed with status '{status_value}'; try a different source"
+
+
+def build_fetch_failure_result(fetch_result: FetchResult) -> ExtractionResult:
+    """v1.7.0: build a failure-transparent ExtractionResult from a failed fetch.
+
+    Replaces the pre-v1.7.0 opaque ``ExtractionResult(url=...,
+    extraction_method="none")`` for non-success fetches: the FetchResult's
+    status / status_code / error_message are now CARRIED onto the
+    extraction so callers (and LLMs behind MCP) can distinguish a 403
+    bot-wall from a robots block from a timeout, and self-correct.
+
+    The fetcher's ``error_message`` is carried verbatim when present;
+    otherwise an actionable message is synthesized from the status value
+    and HTTP code. ``failure_stage`` is always ``'fetch'`` here. Written
+    generically off the status VALUE so any future FetchStatus member is
+    propagated without changes here.
+    """
+    status_value = str(getattr(fetch_result.status, "value", fetch_result.status))
+    message = (fetch_result.error_message or "").strip()
+    if not message:
+        message = _synthesize_fetch_failure_message(status_value, fetch_result.status_code)
+    return ExtractionResult(
+        url=fetch_result.url,
+        extraction_method="none",
+        fetch_status=status_value,
+        status_code=fetch_result.status_code,
+        error_message=message,
+        failure_stage="fetch",
+        correlation_id=fetch_result.correlation_id,
+    )
+
+
+def _apply_content_window(
+    result: ExtractionResult,
+    *,
+    offset: int,
+    max_chars: Optional[int],
+) -> ExtractionResult:
+    """v1.7.0: slice ``result``'s text to a window and stamp the metadata.
+
+    The PRIMARY text is ``content`` when present, else ``markdown`` (in
+    practice ``markdown`` never exists without ``content`` -- trafilatura
+    populates both). Window metadata (``truncated`` /
+    ``total_content_chars`` / ``content_offset`` / ``next_offset``)
+    describes the primary text; when both representations exist,
+    ``markdown`` receives the same (offset, max_chars) window applied to
+    its own text so neither field smuggles the full document.
+
+    Mutates ``result`` in place (consistent with ``_cap_content``) and
+    returns it. ``total_content_chars`` is preserved when already set by
+    a prior cap (it then reflects the larger pre-cap length).
+    """
+    primary_is_content = result.content is not None
+    primary = result.content if primary_is_content else result.markdown
+    if primary is None:
+        result.content_offset = max(0, offset)
+        return result
+    start = max(0, offset)
+    window, next_off = slice_text_window(primary, offset=start, max_chars=max_chars)
+    if primary_is_content:
+        result.content = window
+        result.content_length = len(window)
+        if result.markdown is not None:
+            md_window, _ = slice_text_window(result.markdown, offset=start, max_chars=max_chars)
+            result.markdown = md_window
+    else:
+        result.markdown = window
+    if result.total_content_chars is None:
+        result.total_content_chars = len(primary)
+    result.truncated = result.truncated or next_off is not None
+    result.content_offset = start
+    result.next_offset = next_off
+    return result
+
+
 def _is_pdf(fr: FetchResult) -> bool:
     ct = (fr.content_type or "").lower()
     if "application/pdf" in ct:
@@ -147,6 +289,8 @@ class ContentExtractor:
         *,
         strict: bool = False,
         prefer_api: bool = False,
+        max_chars: Optional[int] = None,
+        offset: int = 0,
     ) -> ExtractionResult:
         """Extract structured content from a FetchResult.
 
@@ -181,6 +325,19 @@ class ContentExtractor:
                 the rendered HTML. Useful on SPAs where the XHR payload
                 is strictly cleaner than the DOM. Default False
                 preserves the v1.6.11 behaviour.
+            max_chars: v1.7.0. Optional content window size in chars,
+                applied AFTER extraction (and after the safety char cap).
+                ``None`` (default) keeps the Python API unlimited -- the
+                MCP boundary is where ``ExtractionConfig.default_max_chars``
+                bites. When set, ``content`` (and ``markdown``, when
+                present) are sliced and ``truncated`` /
+                ``total_content_chars`` / ``content_offset`` /
+                ``next_offset`` are populated. Slices snap back to a
+                newline within the last 200 chars of the window.
+            offset: v1.7.0. Continuation offset (chars into the full
+                extracted text) for paging through large documents. Pass
+                the previous result's ``next_offset``. An offset at/past
+                the end yields empty content with ``next_offset=None``.
 
         Raises:
             ExtractionError: If ``strict=True`` and all layers fail.
@@ -199,7 +356,13 @@ class ContentExtractor:
         # branches -- and keep ``content_length`` honest (mirrors the
         # api_json slice). The api_json branch's own 512 KiB cap is more
         # conservative and still applies first, so it is preserved.
-        return self._cap_content(result)
+        result = self._cap_content(result)
+        # v1.7.0: optional content window (slicing) AFTER extraction + cap.
+        # No-op on the default path (max_chars=None, offset=0) so existing
+        # Python-API callers see byte-identical behaviour.
+        if max_chars is not None or offset > 0:
+            result = _apply_content_window(result, offset=offset, max_chars=max_chars)
+        return result
 
     async def extract_async(
         self,
@@ -207,6 +370,8 @@ class ContentExtractor:
         *,
         strict: bool = False,
         prefer_api: bool = False,
+        max_chars: Optional[int] = None,
+        offset: int = 0,
     ) -> ExtractionResult:
         """Run :meth:`extract` off the event loop in a worker thread.
 
@@ -219,23 +384,37 @@ class ContentExtractor:
         safe. Signature mirrors :meth:`extract`.
         """
         return await asyncio.to_thread(
-            self.extract, fetch_result, strict=strict, prefer_api=prefer_api
+            self.extract,
+            fetch_result,
+            strict=strict,
+            prefer_api=prefer_api,
+            max_chars=max_chars,
+            offset=offset,
         )
 
     def _cap_content(self, result: ExtractionResult) -> ExtractionResult:
         """Truncate ``content``/``markdown`` to ``safety.max_chars_per_call``.
 
         Reuses the existing per-call character budget field rather than a
-        new knob. Slices in place (consistent with the api_json E-6 cap,
-        which has no truncation marker) and resets ``content_length`` to the
-        truncated length so it stays honest.
+        new knob. Slices in place (consistent with the api_json E-6 cap)
+        and resets ``content_length`` to the truncated length so it stays
+        honest. v1.7.0: when the cap fires it now also sets ``truncated``
+        and ``total_content_chars`` (with ``next_offset`` left ``None`` --
+        the overflow is dropped, not pageable) so the cut is no longer
+        silent.
         """
         cap = self._config.safety.max_chars_per_call
         if cap and result.content is not None and len(result.content) > cap:
+            if result.total_content_chars is None:
+                result.total_content_chars = len(result.content)
             result.content = result.content[:cap]
             result.content_length = len(result.content)
+            result.truncated = True
         if cap and result.markdown is not None and len(result.markdown) > cap:
+            if result.total_content_chars is None:
+                result.total_content_chars = len(result.markdown)
             result.markdown = result.markdown[:cap]
+            result.truncated = True
         return result
 
     def _extract_dispatch(
@@ -259,7 +438,10 @@ class ContentExtractor:
                     f"Cannot extract from non-success FetchResult: "
                     f"status={fetch_result.status}, url={fetch_result.url}"
                 )
-            return ExtractionResult(url=fetch_result.url, extraction_method="none")
+            # v1.7.0 failure transparency: carry status / status_code /
+            # error_message (verbatim, or synthesized actionably) onto the
+            # ExtractionResult instead of returning opaque emptiness.
+            return build_fetch_failure_result(fetch_result)
 
         url = fetch_result.final_url
 
@@ -274,11 +456,17 @@ class ContentExtractor:
                 return self._extract_docx(fetch_result.binary, url)
             if _is_csv(fetch_result):
                 return self._extract_csv(fetch_result.binary, url)
-            # Unrecognized binary -- not extractable
+            # Unrecognized binary -- not extractable. v1.7.0: say so.
             return ExtractionResult(
                 url=url,
                 extraction_method="none",
                 content=None,
+                error_message=(
+                    f"binary content (content_type="
+                    f"{fetch_result.content_type or 'unknown'}) is not an "
+                    "extractable kind (pdf/xlsx/docx/csv); use web_download "
+                    "to save the file instead"
+                ),
             )
 
         if not fetch_result.html:
@@ -286,7 +474,20 @@ class ContentExtractor:
                 from .exceptions import ExtractionError
 
                 raise ExtractionError(f"FetchResult has neither html nor binary: url={url}")
-            return ExtractionResult(url=url, extraction_method="none")
+            # v1.7.0: a SUCCESS fetch with no payload is a capture-level
+            # emptiness -- say so instead of returning bare "none".
+            return ExtractionResult(
+                url=url,
+                extraction_method="none",
+                fetch_status=str(getattr(fetch_result.status, "value", fetch_result.status)),
+                status_code=fetch_result.status_code,
+                error_message=(
+                    "fetch succeeded but returned no HTML content (empty page "
+                    "or capture failure); retry once, or inspect the page with "
+                    "web_observe / web_screenshot"
+                ),
+                failure_stage="fetch",
+            )
 
         html = fetch_result.html
         min_len = self._config.extraction.min_content_length

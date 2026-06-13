@@ -160,7 +160,7 @@ async def test_backend_remote_cdp_dispatch_calls_connect_over_cdp_not_launch(
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
 
     fake_pw.chromium.connect_over_cdp.assert_awaited_once_with(
@@ -187,7 +187,7 @@ async def test_backend_remote_cdp_stop_disconnects_without_killing_process(
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
         await bm.stop()
     # close() called (disconnect path); _is_remote_cdp reset
@@ -207,7 +207,7 @@ async def test_backend_remote_cdp_connection_failure_wraps_as_browser_error(
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         with pytest.raises(BrowserError, match="remote CDP"):
             await bm.start()
 
@@ -236,7 +236,7 @@ async def test_get_remote_cdp_url_returns_configured_url_after_start(
     fake_cm = MagicMock()
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
         try:
             assert bm.get_remote_cdp_url() == url

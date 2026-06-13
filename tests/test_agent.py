@@ -35,6 +35,7 @@ def fast_config() -> AppConfig:
     )
 
 
+@pytest.mark.integration
 class TestFetchAndExtract:
     """Test fetching and extracting content from known URLs."""
 
@@ -60,6 +61,7 @@ class TestFetchAndExtract:
         assert result.content_length > 0
 
 
+@pytest.mark.integration
 class TestSearchAndExtract:
     """Test the full search-and-extract pipeline."""
 
@@ -90,6 +92,7 @@ class TestSearchAndExtract:
         assert len(result.pages) > 0 or len(result.errors) > 0
 
 
+@pytest.mark.integration
 class TestDownload:
     """Test file download functionality."""
 
@@ -116,6 +119,7 @@ class TestDownload:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 class TestV169NamedProfilePersistence:
     """v1.6.9: named profile must retain cookies + localStorage across
     Agent lifetimes via ``chromium.launch_persistent_context``."""
@@ -176,6 +180,7 @@ class TestV169NamedProfilePersistence:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 class TestV1610Integration:
     """v1.6.10 hardening: integration tests for the items the v1.6.9 unit
     suite covered only via mocks. Each test exercises the real code path

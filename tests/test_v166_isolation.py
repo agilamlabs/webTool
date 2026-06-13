@@ -50,7 +50,7 @@ async def test_isolation_off_no_user_data_dir_in_launch_args(tmp_path: Path) -> 
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_pw_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_pw_cm):
         await bm.start()
 
     fake_chromium.launch.assert_called_once()
@@ -81,14 +81,20 @@ async def test_isolation_ephemeral_creates_temp_profile_under_base_dir(
     bm = BrowserManager(config)
     fake_browser = MagicMock()
     fake_browser.close = AsyncMock()
+    fake_root_ctx = MagicMock(name="EphemeralRootContext")
+    fake_root_ctx.browser = fake_browser
+    fake_root_ctx.close = AsyncMock()
     fake_chromium = MagicMock()
-    fake_chromium.launch = AsyncMock(return_value=fake_browser)
+    fake_chromium.launch_persistent_context = AsyncMock(return_value=fake_root_ctx)
+    fake_chromium.launch = AsyncMock(
+        side_effect=AssertionError("ephemeral isolation must use launch_persistent_context")
+    )
     fake_pw = MagicMock(chromium=fake_chromium)
     fake_pw_cm = MagicMock()
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_pw_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_pw_cm):
         await bm.start()
 
     profile_root = tmp_path / ".webtool" / "browser-profiles"
@@ -99,10 +105,13 @@ async def test_isolation_ephemeral_creates_temp_profile_under_base_dir(
     assert bm._effective_profile_dir.exists()
     assert bm._owned_profile_dir is True
 
-    args = fake_chromium.launch.call_args.kwargs["args"]
-    udd_arg = next((a for a in args if a.startswith("--user-data-dir=")), None)
-    assert udd_arg is not None
-    assert str(bm._effective_profile_dir) in udd_arg
+    # v1.7.0: the user-data-dir is passed as the launch_persistent_context
+    # kwarg, NOT a --user-data-dir CLI arg (Playwright >= 1.5x rejects the
+    # CLI flag on chromium.launch -- the bug this refactor fixes).
+    kwargs = fake_chromium.launch_persistent_context.call_args.kwargs
+    assert kwargs["user_data_dir"] == str(bm._effective_profile_dir)
+    args = kwargs["args"]
+    assert all(not a.startswith("--user-data-dir") for a in args), args
 
     await bm.stop()
 
@@ -126,14 +135,17 @@ async def test_isolation_ephemeral_cleanup_on_exit_removes_dir(tmp_path: Path) -
     bm = BrowserManager(config)
     fake_browser = MagicMock()
     fake_browser.close = AsyncMock()
+    fake_root_ctx = MagicMock(name="EphemeralRootContext")
+    fake_root_ctx.browser = fake_browser
+    fake_root_ctx.close = AsyncMock()
     fake_chromium = MagicMock()
-    fake_chromium.launch = AsyncMock(return_value=fake_browser)
+    fake_chromium.launch_persistent_context = AsyncMock(return_value=fake_root_ctx)
     fake_pw = MagicMock(chromium=fake_chromium)
     fake_pw_cm = MagicMock()
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_pw_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_pw_cm):
         await bm.start()
 
     profile_dir = bm._effective_profile_dir
@@ -166,6 +178,9 @@ async def test_isolation_named_persists_after_stop(tmp_path: Path) -> None:
     )
 
     bm = BrowserManager(config)
+    # v1.7.0: stealth is applied per-context (not via the launch hook);
+    # neutralize it so the MagicMock context isn't touched by real Stealth.
+    bm._apply_stealth = AsyncMock()
     fake_browser = MagicMock()
     fake_browser.close = AsyncMock()
     fake_ctx = MagicMock(name="PersistentContext")
@@ -184,7 +199,7 @@ async def test_isolation_named_persists_after_stop(tmp_path: Path) -> None:
     fake_pw_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_pw_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_pw_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_pw_cm):
         await bm.start()
 
     resolved = bm._effective_profile_dir

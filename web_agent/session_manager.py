@@ -30,21 +30,33 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import builtins
+import json
 import secrets
+import time
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from loguru import logger
 from playwright.async_api import BrowserContext
 
 from .browser_manager import BrowserManager
 from .config import AppConfig
-from .models import SessionInfo
+from .correlation import get_correlation_id
+from .models import SessionInfo, StorageStateResult
 from .tab_manager import INITIAL_TAB_ID, TabManager
+from .utils import safe_join_path
 
 if TYPE_CHECKING:  # pragma: no cover -- avoid import cycle at runtime
     from .network_collector import NetworkCollector
+
+# v1.7.0: upper bound on a storage_state file accepted by ``import_state``.
+# Real exported states are a few KB to tens of KB; 8 MB is a generous
+# ceiling that still bounds a pathological/hostile file before json.loads.
+_MAX_STORAGE_STATE_BYTES = 8 * 1024 * 1024
 
 
 class SessionManager:
@@ -79,6 +91,16 @@ class SessionManager:
         # shutdown. Without this a failed ctx.close() leaks the Chromium
         # context for the lifetime of the process.
         self._pending_close: set[BrowserContext] = set()
+        # v1.7.0 session hygiene. _last_used tracks a monotonic
+        # last-touch timestamp per session for the lazy idle reaper
+        # (browser.session_idle_ttl_s); the clock is an instance
+        # attribute so tests can monkeypatch it (no sleeps).
+        # _session_generation snapshots BrowserManager.generation at
+        # create time: a mismatch later means the session's context
+        # belongs to a previous (crashed/relaunched) browser instance.
+        self._last_used: dict[str, float] = {}
+        self._session_generation: dict[str, int] = {}
+        self._clock: Callable[[], float] = time.monotonic
 
     async def create(self, name: Optional[str] = None) -> str:
         """Create a new persistent session and return its ``session_id``.
@@ -96,7 +118,21 @@ class SessionManager:
         ``execute_sequence`` calls reuse this page (vs v1.6.5 which
         created a fresh page per call). Set
         ``automation.fresh_tab_per_call=True`` to restore v1.6.5 behavior.
+
+        v1.7.0: runs the lazy idle reaper first (closing sessions idle
+        beyond ``browser.session_idle_ttl_s``), then enforces the
+        ``browser.session_max_count`` cap.
+
+        Raises:
+            BrowserError: When the live-session cap is reached.
         """
+        from .exceptions import BrowserError
+
+        # v1.7.0: lazy reaper sweep -- close idle sessions (and drain any
+        # contexts parked by a previous sync sweep) before counting
+        # toward the cap. No background tasks; runs on create/list only.
+        await self._reap_idle()
+
         token = secrets.token_urlsafe(8)
         session_id = f"{name}-{token}" if name else token
 
@@ -107,6 +143,17 @@ class SessionManager:
         info: SessionInfo | None = None
         initial_page = None
         async with self._lock:
+            # v1.7.0: enforce the cap inside the lock so concurrent
+            # create() calls cannot overshoot it.
+            max_sessions = self._config.browser.session_max_count
+            if len(self._sessions) >= max_sessions:
+                raise BrowserError(
+                    f"Session limit reached: {len(self._sessions)}/{max_sessions} "
+                    "live sessions (browser.session_max_count). Close unused "
+                    "sessions with close_session(), lower "
+                    "browser.session_idle_ttl_s so idle ones are reaped sooner, "
+                    "or raise browser.session_max_count."
+                )
             ctx = await self._bm.create_persistent_context(block_resources=False)
             # v1.6.16 SM-1: from here until the context is registered in the
             # session dicts it is owned by nobody -- close_all() iterates
@@ -132,6 +179,10 @@ class SessionManager:
                 self._sessions[session_id] = ctx
                 self._info[session_id] = info
                 self._tabs[session_id] = tab_mgr
+                # v1.7.0: hygiene bookkeeping -- idle clock + browser
+                # generation snapshot for crash-liveness validation.
+                self._last_used[session_id] = self._clock()
+                self._session_generation[session_id] = self._bm_generation()
             except BaseException:
                 with suppress(Exception):
                     await ctx.close()
@@ -152,6 +203,71 @@ class SessionManager:
         )
         return session_id
 
+    def _bm_generation(self) -> int:
+        """v1.7.0: current BrowserManager launch generation, as an int.
+
+        Normalized through ``int()`` so mock BrowserManagers in tests
+        produce a stable comparable value on both the create and the
+        validation side.
+        """
+        try:
+            return int(getattr(self._bm, "generation", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _session_is_dead(self, session_id: str, ctx: BrowserContext) -> bool:
+        """v1.7.0: positive-signal liveness check for a registered session.
+
+        Dead when:
+
+        * the BrowserManager reports the browser itself dead
+          (``is_alive() is False`` -- crash detected / stopped), or
+        * the session was created on a previous browser generation
+          (the browser crashed and was auto-relaunched since), or
+        * the context's pages all report closed (externally torn down).
+
+        Introspection failures count as ALIVE (fail-open): a false
+        "dead" would destroy a working session, while a false "alive"
+        merely surfaces the underlying Playwright error downstream --
+        the pre-v1.7.0 status quo.
+        """
+        try:
+            alive_fn = getattr(self._bm, "is_alive", None)
+            if callable(alive_fn) and alive_fn() is False:
+                return True
+        except Exception:  # pragma: no cover -- defensive
+            pass
+        recorded = self._session_generation.get(session_id)
+        if recorded is not None and recorded != self._bm_generation():
+            return True
+        pages: Any = getattr(ctx, "pages", None)
+        if isinstance(pages, (list, tuple)) and pages:
+            try:
+                return all(bool(p.is_closed()) for p in pages)
+            except Exception:
+                return False
+        return False
+
+    def _evict_dead(self, session_id: str, ctx: BrowserContext) -> None:
+        """v1.7.0: drop a dead session from every registry (sync).
+
+        The context is parked in ``_pending_close`` so the existing
+        close paths (``close_all`` / the create-time reaper drain) retry
+        an orderly close -- usually a no-op because the browser that
+        owned it is already gone.
+        """
+        self._sessions.pop(session_id, None)
+        self._info.pop(session_id, None)
+        self._tabs.pop(session_id, None)
+        self._last_used.pop(session_id, None)
+        self._session_generation.pop(session_id, None)
+        self._pending_close.add(ctx)
+        logger.warning(
+            "Session {sid} is dead (browser crashed or context closed "
+            "externally); evicted from the registry.",
+            sid=session_id,
+        )
+
     async def close(self, session_id: str) -> None:
         """Close and forget a session.
 
@@ -166,6 +282,9 @@ class SessionManager:
             # calls -- the WeakKeyDictionary inside TabManager evicts entries
             # as pages fire their "close" events.
             self._tabs.pop(session_id, None)
+            # v1.7.0: hygiene bookkeeping.
+            self._last_used.pop(session_id, None)
+            self._session_generation.pop(session_id, None)
 
         if ctx is None:
             raise KeyError(f"Unknown session_id: {session_id!r}")
@@ -191,12 +310,19 @@ class SessionManager:
     def get_tab_manager(self, session_id: str) -> TabManager:
         """Return the :class:`TabManager` for ``session_id``.
 
+        v1.7.0: validates session liveness first -- a dead session is
+        evicted and surfaces the established unknown-session KeyError.
+
         Raises:
-            KeyError: If session_id is not known.
+            KeyError: If session_id is not known (or no longer usable).
         """
+        ctx = self._sessions.get(session_id)
+        if ctx is not None and self._session_is_dead(session_id, ctx):
+            self._evict_dead(session_id, ctx)
         tm = self._tabs.get(session_id)
         if tm is None:
             raise KeyError(f"Unknown session_id: {session_id!r}")
+        self._last_used[session_id] = self._clock()
         return tm
 
     async def close_all(self) -> None:
@@ -234,25 +360,350 @@ class SessionManager:
     def get(self, session_id: str) -> BrowserContext:
         """Return the live BrowserContext for ``session_id``.
 
+        v1.7.0: validates liveness. A session whose browser crashed (or
+        whose context was closed externally) is cleaned out of the
+        registry and surfaces the SAME KeyError path callers already
+        handle for unknown sessions -- instead of handing back a dead
+        context that crashes mid-operation.
+
         Raises:
-            KeyError: If session_id is not known.
+            KeyError: If session_id is not known (or no longer usable).
         """
         ctx = self._sessions.get(session_id)
         if ctx is None:
             raise KeyError(f"Unknown session_id: {session_id!r}")
+        if self._session_is_dead(session_id, ctx):
+            self._evict_dead(session_id, ctx)
+            raise KeyError(
+                f"Unknown session_id: {session_id!r} (session was closed because "
+                "its browser context died -- create a new session)"
+            )
+        self._last_used[session_id] = self._clock()
         return ctx
 
     def list(self) -> list[SessionInfo]:
-        """Return SessionInfo snapshots for all live sessions."""
+        """Return SessionInfo snapshots for all live sessions.
+
+        v1.7.0: runs the synchronous part of the lazy idle reaper first,
+        so expired sessions never show up in the listing. Their contexts
+        are parked in ``_pending_close`` and drained by the next async
+        close path (session create or shutdown).
+        """
+        self._reap_idle_sync()
         return list(self._info.values())
 
     def touch(self, session_id: str) -> None:
         """Update last_used_at and increment page_count on a session.
 
         Silent no-op if session_id is unknown (caller should have checked).
+
+        v1.7.0: also refreshes the monotonic idle clock consumed by the
+        lazy reaper -- every public Agent op that uses a session calls
+        touch(), so an in-use session is never reaped.
         """
         info = self._info.get(session_id)
         if info is None:
             return
         info.last_used_at = datetime.now(timezone.utc)
         info.page_count += 1
+        self._last_used[session_id] = self._clock()
+
+    # ------------------------------------------------------------------
+    # v1.7.0: auth-state persistence (storage_state export / import)
+    # ------------------------------------------------------------------
+
+    def _storage_state_root(self) -> Path:
+        """Workspace root that storage_state files are confined to.
+
+        Reuses the download directory -- the same agent-writable root the
+        :class:`~web_agent.downloader.Downloader` constrains its writes to
+        (``config.download.download_dir``, already resolved to an absolute
+        path by ``AppConfig._resolve_paths``). Confining export/import here
+        means an LLM-supplied ``path`` cannot read or write outside the
+        toolkit's sandbox -- the same SSRF / path-traversal posture used
+        everywhere else (see ``safe_join_path``).
+        """
+        root = Path(self._config.download.download_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _safe_state_path(self, path: str | Path) -> Path:
+        """Resolve ``path`` against the storage-state root, blocking traversal.
+
+        Wraps :func:`~web_agent.utils.safe_join_path`, the single
+        path-traversal chokepoint the toolkit uses for every
+        user/web-derived filename. Absolute paths, ``..`` escapes, and
+        Windows reserved device names all raise ``ValueError`` -- callers
+        surface that as a populated-but-failed
+        :class:`~web_agent.models.StorageStateResult`.
+
+        Raises:
+            ValueError: If ``path`` escapes the storage-state root.
+        """
+        return safe_join_path(self._storage_state_root(), str(path))
+
+    async def export_state(self, session_id: str, path: str | Path) -> StorageStateResult:
+        """Capture a session's authenticated state to a JSON storage_state file.
+
+        Resolves the session's live :class:`~playwright.async_api.BrowserContext`
+        and calls ``ctx.storage_state(path=...)`` -- Playwright's portable
+        snapshot of cookies plus per-origin localStorage. The resulting file
+        can later be replayed into a fresh session via :meth:`import_state`,
+        which is how an Agent reuses a login a human performed once (the
+        headed-handoff workflow: log in by hand, automate afterwards).
+
+        ``path`` is confined to the download directory via
+        :func:`~web_agent.utils.safe_join_path`; a traversal / absolute path
+        is rejected with a populated ``StorageStateResult(error=...)`` rather
+        than a raise, so the result-based contract holds.
+
+        Args:
+            session_id: The session to export. Must be live.
+            path: Destination filename, relative to the download dir.
+
+        Returns:
+            A :class:`~web_agent.models.StorageStateResult` with
+            ``saved=True``, the absolute ``path``, and cookie / origin counts.
+
+        Raises:
+            KeyError: If ``session_id`` is unknown or its context has died --
+                the SAME path :meth:`get` raises for every other session op.
+        """
+        cid = get_correlation_id()
+        try:
+            safe_path = self._safe_state_path(path)
+        except ValueError as exc:
+            logger.warning(
+                "export_state rejected unsafe path {p!r} for session {sid}: {e}",
+                p=str(path),
+                sid=session_id,
+                e=exc,
+            )
+            return StorageStateResult(
+                session_id=session_id,
+                path=None,
+                saved=False,
+                error=f"Invalid storage_state path: {exc}",
+                correlation_id=cid,
+            )
+
+        # get() validates liveness, raises the established KeyError for an
+        # unknown / dead session, AND refreshes the idle clock.
+        ctx = self.get(session_id)
+
+        state = await ctx.storage_state(path=str(safe_path))
+        cookie_count = len(state.get("cookies", []) or [])
+        origin_count = len(state.get("origins", []) or [])
+        # Belt-and-braces idle-clock touch (get() already did it; keep the
+        # bookkeeping explicit so export never makes a session look idle).
+        self._last_used[session_id] = self._clock()
+
+        logger.info(
+            "Exported storage_state for session {sid}: {c} cookies, {o} origins -> {p}",
+            sid=session_id,
+            c=cookie_count,
+            o=origin_count,
+            p=safe_path,
+        )
+        return StorageStateResult(
+            session_id=session_id,
+            path=str(safe_path),
+            cookie_count=cookie_count,
+            origin_count=origin_count,
+            saved=True,
+            correlation_id=cid,
+        )
+
+    async def import_state(self, path: str | Path, *, name: str | None = None) -> str:
+        """Create a NEW session hydrated from a saved storage_state file.
+
+        Round-trips the file written by :meth:`export_state` back into a
+        live session so the Agent reuses the captured authentication.
+
+        Rehydration strategy (and its limitation)
+        -----------------------------------------
+        Playwright's clean path is ``browser.new_context(storage_state=...)``
+        / ``launch_persistent_context(storage_state=...)``. webTool builds
+        every session context through
+        :meth:`BrowserManager.create_persistent_context`, which today does
+        NOT accept a ``storage_state=`` kwarg, and that module is out of
+        scope for this change. So import is implemented additively here:
+
+        1. create a normal session via the existing :meth:`create` flow;
+        2. parse the saved state JSON (path-confined) and replay its
+           ``cookies`` onto the new context via ``ctx.add_cookies(...)``.
+
+        Cookies (the auth-critical part) rehydrate fully. Per-origin
+        ``localStorage`` / IndexedDB are NOT restored by this path --
+        ``add_cookies`` covers cookies only, and localStorage can only be
+        seeded by navigating to each origin and writing it. For the common
+        cookie-based session this is sufficient; a
+        ``BrowserManager.create_persistent_context(storage_state=...)``
+        passthrough is the cleaner long-term fix (see report: WIRING NEEDED).
+
+        ``path`` is confined to the download directory via
+        :func:`~web_agent.utils.safe_join_path`.
+
+        Args:
+            path: Source storage_state file, relative to the download dir.
+            name: Optional human-friendly label for the new session.
+
+        Returns:
+            The ``session_id`` of the newly created, hydrated session.
+
+        Raises:
+            ValueError: If ``path`` escapes the root, the file is missing,
+                or it is not a valid storage_state JSON document.
+        """
+        try:
+            safe_path = self._safe_state_path(path)
+        except ValueError as exc:
+            logger.warning("import_state rejected unsafe path {p!r}: {e}", p=str(path), e=exc)
+            raise ValueError(f"Invalid storage_state path: {exc}") from exc
+
+        if not safe_path.is_file():
+            raise ValueError(f"storage_state file not found: {safe_path}")
+
+        # Bound the read: a real storage_state is a few KB to tens of KB.
+        # An 8 MB ceiling stops a pathological / hostile file (even one
+        # already inside the sandbox) from being slurped whole into memory
+        # before json.loads.
+        try:
+            state_size = safe_path.stat().st_size
+        except OSError as exc:
+            raise ValueError(f"Could not stat storage_state file {safe_path}: {exc}") from exc
+        if state_size > _MAX_STORAGE_STATE_BYTES:
+            raise ValueError(
+                f"storage_state file {safe_path} is {state_size} bytes, over the "
+                f"{_MAX_STORAGE_STATE_BYTES}-byte limit; refusing to load."
+            )
+
+        try:
+            raw = safe_path.read_text(encoding="utf-8")
+            state = cast("dict[str, Any]", json.loads(raw))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Could not read storage_state file {safe_path}: {exc}") from exc
+        if not isinstance(state, dict):
+            raise ValueError(f"storage_state file {safe_path} is not a JSON object")
+
+        cookies = state.get("cookies") or []
+        origins = state.get("origins") or []
+
+        session_id = await self.create(name=name)
+        ctx = self.get(session_id)
+
+        applied = 0
+        if cookies:
+            try:
+                # StorageState cookies are a structural superset of
+                # SetCookieParam; Playwright accepts them as-is. cast keeps
+                # mypy honest without copying the list.
+                await ctx.add_cookies(cast("list[Any]", cookies))
+                applied = len(cookies)
+            except Exception as exc:
+                logger.warning(
+                    "import_state: failed to apply {n} cookies to session {sid}: {e}",
+                    n=len(cookies),
+                    sid=session_id,
+                    e=exc,
+                )
+
+        info = self._info.get(session_id)
+        if info is not None:
+            info.has_storage_state = True
+        # Importing is active use -- never let it look idle.
+        self._last_used[session_id] = self._clock()
+
+        if origins:
+            logger.info(
+                "import_state: {o} localStorage origin(s) in {p} were NOT restored "
+                "(add_cookies covers cookies only; navigate per-origin to seed "
+                "localStorage). Session {sid} has {n} cookies applied.",
+                o=len(origins),
+                p=safe_path,
+                sid=session_id,
+                n=applied,
+            )
+        logger.info(
+            "Imported storage_state {p} -> new session {sid} ({n} cookies)",
+            p=safe_path,
+            sid=session_id,
+            n=applied,
+        )
+        return session_id
+
+    # ------------------------------------------------------------------
+    # v1.7.0: lazy idle reaper (no background tasks)
+    # ------------------------------------------------------------------
+
+    def _idle_expired(self) -> builtins.list[str]:
+        """Session ids idle beyond ``browser.session_idle_ttl_s`` (0 = off).
+
+        Annotated with ``builtins.list`` because the public :meth:`list`
+        method shadows the ``list`` name for every annotation lexically
+        below its definition (PEP 563 strings are still resolved through
+        class scope by the type checker).
+        """
+        ttl = self._config.browser.session_idle_ttl_s
+        if ttl <= 0:
+            return []
+        now = self._clock()
+        return [sid for sid, last in self._last_used.items() if now - last > ttl]
+
+    def _reap_idle_sync(self) -> None:
+        """Synchronous reap: drop expired sessions from the registries.
+
+        Used by :meth:`list` (a sync method that cannot await
+        ``ctx.close()``). The contexts are parked in ``_pending_close``;
+        the next async close path drains them.
+        """
+        for sid in self._idle_expired():
+            ctx = self._sessions.pop(sid, None)
+            self._info.pop(sid, None)
+            self._tabs.pop(sid, None)
+            idle_s = self._clock() - self._last_used.pop(sid, self._clock())
+            self._session_generation.pop(sid, None)
+            if ctx is not None:
+                self._pending_close.add(ctx)
+            logger.info(
+                "Reaped idle session {sid} (idle {idle:.0f}s > "
+                "browser.session_idle_ttl_s={ttl:.0f}s)",
+                sid=sid,
+                idle=idle_s,
+                ttl=self._config.browser.session_idle_ttl_s,
+            )
+
+    async def _reap_idle(self) -> None:
+        """Async reap: close expired sessions via the regular close path,
+        then drain contexts parked by earlier sync sweeps.
+
+        Called from :meth:`create` -- the lazy-reaper contract is
+        "sweep on create/list", with no background tasks.
+        """
+        expired = self._idle_expired()
+        for sid in expired:
+            idle_s = self._clock() - self._last_used.get(sid, self._clock())
+            logger.info(
+                "Reaping idle session {sid} (idle {idle:.0f}s > "
+                "browser.session_idle_ttl_s={ttl:.0f}s)",
+                sid=sid,
+                idle=idle_s,
+                ttl=self._config.browser.session_idle_ttl_s,
+            )
+            try:
+                await self.close(sid)
+            except KeyError:
+                pass  # raced with a manual close -- already gone
+            except Exception as exc:
+                logger.warning("Error reaping idle session {sid}: {e}", sid=sid, e=exc)
+
+        # Drain contexts parked by _reap_idle_sync / _evict_dead so they
+        # are released promptly instead of waiting for shutdown.
+        async with self._lock:
+            pending = list(self._pending_close)
+            self._pending_close.clear()
+        for ctx in pending:
+            try:
+                await ctx.close()
+            except Exception as exc:
+                logger.debug("Error closing reaped/parked context: {e}", e=exc)

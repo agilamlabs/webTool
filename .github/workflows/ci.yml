@@ -66,7 +66,10 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Run unit tests with coverage
-        # Skip browser/network integration tests -- those run elsewhere.
+        # Browser/network integration tests are excluded by the default
+        # addopts = '-m "not integration"' in pyproject.toml -- those run
+        # in the dedicated integration job below. The hermetic (mocked)
+        # tests in test_agent.py / test_browser_actions.py DO run here.
         # Tee output to a file so the failure step below can publish it to
         # the publicly-visible job summary even when raw logs require auth.
         run: |
@@ -74,9 +77,7 @@ jobs:
           python -m pytest -v --tb=long \
             --cov \
             --cov-report=term-missing \
-            --cov-report=xml \
-            --ignore=tests/test_browser_actions.py \
-            --ignore=tests/test_agent.py 2>&1 | tee pytest-output.txt
+            --cov-report=xml 2>&1 | tee pytest-output.txt
 
       - name: Publish pytest output to job summary on failure
         if: failure()
@@ -139,8 +140,11 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run integration tests (browser + network)
+        # Select by marker, not file path: the default addopts in
+        # pyproject.toml is '-m "not integration"', and this explicit
+        # CLI -m overrides it (argparse keeps the last -m value).
         run: |
-          python -m pytest tests/test_browser_actions.py tests/test_agent.py \
+          python -m pytest -m integration \
             -v --tb=short --maxfail=5 --durations=10
 
       - name: Upload integration test artifacts on failure
