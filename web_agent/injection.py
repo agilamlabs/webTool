@@ -60,8 +60,6 @@ __all__ = [
 _EXPLICIT_INVISIBLE = frozenset(
     {
         "​",  # zero-width space
-        "‌",  # zero-width non-joiner
-        "‍",  # zero-width joiner
         "‎",  # left-to-right mark
         "‏",  # right-to-left mark
         "‪",  # left-to-right embedding
@@ -85,16 +83,36 @@ _EXPLICIT_INVISIBLE = frozenset(
 # not ``Cf`` so they are never touched.
 _KEEP_WHITESPACE = frozenset({"\n", "\r", "\t"})
 
+# Format characters we must KEEP even though they are category ``Cf``: the
+# zero-width joiner (U+200D) and non-joiner (U+200C) are REQUIRED, not
+# decorative, in real content -- ZWJ binds emoji sequences (family, flags,
+# professions) and Indic conjuncts; ZWNJ separates letters that must not join
+# in Persian/Arabic/Indic scripts. Stripping them corrupts legitimate text
+# (e.g. splits a ZWJ family emoji into individual people, or mis-forms a
+# Persian word), so they are preserved. The unambiguous *hiding* vectors
+# (ZWSP, bidi overrides/embeddings/isolates, BOM, soft hyphen, tag block,
+# word joiner) are still stripped.
+_KEEP_FORMAT = frozenset({"‌", "‍"})  # ZWNJ, ZWJ
+
 
 def strip_invisible_chars(text: str) -> tuple[str, int]:
     """Remove zero-width / invisible / bidi-control characters from ``text``.
 
     Targets the characters an attacker uses to hide injected instructions
     from a human reader, or to reorder visible text via bidi overrides:
-    U+200B-200F, U+202A-202E (bidi overrides/embeddings), U+2060-2064,
-    U+FEFF (BOM), U+00AD (soft hyphen), U+180E, the U+E0000-E007F tag block,
-    and every other Unicode ``Cf`` (format) category character. Ordinary
-    whitespace and newlines are preserved.
+    U+200B (ZWSP), U+200E/200F (LRM/RLM), U+202A-202E (bidi
+    overrides/embeddings), U+2060-2064, U+2066-2069 (bidi isolates),
+    U+FEFF (BOM), U+00AD (soft hyphen), U+180E, the U+E0000-E007F tag
+    block, and every other Unicode ``Cf`` (format) category character.
+
+    Ordinary whitespace and newlines are preserved. So are the zero-width
+    joiner (U+200D) and non-joiner (U+200C): they are REQUIRED in
+    legitimate content (ZWJ binds emoji sequences and Indic conjuncts;
+    ZWNJ separates non-joining letters in Persian/Arabic/Indic), so
+    stripping them would corrupt real text. This is a deliberate
+    recall/correctness trade-off: an attacker could in principle use ZWJ
+    to obfuscate, but stripping it breaks far more legitimate pages than
+    it defends.
 
     Args:
         text: The text to clean.
@@ -109,7 +127,7 @@ def strip_invisible_chars(text: str) -> tuple[str, int]:
     out: list[str] = []
     removed = 0
     for ch in text:
-        if ch in _KEEP_WHITESPACE:
+        if ch in _KEEP_WHITESPACE or ch in _KEEP_FORMAT:
             out.append(ch)
             continue
         # Tag block U+E0000-U+E007F: deprecated/invisible tag characters
@@ -630,7 +648,15 @@ def _decide_risk(
     quoted signal is LOW; nothing is NONE. A purely descriptive page (all
     strong matches quote/mention-framed) can reach at most MEDIUM, never HIGH.
     """
-    behavioral = unquoted_strong >= 1 and (has_imperative_you or has_role_framing or exfil_intent)
+    # ``exfil_intent`` is gated by the discussion veto because its weakest
+    # trigger -- the bare word "exfiltrate" -- is exactly the vocabulary a
+    # security article or these docs use ("malware can exfiltrate the system
+    # prompt, researchers warn"). Imperative-you and role-framing are NOT
+    # gated: a page that literally commands the assistant ("you must ignore
+    # ...", "SYSTEM:") is attack-shaped even when it also reads like prose.
+    behavioral = unquoted_strong >= 1 and (
+        has_imperative_you or has_role_framing or (exfil_intent and not has_discussion_context)
+    )
     coordinated = unquoted_strong >= 3 and not has_discussion_context
     if (behavioral or coordinated) and score >= _THRESHOLD_MEDIUM:
         return "high"

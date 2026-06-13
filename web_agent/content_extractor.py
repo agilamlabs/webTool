@@ -706,6 +706,13 @@ class ContentExtractor:
         # The removed-element count is stashed on the result via an early
         # InjectionReport so ``extract`` can complete the report after the
         # invisible-char pass. Gated on the sanitize flag.
+        # Keep the original HTML for JSON-LD extraction below: strip_hidden_dom
+        # removes ALL <script> tags, which would also drop
+        # <script type="application/ld+json"> metadata. JSON-LD is structured
+        # DATA the caller wants, not hidden injection TEXT, so it is read from
+        # the pre-strip HTML (it is surfaced in structured_data, never executed,
+        # and the main-content injection scan still runs on the stripped text).
+        original_html = html
         stripped_hidden = 0
         if self._config.safety.sanitize_fetched_content:
             html, stripped_hidden = strip_hidden_dom(html)
@@ -723,8 +730,9 @@ class ContentExtractor:
         # already do; a future patch can share the parsed soup, but
         # the duplication is acceptable for now (small absolute cost,
         # keeps the JSON-LD path decoupled from the fallback chain).
-        # Compute once; attach to whichever extractor wins.
-        structured = _extract_json_ld(html)
+        # Compute once; attach to whichever extractor wins. Read from the
+        # pre-strip HTML so hidden-DOM stripping doesn't drop JSON-LD scripts.
+        structured = _extract_json_ld(original_html)
 
         # v1.6.12: prefer_api path -- when the caller opted in AND the
         # FetchResult carries a captured JSON response body, route
@@ -921,8 +929,7 @@ class ContentExtractor:
         Availability is probed with :func:`importlib.util.find_spec`
         (mirrors how the optional-extra paths detect their library
         without a hard top-level import) so the no-extra install keeps
-        working; tests patch ``_PDFPLUMBER_AVAILABLE`` / the spec to
-        exercise each branch.
+        working; tests patch ``_module_available`` to exercise each branch.
         """
         if _module_available("pdfplumber"):
             return self._extract_pdf_pdfplumber(blob, url)
