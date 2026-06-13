@@ -1160,6 +1160,53 @@ class SafetyConfig(BaseSettings):
         ),
     )
 
+    # --- v1.7.0 Wave 3A: prompt-injection containment ---
+    # webTool fetches UNTRUSTED web content and hands it to an LLM, so it is
+    # where defense-in-depth against prompt injection belongs. These knobs
+    # are SAFE to leave on by default: stripping only removes content a human
+    # cannot see ("render what a human sees"), and detection is advisory --
+    # it FLAGS, it does not block (unless injection_action is set to 'block').
+    sanitize_fetched_content: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0 Wave 3A: when True (default), strip hidden-from-humans "
+            "content from fetched HTML before main-content extraction -- "
+            "hidden DOM elements (display:none, off-screen, aria-hidden, "
+            "comments, script/style/template/noscript) AND zero-width / "
+            "bidi-control / other invisible characters in the extracted "
+            "text. This is 'render what a human sees': it removes a common "
+            "prompt-injection vector (instructions hidden where a human "
+            "reader can't see them) with no false-positive harm to "
+            "legitimate pages. Disable only if you specifically need the "
+            "raw, un-sanitized text."
+        ),
+    )
+    detect_prompt_injection: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0 Wave 3A: when True (default), scan the VISIBLE extracted "
+            "text for prompt-injection indicators and populate "
+            "ExtractionResult.injection (an advisory, risk-leveled "
+            "InjectionReport). ADVISORY ONLY -- a flag does not block the "
+            "content (see injection_action). Legitimate content discussing "
+            "injection attacks is expected to flag LOW, not HIGH. Set False "
+            "to leave injection=None."
+        ),
+    )
+    injection_action: Literal["flag", "redact", "block"] = Field(
+        default="flag",
+        description=(
+            "v1.7.0 Wave 3A: what to do on a HIGH-risk injection detection. "
+            "'flag' (default) = advisory only: populate the InjectionReport "
+            "but return the content unchanged -- the caller/LLM decides. "
+            "'redact' = additionally mask the matched indicator spans in the "
+            "returned text. 'block' = empty the content on a HIGH detection "
+            "and stamp an error_message (must be explicit opt-in -- never "
+            "the default, because detection is imperfect and blocking would "
+            "drop legitimate content that merely discusses these phrases)."
+        ),
+    )
+
     @model_validator(mode="after")
     def _apply_safe_mode(self) -> SafetyConfig:
         """When safe_mode is True, force all allow_* flags to False.

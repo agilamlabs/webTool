@@ -21,7 +21,8 @@ from bs4 import BeautifulSoup
 from loguru import logger
 
 from .config import AppConfig
-from .models import ExtractionResult, FetchResult, FetchStatus
+from .injection import detect_injection, strip_hidden_dom, strip_invisible_chars
+from .models import ExtractionResult, FetchResult, FetchStatus, InjectionReport
 
 # v1.6.16 CE-3: URL fragments that mark a captured response as
 # analytics/telemetry rather than the page's real data API. Used to
@@ -362,6 +363,10 @@ class ContentExtractor:
         # Python-API callers see byte-identical behaviour.
         if max_chars is not None or offset > 0:
             result = _apply_content_window(result, offset=offset, max_chars=max_chars)
+        # v1.7.0 Wave 3A: strip invisible/bidi chars + run advisory injection
+        # detection on the final VISIBLE text. Runs last so the scan sees
+        # exactly what a caller would consume. Gated on the safety flags.
+        result = self._apply_injection_containment(result)
         return result
 
     async def extract_async(
@@ -415,6 +420,116 @@ class ContentExtractor:
                 result.total_content_chars = len(result.markdown)
             result.markdown = result.markdown[:cap]
             result.truncated = True
+        return result
+
+    def _apply_injection_containment(self, result: ExtractionResult) -> ExtractionResult:
+        """v1.7.0 Wave 3A: strip invisible chars + run advisory injection scan.
+
+        Composes with the rest of the pipeline (runs AFTER cap + window so it
+        sees exactly the text a caller consumes). Two independent gates:
+
+        - ``SafetyConfig.sanitize_fetched_content`` (default on): strip
+          zero-width / bidi-control / invisible characters from ``content``
+          and ``markdown``, accumulate the removed count onto the report, and
+          set ``content_sanitized=True``. (Hidden-DOM stripping already ran
+          pre-extraction; its count is carried on ``result.injection`` here.)
+        - ``SafetyConfig.detect_prompt_injection`` (default on): run
+          :func:`detect_injection` on the visible text and merge the risk /
+          indicators / score into the report. On a HIGH detection the
+          configured ``injection_action`` is applied (``flag`` = no change;
+          ``redact`` = mask matched spans; ``block`` = empty the content and
+          stamp an actionable ``error_message``).
+
+        When BOTH gates are off this is a near no-op: any hidden-element count
+        captured pre-extraction is preserved, but no new report is created
+        and ``content_sanitized`` stays False.
+        """
+        safety = self._config.safety
+        sanitize = safety.sanitize_fetched_content
+        detect = safety.detect_prompt_injection
+
+        # Preserve any hidden-element count stamped pre-extraction.
+        existing = result.injection
+        stripped_hidden = existing.stripped_hidden_elements if existing is not None else 0
+
+        if not sanitize and not detect:
+            return result
+
+        invisible_removed = 0
+        if sanitize:
+            if result.content is not None:
+                cleaned, n = strip_invisible_chars(result.content)
+                if n:
+                    result.content = cleaned
+                    result.content_length = len(cleaned)
+                    invisible_removed += n
+            if result.markdown is not None:
+                cleaned_md, n = strip_invisible_chars(result.markdown)
+                if n:
+                    result.markdown = cleaned_md
+                    invisible_removed += n
+            result.content_sanitized = True
+
+        if detect:
+            visible = result.content if result.content is not None else (result.markdown or "")
+            report = detect_injection(visible)
+            report.stripped_hidden_elements = stripped_hidden
+            report.stripped_invisible_chars = invisible_removed
+            result.injection = report
+            if report.risk == "high":
+                result = self._apply_injection_action(result, report)
+        elif sanitize and (stripped_hidden or invisible_removed):
+            # Detection off but sanitization ran and removed something --
+            # keep a counts-only report so the strip is observable.
+            result.injection = InjectionReport(
+                stripped_hidden_elements=stripped_hidden,
+                stripped_invisible_chars=invisible_removed,
+            )
+
+        return result
+
+    def _apply_injection_action(
+        self, result: ExtractionResult, report: InjectionReport
+    ) -> ExtractionResult:
+        """Apply ``SafetyConfig.injection_action`` to a HIGH-risk result.
+
+        ``flag`` (default) leaves content untouched -- the report alone is the
+        signal. ``redact`` masks the matched indicator phrases in the visible
+        text. ``block`` empties the content and stamps an actionable
+        ``error_message`` (explicit opt-in only).
+        """
+        action = self._config.safety.injection_action
+        if action == "flag":
+            return result
+        if action == "redact":
+            for field in ("content", "markdown"):
+                text = getattr(result, field)
+                if not text:
+                    continue
+                for snippet in report.indicators:
+                    # Redact the indicator's leading phrase. Snippets are
+                    # truncated/whitespace-collapsed, so redact the longest
+                    # contiguous run that still appears verbatim; fall back to
+                    # nothing when no verbatim run is found (collapsed context).
+                    needle = snippet.split("...")[0].strip()
+                    if needle and needle in text:
+                        text = text.replace(needle, "[redacted: possible injection]")
+                setattr(result, field, text)
+            if result.content is not None:
+                result.content_length = len(result.content)
+            return result
+        # action == "block"
+        result.content = None
+        result.markdown = None
+        result.content_length = 0
+        result.error_message = (
+            "content blocked: high-confidence prompt-injection indicators "
+            f"detected (risk={report.risk}, score={report.score}); "
+            "SafetyConfig.injection_action='block'. Inspect "
+            "injection.indicators to see why, or set injection_action='flag' "
+            "to receive the content with an advisory flag instead"
+        )
+        result.failure_stage = "injection_blocked"
         return result
 
     def _extract_dispatch(
@@ -492,6 +607,22 @@ class ContentExtractor:
         html = fetch_result.html
         min_len = self._config.extraction.min_content_length
 
+        # v1.7.0 Wave 3A: strip hidden-from-humans DOM BEFORE extraction so
+        # the injected text a human can't see (display:none divs, off-screen
+        # spans, aria-hidden, comments, script/style) never reaches
+        # trafilatura/bs4/markdown. Deterministic, zero false-positive harm.
+        # The removed-element count is stashed on the result via an early
+        # InjectionReport so ``extract`` can complete the report after the
+        # invisible-char pass. Gated on the sanitize flag.
+        stripped_hidden = 0
+        if self._config.safety.sanitize_fetched_content:
+            html, stripped_hidden = strip_hidden_dom(html)
+
+        def _stamp_hidden(res: ExtractionResult) -> ExtractionResult:
+            if stripped_hidden:
+                res.injection = InjectionReport(stripped_hidden_elements=stripped_hidden)
+            return res
+
         # v1.6.12: JSON-LD enrichment. The helper swallows malformed
         # JSON (including ``RecursionError`` from deeply-nested
         # adversarial payloads). Cost: one extra BS4+lxml parse per
@@ -521,14 +652,14 @@ class ContentExtractor:
         result = self._extract_trafilatura(html, url)
         if result and result.content and len(result.content) >= min_len:
             result.structured_data = structured
-            return result
+            return _stamp_hidden(result)
         logger.debug("Trafilatura insufficient for {url}, trying BS4", url=url)
 
         # Layer 2: BeautifulSoup
         result = self._extract_bs4(html, url)
         if result and result.content and len(result.content) >= min_len:
             result.structured_data = structured
-            return result
+            return _stamp_hidden(result)
         logger.debug("BS4 insufficient for {url}, falling back to raw", url=url)
 
         # Layer 3: raw text (always-success unless catastrophic)
@@ -541,7 +672,7 @@ class ContentExtractor:
                 f"(content_length={raw_result.content_length})"
             )
         raw_result.structured_data = structured
-        return raw_result
+        return _stamp_hidden(raw_result)
 
     # ------------------------------------------------------------------
     # v1.6.12: API-candidates extraction (prefer_api=True path)
