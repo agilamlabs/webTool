@@ -34,7 +34,7 @@ import builtins
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +46,7 @@ from playwright.async_api import BrowserContext
 from .browser_manager import BrowserManager
 from .config import AppConfig
 from .correlation import get_correlation_id
-from .models import SessionInfo, StorageStateResult
+from .models import LoginHandoffResult, SessionInfo, StorageStateResult
 from .tab_manager import INITIAL_TAB_ID, TabManager
 from .utils import safe_join_path
 
@@ -101,6 +101,9 @@ class SessionManager:
         self._last_used: dict[str, float] = {}
         self._session_generation: dict[str, int] = {}
         self._clock: Callable[[], float] = time.monotonic
+        # v1.7.0 (Wave 8): injectable async sleep so the login-handoff wait
+        # loop is testable without real time (mirrors the _clock seam).
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     async def create(self, name: Optional[str] = None) -> str:
         """Create a new persistent session and return its ``session_id``.
@@ -511,6 +514,139 @@ class SessionManager:
             cookie_count=cookie_count,
             origin_count=origin_count,
             saved=True,
+            correlation_id=cid,
+        )
+
+    async def login_handoff(
+        self,
+        *,
+        login_url: str,
+        storage_state_path: str | Path,
+        session_id: Optional[str] = None,
+        name: Optional[str] = None,
+        success_url_substring: Optional[str] = None,
+        success_selector: Optional[str] = None,
+        timeout_s: float = 300.0,
+        poll_interval_s: float = 1.0,
+    ) -> LoginHandoffResult:
+        """Open a HEADED session on ``login_url``, wait for a human, export state.
+
+        The first-class "log in by hand, automate afterwards" helper: it sends
+        a human to a login page in a VISIBLE browser, waits for them to finish
+        authenticating (password / 2FA / CAPTCHA / SSO), then captures the
+        session's Playwright ``storage_state`` so a later headless run can
+        rehydrate the login via :meth:`import_state`.
+
+        The wait ends when a success condition is met or the timeout elapses;
+        ``storage_state`` is exported EITHER WAY (best-effort capture of
+        whatever login the human completed). Success conditions (optional):
+
+        - ``success_url_substring``: the post-login app lands on a URL
+          containing this substring (e.g. ``"/dashboard"``).
+        - ``success_selector``: a selector that only resolves once logged in
+          (e.g. ``"nav.user-menu"``).
+
+        With neither set, the helper simply waits the full ``timeout_s`` window
+        for the human (``success_signal="elapsed"``) and then exports.
+
+        Requires ``browser.headless=False`` to be useful (a human must see the
+        window); when headless is True the helper still runs and exports, but
+        the returned ``message`` flags that no human could interact. The wait
+        does NOT re-gate cross-domain redirects (SSO bounces through identity
+        providers are expected and the operator initiated this handoff
+        deliberately).
+
+        Never raises: a dead session or an export error is returned in the
+        result's ``error`` field.
+        """
+        cid = get_correlation_id()
+        if session_id is None:
+            session_id = await self.create(name=name)
+
+        try:
+            ctx = self.get(session_id)
+        except KeyError as exc:
+            return LoginHandoffResult(
+                session_id=session_id,
+                login_url=login_url,
+                saved=False,
+                error=f"Session not available for handoff: {exc}",
+                message="The handoff session could not be resolved (unknown or dead).",
+                correlation_id=cid,
+            )
+
+        # Resolve the session's main interactive page (fall back defensively).
+        try:
+            page = self._tabs[session_id].get(INITIAL_TAB_ID)
+        except Exception:  # pragma: no cover -- defensive: main tab gone
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        headless = bool(self._config.browser.headless)
+        started = self._clock()
+        try:
+            await page.goto(login_url, wait_until="domcontentloaded")
+        except Exception as exc:
+            # Non-fatal: the human can still drive the window; the page may
+            # simply be slow. Record nothing fatal and proceed to the wait.
+            logger.warning(
+                "login_handoff initial navigation to {u} failed (continuing): {e}",
+                u=login_url,
+                e=exc,
+            )
+
+        success = False
+        signal: Optional[str]
+        has_condition = bool(success_url_substring or success_selector)
+        deadline = started + max(0.0, timeout_s)
+
+        if not has_condition:
+            # No auto-detect: give the human the full window, then export.
+            remaining = deadline - self._clock()
+            if remaining > 0:
+                await self._sleep(remaining)
+            signal = "elapsed"
+        else:
+            signal = "timeout"
+            while self._clock() < deadline:
+                if success_url_substring and success_url_substring in (page.url or ""):
+                    success, signal = True, "url_match"
+                    break
+                if success_selector:
+                    try:
+                        if await page.query_selector(success_selector) is not None:
+                            success, signal = True, "selector"
+                            break
+                    except Exception:  # pragma: no cover -- page mid-navigation
+                        pass
+                await self._sleep(poll_interval_s)
+
+        elapsed = max(0.0, self._clock() - started)
+        state = await self.export_state(session_id, storage_state_path)
+
+        headless_note = (
+            " NOTE: browser.headless is True, so no human could interact with "
+            "the window -- run with browser.headless=False for a real handoff."
+            if headless
+            else ""
+        )
+        outcome = "succeeded" if success else "window elapsed"
+        message = (
+            f"Login handoff {outcome} (signal={signal}); exported "
+            f"{state.cookie_count} cookies / {state.origin_count} origins."
+            f"{headless_note}"
+        )
+        return LoginHandoffResult(
+            session_id=session_id,
+            login_url=login_url,
+            success_detected=success,
+            success_signal=signal,
+            storage_state_path=state.path,
+            saved=state.saved,
+            cookie_count=state.cookie_count,
+            origin_count=state.origin_count,
+            elapsed_s=elapsed,
+            message=message,
+            error=state.error,
             correlation_id=cid,
         )
 

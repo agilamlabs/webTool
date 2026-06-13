@@ -22,6 +22,7 @@ import inspect
 import re
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -32,22 +33,27 @@ from .browser_manager import BrowserManager
 from .config import AppConfig
 from .content_extractor import ContentExtractor, build_fetch_failure_result
 from .correlation import get_correlation_id
+from .crawl import SiteCrawler
 from .downloader import Downloader
 from .models import (
     ActionStatus,
     Citation,
     CollectedPage,
     CollectionResult,
+    CrawlResult,
     DownloadResult,
     ExtractionResult,
     FetchDiagnostic,
     FetchResult,
     FetchStatus,
     FormFilterSpec,
+    PageSnapshot,
     ResearchResult,
     SearchResultItem,
+    SnapshotDiff,
     StructuredExtractionResult,
 )
+from .monitoring import SnapshotStore, content_hash, diff_snapshots, normalize_content
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
 from .structured import resolve_fields
@@ -1083,6 +1089,204 @@ class Recipes:
             field_sources[name] = "llm"
             unresolved_set.discard(name)
         unresolved[:] = [name for name in unresolved if name in unresolved_set]
+
+    # ------------------------------------------------------------------
+    # Recipe: snapshot_page / diff_page (v1.7.0 Wave 8 change-monitoring)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _utc_now_iso() -> str:
+        """Current UTC time as an ISO-8601 string (snapshot timestamp)."""
+        return datetime.now(timezone.utc).isoformat()
+
+    def _snapshot_store(self) -> SnapshotStore:
+        return SnapshotStore(self._config.monitoring.snapshot_dir)
+
+    def _default_label(self, url: str) -> str:
+        """Stable per-URL snapshot label used when the caller gives none."""
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+    async def _capture_snapshot(
+        self, url: str, *, label: str, session_id: Optional[str]
+    ) -> PageSnapshot:
+        """Fetch + extract + normalize a page into a PageSnapshot (no persist).
+
+        Routes through the normal fetch pipeline (challenge / injection /
+        robots / rate-limit / SSRF all apply). A failed fetch returns a
+        snapshot carrying the ``fetch_status`` / ``error_message`` and empty
+        content (so the caller can tell a real "no change" from a fetch error).
+        """
+        cid = get_correlation_id()
+        if not check_domain_allowed(url, self._config.safety):
+            return PageSnapshot(
+                url=url,
+                label=label,
+                fetch_status="blocked",
+                error_message=(
+                    f"domain of {url} is blocked by the SafetyConfig allow/deny "
+                    "rules; choose a source on an allowed domain"
+                ),
+                correlation_id=cid,
+            )
+        fr = await self._fetcher.fetch_smart(url, session_id=session_id)
+        if fr.status != FetchStatus.SUCCESS:
+            failed = build_fetch_failure_result(fr)
+            return PageSnapshot(
+                url=url,
+                label=label,
+                fetch_status=failed.fetch_status,
+                error_message=failed.error_message,
+                correlation_id=cid,
+            )
+        extracted = await self._extractor.extract_async(fr)
+        raw = extracted.markdown or extracted.content or ""
+        normalized = normalize_content(raw)[: self._config.monitoring.max_snapshot_chars]
+        return PageSnapshot(
+            url=url,
+            label=label,
+            captured_at=self._utc_now_iso(),
+            title=extracted.title,
+            content=normalized,
+            content_hash=content_hash(normalized),
+            content_length=len(normalized),
+            extraction_method=extracted.extraction_method,
+            correlation_id=cid,
+        )
+
+    async def snapshot_page(
+        self,
+        url: str,
+        *,
+        label: Optional[str] = None,
+        session_id: Optional[str] = None,
+        persist: bool = True,
+    ) -> PageSnapshot:
+        """Capture a page's normalized content as a PageSnapshot, and persist it.
+
+        Fetches + extracts ``url`` through the normal pipeline, normalizes the
+        main content, hashes it, and -- when ``persist`` (default) AND the fetch
+        succeeded -- stores it under ``label`` (default: a hash of the URL) so a
+        later :meth:`diff_page` can compare against it. A failed fetch yields a
+        snapshot carrying the ``fetch_status`` / ``error_message`` and is NOT
+        persisted (so a transient failure never clobbers a good baseline).
+        """
+        label_key = label or self._default_label(url)
+        snap = await self._capture_snapshot(url, label=label_key, session_id=session_id)
+        if persist and snap.fetch_status is None:
+            try:
+                self._snapshot_store().save(snap, label_key)
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "snapshot_page: could not persist snapshot for {u}: {e}", u=url, e=exc
+                )
+        return snap
+
+    async def diff_page(
+        self,
+        url: str,
+        *,
+        label: Optional[str] = None,
+        session_id: Optional[str] = None,
+        update: bool = True,
+    ) -> SnapshotDiff:
+        """Capture ``url`` now and diff it against the stored baseline for ``label``.
+
+        Loads the baseline persisted by a prior :meth:`snapshot_page` /
+        :meth:`diff_page` (keyed by ``label``, default a hash of the URL),
+        captures the page now, and returns a :class:`SnapshotDiff`. With no
+        baseline yet, ``is_first_snapshot`` is True. When ``update`` (default)
+        AND the capture succeeded, the fresh snapshot becomes the new baseline,
+        so repeated ``diff_page`` calls report change SINCE THE PREVIOUS CHECK.
+        """
+        label_key = label or self._default_label(url)
+        store = self._snapshot_store()
+        baseline = store.load(label_key)
+        new_snap = await self._capture_snapshot(url, label=label_key, session_id=session_id)
+        diff = diff_snapshots(
+            baseline, new_snap, max_lines=self._config.monitoring.diff_max_lines
+        )
+        # Roll the baseline forward only on a SUCCESSFUL capture, so a transient
+        # fetch failure can't overwrite a good baseline with an empty snapshot.
+        if update and new_snap.fetch_status is None:
+            try:
+                store.save(new_snap, label_key)
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "diff_page: could not persist updated baseline for {u}: {e}", u=url, e=exc
+                )
+        return diff
+
+    # ------------------------------------------------------------------
+    # Recipe: crawl_site (v1.7.0 Wave 8 bounded same-site crawl)
+    # ------------------------------------------------------------------
+
+    async def crawl_site(
+        self,
+        start_url: str,
+        *,
+        max_pages: Optional[int] = None,
+        max_depth: Optional[int] = None,
+        same_registrable_domain: Optional[bool] = None,
+        use_sitemap: Optional[bool] = None,
+        include: Optional[list[str]] = None,
+        exclude: Optional[list[str]] = None,
+        session_id: Optional[str] = None,
+    ) -> CrawlResult:
+        """Bounded breadth-first crawl of a single site (optionally sitemap-seeded).
+
+        Walks links within scope starting from ``start_url``, fetching every page
+        through the normal pipeline (challenge / injection / robots / rate-limit /
+        SSRF all apply) and deduplicating URLs so a cyclic link graph never
+        double-fetches. ``max_pages`` / ``max_depth`` are CLAMPED to the
+        ``CrawlConfig`` ceilings so a large caller value can never make the crawl
+        unbounded; the crawl is also bounded by ``SafetyConfig.max_time_per_call_seconds``.
+
+        Args:
+            start_url: Seed URL; its host (or registrable domain) defines scope.
+            max_pages / max_depth: Per-call bounds, clamped to the config ceilings
+                (defaults come from ``CrawlConfig``).
+            same_registrable_domain: Widen scope from the exact host to the
+                registrable domain (subdomains in scope). Defaults to config.
+            use_sitemap: Seed the frontier from ``/sitemap.xml``. Defaults to config.
+            include / exclude: Optional lists of regexes; a URL must match an
+                ``include`` (if any) and must not match any ``exclude``.
+            session_id: Optional persistent browser session.
+
+        Returns:
+            A :class:`CrawlResult` with per-page records, counts, the injection
+            rollup, and a ``stopped_reason``.
+        """
+        cfg = self._config.crawl
+        pages_cap = cfg.max_pages if max_pages is None else max_pages
+        pages_cap = max(1, min(int(pages_cap), cfg.max_pages))
+        depth_cap = cfg.max_depth if max_depth is None else max_depth
+        depth_cap = max(0, min(int(depth_cap), cfg.max_depth))
+        same_dom = cfg.same_registrable_domain if same_registrable_domain is None else (
+            same_registrable_domain
+        )
+        sitemap = cfg.use_sitemap if use_sitemap is None else use_sitemap
+
+        logger.info(
+            "Recipe: crawl_site start={u} max_pages={p} max_depth={d} sitemap={s}",
+            u=start_url,
+            p=pages_cap,
+            d=depth_cap,
+            s=sitemap,
+        )
+        crawler = SiteCrawler(self._fetcher, self._extractor, self._config)
+        return await crawler.crawl(
+            start_url,
+            max_pages=pages_cap,
+            max_depth=depth_cap,
+            same_registrable_domain=same_dom,
+            use_sitemap=sitemap,
+            sitemap_max_urls=cfg.sitemap_max_urls,
+            per_page_link_cap=cfg.per_page_link_cap,
+            include=include,
+            exclude=exclude,
+            session_id=session_id,
+            time_budget_s=self._config.safety.max_time_per_call_seconds,
+        )
 
     # ------------------------------------------------------------------
     # Recipe 4: fill_form_and_extract (Phase 7 / v1.6.1)

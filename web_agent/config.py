@@ -2281,6 +2281,8 @@ class AppConfig(BaseSettings):
         self.cache.cache_dir = _resolve(self.cache.cache_dir)
         # v1.6.8: session replay traces live under base_dir by default
         self.diagnostics.trace_dir = _resolve(self.diagnostics.trace_dir)
+        # v1.7.0 (Wave 8): page-snapshot store lives under base_dir by default
+        self.monitoring.snapshot_dir = _resolve(self.monitoring.snapshot_dir)
         return self
 
     @classmethod

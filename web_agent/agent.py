@@ -69,6 +69,7 @@ from .models import (
     CdpConnectionInfo,
     ClickXYInput,
     CollectionResult,
+    CrawlResult,
     DoctorReport,
     DomainSkill,
     DownloadResult,
@@ -77,9 +78,11 @@ from .models import (
     FetchResult,
     FetchStatus,
     FormFilterSpec,
+    LoginHandoffResult,
     MetricsSnapshot,
     MouseButton,
     ObserveResult,
+    PageSnapshot,
     PressKeyInput,
     ResearchResult,
     ScreenshotResult,
@@ -88,6 +91,7 @@ from .models import (
     SelectorLike,
     SessionInfo,
     SkillApplicationResult,
+    SnapshotDiff,
     StorageStateResult,
     StructuredExtractionResult,
     TabInfo,
@@ -1076,6 +1080,64 @@ class Agent:
         async with self._call_scope("import_session_state", {"name": name}):
             return await self._sessions.import_state(path, name=name)
 
+    async def login_handoff(
+        self,
+        login_url: str,
+        storage_state_path: str | Path,
+        *,
+        session_id: str | None = None,
+        name: str | None = None,
+        success_url_substring: str | None = None,
+        success_selector: str | None = None,
+        timeout_s: float = 300.0,
+        poll_interval_s: float = 1.0,
+    ) -> LoginHandoffResult:
+        """Headed "log in by hand, automate afterwards" handoff (v1.7.0 Wave 8).
+
+        Opens ``login_url`` in a VISIBLE browser session, waits for a human to
+        finish authenticating (password / 2FA / CAPTCHA / SSO), then exports the
+        session's Playwright ``storage_state`` to ``storage_state_path`` (confined
+        to the download dir) so a later headless run can rehydrate the login via
+        :meth:`import_session_state`. The single-call front door to the
+        export/import primitives.
+
+        Requires ``browser.headless=False`` to be useful -- construct the Agent
+        with ``AppConfig(browser={"headless": False})`` so the human can see and
+        drive the window. The wait ends when a success condition is met or the
+        timeout elapses; the state is exported either way.
+
+        Args:
+            login_url: The login page to send the human to.
+            storage_state_path: Destination for the exported state (relative to
+                the download dir; traversal/absolute escapes are rejected).
+            session_id: Reuse an existing session; None creates a fresh one.
+            name: Name for the created session (when ``session_id`` is None).
+            success_url_substring: Stop waiting once the page URL contains this
+                (e.g. ``"/dashboard"``).
+            success_selector: Stop waiting once this selector resolves (a
+                logged-in-only element, e.g. ``"nav.user-menu"``).
+            timeout_s: Max seconds to wait for the human (default 300).
+            poll_interval_s: How often to check the success condition.
+
+        Returns:
+            A :class:`LoginHandoffResult` with the session id, whether/how
+            success was detected, and the exported-state path + cookie/origin
+            counts. Never raises -- failures land in ``error``.
+        """
+        async with self._call_scope(
+            "login_handoff", {"login_url": login_url, "session_id": session_id}
+        ):
+            return await self._sessions.login_handoff(
+                login_url=login_url,
+                storage_state_path=storage_state_path,
+                session_id=session_id,
+                name=name,
+                success_url_substring=success_url_substring,
+                success_selector=success_selector,
+                timeout_s=timeout_s,
+                poll_interval_s=poll_interval_s,
+            )
+
     async def search(
         self,
         query: str,
@@ -1219,6 +1281,90 @@ class Agent:
                 session_id=session_id,
                 strict=strict,
                 llm_extractor=llm_extractor,
+            )
+
+    async def snapshot_page(
+        self,
+        url: str,
+        *,
+        label: str | None = None,
+        session_id: str | None = None,
+        persist: bool = True,
+    ) -> PageSnapshot:
+        """Capture a page's normalized content as a PageSnapshot (v1.7.0 Wave 8).
+
+        Fetches + extracts ``url`` through the normal pipeline (challenge /
+        injection-sanitize / robots / rate-limit / SSRF all apply), normalizes
+        the main content, and -- when ``persist`` (default) and the fetch
+        succeeded -- stores it under ``label`` (default: a hash of the URL) for
+        later change monitoring with :meth:`diff_page`. A failed fetch is
+        transparent (``fetch_status`` / ``error_message``) and is not persisted.
+        """
+        async with self._call_scope("snapshot_page", {"url": url, "label": label}):
+            self._debug.reset()
+            return await self._recipes.snapshot_page(
+                url, label=label, session_id=session_id, persist=persist
+            )
+
+    async def diff_page(
+        self,
+        url: str,
+        *,
+        label: str | None = None,
+        session_id: str | None = None,
+        update: bool = True,
+    ) -> SnapshotDiff:
+        """Diff a page against its stored baseline, then roll the baseline forward.
+
+        v1.7.0 Wave 8 change-monitoring: capture ``url`` now and compare it to
+        the snapshot persisted by a prior :meth:`snapshot_page` / :meth:`diff_page`
+        (keyed by ``label``, default a hash of the URL). Returns a
+        :class:`SnapshotDiff` (``changed`` / ``similarity`` / bounded added &
+        removed lines); ``is_first_snapshot`` is True when there is no baseline
+        yet. With ``update`` (default), a successful capture becomes the new
+        baseline so repeated calls report change SINCE THE PREVIOUS CHECK.
+        """
+        async with self._call_scope("diff_page", {"url": url, "label": label}):
+            self._debug.reset()
+            return await self._recipes.diff_page(
+                url, label=label, session_id=session_id, update=update
+            )
+
+    async def crawl_site(
+        self,
+        start_url: str,
+        *,
+        max_pages: int | None = None,
+        max_depth: int | None = None,
+        same_registrable_domain: bool | None = None,
+        use_sitemap: bool | None = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+        session_id: str | None = None,
+    ) -> CrawlResult:
+        """Bounded breadth-first crawl of a single site (v1.7.0 Wave 8).
+
+        Walks links within scope from ``start_url`` (optionally seeded from
+        ``/sitemap.xml``), fetching every page through the normal pipeline
+        (challenge / injection / robots / rate-limit / SSRF all apply) and
+        deduplicating URLs. ``max_pages`` / ``max_depth`` are CLAMPED to the
+        ``CrawlConfig`` ceilings so the crawl is always bounded; it also stops at
+        ``SafetyConfig.max_time_per_call_seconds``. Returns a :class:`CrawlResult`
+        with per-page records, counts, the injection rollup, and a stop reason.
+        """
+        async with self._call_scope(
+            "crawl_site", {"start_url": start_url, "max_pages": max_pages}
+        ):
+            self._debug.reset()
+            return await self._recipes.crawl_site(
+                start_url,
+                max_pages=max_pages,
+                max_depth=max_depth,
+                same_registrable_domain=same_registrable_domain,
+                use_sitemap=use_sitemap,
+                include=include,
+                exclude=exclude,
+                session_id=session_id,
             )
 
     # ------------------------------------------------------------------
