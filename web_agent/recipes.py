@@ -10,25 +10,33 @@ Available recipes:
 - :meth:`Recipes.search_and_open_best_result` -- search, rank results, fetch+extract top hit
 - :meth:`Recipes.find_and_download_file` -- search, locate first file URL of given types, download
 - :meth:`Recipes.web_research` -- search, parallel fetch+extract top N, return citations
+- :meth:`Recipes.collect_across_pages` -- walk a paginated / infinite-scroll listing,
+  assembling extracted content across pages (v1.7.0 Wave 3B)
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import time
-from typing import Optional
-from urllib.parse import urlparse
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from loguru import logger
 
+from .browser_actions import BrowserActions
 from .browser_manager import BrowserManager
 from .config import AppConfig
 from .content_extractor import ContentExtractor
 from .correlation import get_correlation_id
 from .downloader import Downloader
 from .models import (
+    ActionStatus,
     Citation,
+    CollectedPage,
+    CollectionResult,
     DownloadResult,
     ExtractionResult,
     FetchDiagnostic,
@@ -50,6 +58,12 @@ from .web_fetcher import (
     is_binary_kind,
     is_extractable_binary_kind,
 )
+
+if TYPE_CHECKING:
+    from .agent import _MessageBag as _MessageBagT
+
+# Callable that builds the terminal CollectionResult from a stopped_reason.
+_FinishT = Callable[[str], CollectionResult]
 
 
 def _selector_desc(sel: object) -> str:
@@ -198,6 +212,10 @@ class Recipes:
         browser_manager: Optional BrowserManager for direct page control
             (required by :meth:`fill_form_and_extract`).
         sessions: Optional SessionManager for session-aware page acquisition.
+        actions: Optional BrowserActions for the ``"scroll"`` strategy of
+            :meth:`collect_across_pages` (scroll-to-exhaustion needs a
+            session tab). The ``"next_link"`` / ``"page_param"`` strategies
+            go through the injected WebFetcher and do not need it.
     """
 
     def __init__(
@@ -209,6 +227,7 @@ class Recipes:
         config: AppConfig,
         browser_manager: Optional[BrowserManager] = None,
         sessions: Optional[SessionManager] = None,
+        actions: Optional[BrowserActions] = None,
     ) -> None:
         self._search = search
         self._fetcher = fetcher
@@ -217,6 +236,7 @@ class Recipes:
         self._config = config
         self._bm = browser_manager
         self._sessions = sessions
+        self._actions = actions
         # Merge built-in RANKING_PROFILES with user-defined profiles from
         # AppConfig.ranking_profiles. User-defined wins on collision so a
         # caller can redefine 'docs' for an internal portal.
@@ -1192,3 +1212,481 @@ class Recipes:
         else:
             async with self._bm.new_page(block_resources=False) as page:
                 return await _drive(page)
+
+    # ------------------------------------------------------------------
+    # Recipe 5: collect_across_pages (v1.7.0 Wave 3B)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _content_hash(text: str) -> str:
+        """Stable hash of extracted text for content-level dedup."""
+        return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+    @staticmethod
+    def _bump_page_param(url: str) -> Optional[str]:
+        """Increment a ``?page=`` / ``?p=`` query param; None if absent.
+
+        Only the FIRST recognized param is bumped. Returns None when neither
+        ``page`` nor ``p`` is present (the caller stops the walk), so we
+        never guess a starting page for a URL that doesn't paginate by
+        query string.
+        """
+        parsed = urlparse(url)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        target = None
+        for i, (k, v) in enumerate(pairs):
+            if k.lower() in ("page", "p") and v.isdigit():
+                target = i
+                break
+        if target is None:
+            return None
+        k, v = pairs[target]
+        pairs[target] = (k, str(int(v) + 1))
+        new_query = urlencode(pairs)
+        return urlunparse(parsed._replace(query=new_query))
+
+    async def collect_across_pages(
+        self,
+        url: str,
+        *,
+        strategy: str = "next_link",
+        max_pages: Optional[int] = None,
+        session_id: Optional[str] = None,
+        next_texts: Optional[list[str]] = None,
+        settle_ms: Optional[int] = None,
+        stable_rounds: Optional[int] = None,
+        max_scrolls: Optional[int] = None,
+    ) -> CollectionResult:
+        """Walk a multi-page listing and assemble the extracted content.
+
+        Bounded by ``max_pages`` (clamped to
+        ``automation.pagination_max_pages``) and the per-call budget
+        (``SafetyConfig.max_pages_per_call`` / ``max_chars_per_call`` /
+        ``max_time_per_call_seconds``). Every visited page is fetched +
+        extracted through the injected ``WebFetcher.fetch`` +
+        ``ContentExtractor`` -- so v1.7.0 challenge detection,
+        injection-sanitize, robots obedience, per-host rate limiting, and
+        SSRF re-gating all apply automatically. Pages are DEDUPLICATED by
+        URL and by content hash, so a "next" control that loops never
+        double-counts.
+
+        Strategies:
+          - ``"scroll"``: single URL. Uses scroll-to-exhaustion
+            (:meth:`BrowserActions.scroll_to_bottom`) on a session tab to
+            assemble all lazy/infinite-scroll content, then extracts the
+            page once. Requires ``session_id`` and an injected
+            ``BrowserActions``.
+          - ``"next_link"``: extract a page, find the "next" control (a
+            ``rel=next`` link, an ``aria-label*=next`` link, or an ``<a>``
+            whose text/aria matches ``next_texts``), navigate to it, repeat.
+            Stops on no next control, a revisited URL (cycle guard),
+            ``max_pages``, or budget exhaustion.
+          - ``"page_param"``: increment a ``?page=`` / ``?p=`` query param
+            until an empty or duplicate page, ``max_pages``, or budget.
+
+        Args:
+            url: The listing URL to start from.
+            strategy: ``"scroll"`` | ``"next_link"`` | ``"page_param"``.
+            max_pages: Page cap (clamped to ``automation.pagination_max_pages``).
+            session_id: Persistent session. Required for ``"scroll"``;
+                threaded through ``fetch`` for the link/param strategies.
+            next_texts: Override the ``next_link`` control vocabulary
+                (defaults to ``automation.pagination_next_texts``).
+            settle_ms / stable_rounds / max_scrolls: Forwarded to
+                ``scroll_to_bottom`` for the ``"scroll"`` strategy.
+
+        Returns:
+            CollectionResult with per-page content, counts, a
+            ``stopped_reason``, diagnostics, warnings, and budget telemetry.
+        """
+        from .agent import _block_reason_for, _MessageBag
+
+        start = time.perf_counter()
+        bag = _MessageBag()
+        diagnostics: list[FetchDiagnostic] = []
+        pages: list[CollectedPage] = []
+        budget = BudgetTracker(self._config.safety)
+
+        page_cap = self._config.automation.pagination_max_pages
+        if max_pages is None:
+            max_pages = page_cap
+        # Clamp to the configured ceiling so a large per-call value can't
+        # make the walk unbounded.
+        max_pages = max(1, min(int(max_pages), page_cap))
+
+        logger.info(
+            "Recipe: collect_across_pages url={u} strategy={s} max_pages={n}",
+            u=url,
+            s=strategy,
+            n=max_pages,
+        )
+
+        def _finish(stopped_reason: str) -> CollectionResult:
+            return CollectionResult(
+                start_url=url,
+                strategy=strategy,
+                pages=pages,
+                pages_collected=len(pages),
+                total_content_length=sum(p.content_length for p in pages),
+                stopped_reason=stopped_reason,
+                errors=bag.errors,
+                warnings=bag.warnings,
+                diagnostics=diagnostics,
+                structured_warnings=bag.structured_warnings,
+                structured_errors=bag.structured_errors,
+                correlation_id=get_correlation_id(),
+                total_time_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        if not check_domain_allowed(url, self._config.safety):
+            bag.err("domain_blocked", f"Start URL domain is blocked: {url}", url=url)
+            diagnostics.append(
+                FetchDiagnostic(url=url, status=FetchStatus.BLOCKED, block_reason="domain_blocked")
+            )
+            return _finish("blocked")
+
+        if strategy == "scroll":
+            return await self._collect_scroll(
+                url,
+                session_id=session_id,
+                settle_ms=settle_ms,
+                stable_rounds=stable_rounds,
+                max_scrolls=max_scrolls,
+                bag=bag,
+                diagnostics=diagnostics,
+                pages=pages,
+                budget=budget,
+                finish=_finish,
+            )
+        if strategy not in ("next_link", "page_param"):
+            bag.err(
+                "unknown_strategy",
+                f"Unknown collection strategy {strategy!r}; "
+                "expected 'scroll' | 'next_link' | 'page_param'",
+            )
+            return _finish("error")
+
+        # --- next_link / page_param: a paginated fetch-and-extract walk ---
+        visited_urls: set[str] = set()
+        seen_hashes: set[str] = set()
+        vocabulary = next_texts or self._config.automation.pagination_next_texts
+        current: Optional[str] = url
+        stopped_reason = "no_next"
+
+        while current is not None:
+            if len(pages) >= max_pages:
+                stopped_reason = "max_pages"
+                break
+            # Cycle guard: a next control that loops back to a visited URL
+            # (or a page_param that wraps) must not re-collect.
+            if current in visited_urls:
+                stopped_reason = "cycle"
+                break
+            # Re-gate every navigation target (defense-in-depth on top of the
+            # gate inside fetch()).
+            if not check_domain_allowed(current, self._config.safety):
+                bag.warn("domain_blocked", f"Pagination target blocked: {current}", url=current)
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=current, status=FetchStatus.BLOCKED, block_reason="domain_blocked"
+                    )
+                )
+                stopped_reason = "blocked"
+                break
+            try:
+                budget.check_time()
+                budget.add_page()
+            except Exception as exc:
+                bag.err("budget_exceeded", str(exc))
+                stopped_reason = "budget"
+                break
+
+            visited_urls.add(current)
+            # Go through fetch() (NOT a raw goto) so robots, rate limiting,
+            # challenge detection, injection-sanitize, and SSRF re-gating all
+            # apply to every page automatically.
+            fr = await self._fetcher.fetch(current, session_id=session_id)
+            if fr.status != FetchStatus.SUCCESS or not fr.html:
+                bag.warn(
+                    "fetch_failed",
+                    f"Failed to fetch {current}: {fr.error_message}",
+                    url=current,
+                )
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=current,
+                        final_url=fr.final_url,
+                        status=fr.status,
+                        status_code=fr.status_code,
+                        block_reason=_block_reason_for(fr),
+                        response_time_ms=fr.response_time_ms,
+                        from_cache=fr.from_cache,
+                    )
+                )
+                stopped_reason = "blocked" if fr.status == FetchStatus.BLOCKED else "error"
+                break
+
+            extracted = await self._extractor.extract_async(fr)
+            content = extracted.content or ""
+            chash = self._content_hash(content)
+            # Content-level dedup: a different URL that renders identical
+            # content (e.g. a "next" that silently clamps at the last page)
+            # is not collected twice; for page_param this is the empty/dup
+            # stop signal.
+            if content and chash in seen_hashes:
+                if strategy == "page_param":
+                    stopped_reason = "empty_page"
+                else:
+                    bag.warn(
+                        "duplicate_page",
+                        f"Skipped duplicate page content: {current}",
+                        url=current,
+                    )
+                    stopped_reason = "cycle"
+                break
+            # page_param: an empty page is the natural end of the listing.
+            if strategy == "page_param" and not content:
+                diagnostics.append(
+                    FetchDiagnostic(
+                        url=current,
+                        final_url=fr.final_url,
+                        status=fr.status,
+                        status_code=fr.status_code,
+                        content_length=0,
+                        response_time_ms=fr.response_time_ms,
+                        from_cache=fr.from_cache,
+                    )
+                )
+                stopped_reason = "empty_page"
+                break
+
+            if content:
+                seen_hashes.add(chash)
+            try:
+                budget.add_chars(extracted.content_length)
+            except Exception as exc:
+                bag.err("budget_exceeded", str(exc))
+                self._append_page(pages, current, fr, extracted)
+                diagnostics.append(
+                    self._page_diagnostic(current, fr, extracted)
+                )
+                stopped_reason = "budget"
+                break
+
+            self._append_page(pages, current, fr, extracted)
+            diagnostics.append(self._page_diagnostic(current, fr, extracted))
+
+            # Find the next target.
+            if strategy == "page_param":
+                current = self._bump_page_param(current)
+                if current is None:
+                    stopped_reason = "no_next"
+            else:
+                current = self._find_next_link(fr, list(vocabulary))
+                if current is None:
+                    stopped_reason = "no_next"
+
+        return _finish(stopped_reason)
+
+    @staticmethod
+    def _append_page(
+        pages: list[CollectedPage],
+        url: str,
+        fr: FetchResult,
+        extracted: ExtractionResult,
+    ) -> None:
+        pages.append(
+            CollectedPage(
+                url=url,
+                final_url=fr.final_url if fr.final_url != url else None,
+                title=extracted.title,
+                content=extracted.content or "",
+                content_length=extracted.content_length,
+                extraction_method=extracted.extraction_method,
+            )
+        )
+
+    @staticmethod
+    def _page_diagnostic(
+        url: str, fr: FetchResult, extracted: ExtractionResult
+    ) -> FetchDiagnostic:
+        return FetchDiagnostic(
+            url=url,
+            final_url=fr.final_url,
+            status=fr.status,
+            status_code=fr.status_code,
+            content_length=extracted.content_length,
+            response_time_ms=fr.response_time_ms,
+            from_cache=fr.from_cache,
+        )
+
+    @staticmethod
+    def _find_next_link(fr: FetchResult, vocabulary: list[str]) -> Optional[str]:
+        """Resolve the 'next' control's href from the just-fetched page.
+
+        Parses the fetched HTML with BeautifulSoup (no second navigation):
+        rel=next, then aria-label*=next/older, then a text/aria substring
+        match against ``vocabulary``. Relative hrefs are resolved against
+        the page's final URL. Only same-result-shape hrefs (http/https) are
+        returned; javascript:/#-only anchors are skipped.
+        """
+        from urllib.parse import urljoin
+
+        from bs4 import BeautifulSoup, Tag
+
+        if not fr.html:
+            return None
+        base = fr.final_url or fr.url
+        soup = BeautifulSoup(fr.html, "html.parser")
+        wanted = [w.strip().lower() for w in vocabulary if w.strip()]
+
+        def _href(tag: Tag) -> Optional[str]:
+            raw = tag.get("href")
+            if not isinstance(raw, str) or not raw:
+                return None
+            if raw.startswith(("javascript:", "#", "mailto:")):
+                return None
+            resolved = urljoin(base, raw)
+            scheme = urlparse(resolved).scheme
+            return resolved if scheme in ("http", "https") else None
+
+        # 1. rel=next
+        for a in soup.find_all("a", rel=True):
+            if not isinstance(a, Tag):
+                continue
+            rel = a.get("rel")
+            rel_tokens = rel if isinstance(rel, list) else [rel]
+            if any(isinstance(t, str) and t.lower() == "next" for t in rel_tokens):
+                href = _href(a)
+                if href:
+                    return href
+
+        # 2. + 3. aria-label / text substring match
+        for a in soup.find_all("a"):
+            if not isinstance(a, Tag):
+                continue
+            aria = a.get("aria-label")
+            label = (aria if isinstance(aria, str) else "") + " " + a.get_text()
+            label_l = label.lower()
+            if any(w in label_l for w in wanted):
+                href = _href(a)
+                if href:
+                    return href
+        return None
+
+    async def _collect_scroll(
+        self,
+        url: str,
+        *,
+        session_id: Optional[str],
+        settle_ms: Optional[int],
+        stable_rounds: Optional[int],
+        max_scrolls: Optional[int],
+        bag: _MessageBagT,
+        diagnostics: list[FetchDiagnostic],
+        pages: list[CollectedPage],
+        budget: BudgetTracker,
+        finish: _FinishT,
+    ) -> CollectionResult:
+        """``"scroll"`` strategy: scroll-to-exhaustion then extract once.
+
+        Navigates the session's current tab to ``url``, drives
+        :meth:`BrowserActions.scroll_to_bottom` so the full assembled DOM
+        (all lazy / infinite-scroll content) materializes, then captures and
+        extracts the page once. Requires ``session_id`` (the scroll drives a
+        persistent tab) and an injected ``BrowserActions``.
+        """
+        if session_id is None or self._sessions is None:
+            bag.err(
+                "scroll_requires_session",
+                "strategy='scroll' requires a session_id (scroll-to-exhaustion "
+                "drives a persistent session tab)",
+                url=url,
+            )
+            return finish("error")
+        if self._actions is None:
+            bag.err(
+                "scroll_unavailable",
+                "strategy='scroll' requires an injected BrowserActions "
+                "(construct Recipes via Agent, which wires it)",
+                url=url,
+            )
+            return finish("error")
+
+        try:
+            budget.check_time()
+            budget.add_page()
+        except Exception as exc:
+            bag.err("budget_exceeded", str(exc))
+            return finish("budget")
+
+        # The session already has a current tab (SessionManager.create
+        # registers one). Navigate it to the target URL, then scroll. The
+        # up-front check_domain_allowed(url) in collect_across_pages already
+        # gated the start URL; we re-gate the POST-navigation URL below.
+        self._sessions.touch(session_id)
+        tab_mgr = self._sessions.get_tab_manager(session_id)
+        page = tab_mgr.get_or_current(None)
+        if page is None:
+            ctx = self._sessions.get(session_id)
+            page = await ctx.new_page()
+            await tab_mgr.register_initial_page(page)
+
+        await page.goto(url, wait_until="domcontentloaded")
+        # Post-nav SSRF re-gate (the goto may have redirected to an internal
+        # host); never scroll/extract content off a disallowed page.
+        if not check_domain_allowed(page.url, self._config.safety):
+            bag.warn("ssrf_redirect", f"Scroll nav redirected off-domain: {page.url}", url=url)
+            diagnostics.append(
+                FetchDiagnostic(
+                    url=url,
+                    final_url=page.url,
+                    status=FetchStatus.BLOCKED,
+                    block_reason="domain_blocked",
+                )
+            )
+            return finish("blocked")
+
+        scroll_res = await self._actions.scroll_to_bottom(
+            session_id=session_id,
+            settle_ms=settle_ms,
+            stable_rounds=stable_rounds,
+            max_scrolls=max_scrolls,
+        )
+        if scroll_res.status != ActionStatus.SUCCESS:
+            bag.warn(
+                "scroll_failed",
+                f"scroll_to_bottom did not succeed: {scroll_res.error_message}",
+                url=url,
+            )
+
+        # Capture the assembled DOM and extract. safe_page_content is the
+        # 3-tier mid-navigation-safe capture used elsewhere in this module.
+        html, html_source = await safe_page_content(page)
+        if html_source == "navigating" or not html:
+            bag.err(
+                "capture_failed",
+                "assembled page content could not be captured after scrolling",
+                url=url,
+            )
+            diagnostics.append(
+                FetchDiagnostic(url=url, final_url=page.url, status=FetchStatus.NETWORK_ERROR)
+            )
+            return finish("error")
+
+        fr = FetchResult(
+            url=url,
+            final_url=page.url,
+            status=FetchStatus.SUCCESS,
+            html=html,
+            html_capture_source=html_source,
+            correlation_id=get_correlation_id(),
+        )
+        extracted = await self._extractor.extract_async(fr)
+        try:
+            budget.add_chars(extracted.content_length)
+        except Exception as exc:
+            bag.err("budget_exceeded", str(exc))
+        self._append_page(pages, url, fr, extracted)
+        diagnostics.append(self._page_diagnostic(url, fr, extracted))
+        return finish("scroll_complete")

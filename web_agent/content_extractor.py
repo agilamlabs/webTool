@@ -11,6 +11,7 @@ hint -- it never crashes the pipeline.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import re
 from typing import Any, Optional
@@ -35,6 +36,97 @@ _ANALYTICS_URL_RE = re.compile(
     r"|/stats\b|/metrics\b|/rum\b|/log(?:s|ging)?\b)",
     re.IGNORECASE,
 )
+
+
+def _module_available(name: str) -> bool:
+    """v1.7.0 Wave 3C: True when an optional module can be imported.
+
+    Probes via :func:`importlib.util.find_spec` without importing the
+    module, so the no-``[binary]``-extra install is unaffected. Used to
+    choose the PDF engine (pdfplumber preferred, pypdf fallback). Tests
+    patch this to exercise each branch.
+    """
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):  # pragma: no cover -- defensive
+        # ImportError: a parent package is itself broken/missing.
+        # ValueError: ``name`` has no spec machinery (e.g. __main__).
+        return False
+
+
+def _pdf_title_from_metadata(metadata: Any) -> Optional[str]:
+    """Pull a non-empty ``/Title`` from pypdf/pdfplumber metadata.
+
+    pypdf exposes a ``DocumentInformation`` object (``.title`` attr);
+    pdfplumber exposes a plain dict (``{'Title': ...}``). Handle both
+    shapes; never raise -- a missing/garbage title just yields None.
+    """
+    if metadata is None:
+        return None
+    candidate: Any = None
+    try:
+        if isinstance(metadata, dict):
+            candidate = metadata.get("Title")
+        else:
+            candidate = getattr(metadata, "title", None)
+    except Exception:  # pragma: no cover -- defensive
+        return None
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    return None
+
+
+def _render_markdown_table(
+    table: list[list[Any]],
+    *,
+    page_index: int,
+    url: str,
+    max_cells: int,
+) -> Optional[str]:
+    """Render a pdfplumber table (list of rows) as a GFM markdown table.
+
+    The first row becomes the header. ``None`` cells (very common in
+    pdfplumber output) render as empty; pipes / newlines inside a cell
+    are escaped so they don't break the table grid. Bounded by
+    ``max_cells`` (rows * columns): when exceeded, whole trailing rows
+    are dropped to stay under budget and a WARNING is logged. Returns
+    ``None`` for an empty/degenerate table.
+    """
+    rows = [r for r in table if r is not None]
+    if not rows:
+        return None
+    width = max(len(r) for r in rows)
+    if width == 0:
+        return None
+
+    if max_cells > 0 and width * len(rows) > max_cells:
+        keep_rows = max(1, max_cells // width)
+        if keep_rows < len(rows):
+            logger.warning(
+                "PDF table on page {n} exceeds cell cap ({cap}); keeping "
+                "{kept}/{total} rows for {url}",
+                n=page_index,
+                cap=max_cells,
+                kept=keep_rows,
+                total=len(rows),
+                url=url,
+            )
+            rows = rows[:keep_rows]
+
+    def _cell(value: Any) -> str:
+        text = "" if value is None else str(value)
+        # Collapse newlines (a cell spanning lines would break the row)
+        # and escape pipes so the grid stays intact.
+        return text.replace("\r", " ").replace("\n", " ").replace("|", "\\|").strip()
+
+    def _row(cells: list[Any]) -> str:
+        padded = list(cells) + [None] * (width - len(cells))
+        return "| " + " | ".join(_cell(c) for c in padded) + " |"
+
+    header = _row(rows[0])
+    separator = "| " + " | ".join(["---"] * width) + " |"
+    body = [_row(r) for r in rows[1:]]
+    return "\n".join([header, separator, *body])
 
 
 def _extract_json_ld(html: str) -> list[dict[str, Any]]:
@@ -806,64 +898,272 @@ class ContentExtractor:
     # Binary branches: PDF + XLSX
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_pdf(blob: bytes, url: str) -> ExtractionResult:
-        """Extract text from PDF bytes using pypdf.
+    def _extract_pdf(self, blob: bytes, url: str) -> ExtractionResult:
+        """Extract text (and tables) from PDF bytes.
 
-        Returns an ExtractionResult with extraction_method='pdf' on success
-        or 'none' on missing-library / encrypted / malformed PDF.
+        Engine preference chain (v1.7.0 Wave 3C):
+
+        1. **pdfplumber** when installed -- per-page text with better
+           layout fidelity AND per-page table extraction rendered as
+           markdown. ``extraction_method='pdfplumber'``.
+        2. **pypdf** fallback when pdfplumber is missing -- page text
+           only, no tables. ``extraction_method='pdf'``.
+        3. Neither installed -> ``extraction_method='none'`` with an
+           install hint (the pre-Wave-3C missing-extra contract).
+
+        Both engines emit per-page markers (``===== Page N =====``) when
+        ``ExtractionConfig.pdf_page_markers`` is on so an agent can cite
+        pages, and set ``page_count``. When a PDF has pages but no
+        embedded text layer (scanned / image-only), the result is NOT a
+        bare empty success -- ``error_message`` names the OCR reason and
+        ``failure_stage='extract'``.
+
+        Availability is probed with :func:`importlib.util.find_spec`
+        (mirrors how the optional-extra paths detect their library
+        without a hard top-level import) so the no-extra install keeps
+        working; tests patch ``_PDFPLUMBER_AVAILABLE`` / the spec to
+        exercise each branch.
+        """
+        if _module_available("pdfplumber"):
+            return self._extract_pdf_pdfplumber(blob, url)
+        if _module_available("pypdf"):
+            return self._extract_pdf_pypdf(blob, url)
+        logger.warning(
+            "Neither pdfplumber nor pypdf installed; PDF extraction skipped. "
+            "Install with: pip install 'web-agent-toolkit[binary]'"
+        )
+        return ExtractionResult(
+            url=url,
+            extraction_method="none",
+            content=None,
+            error_message=(
+                "PDF extraction requires the [binary] extra (pdfplumber "
+                "preferred, pypdf fallback); neither is installed. Install "
+                "with: pip install 'web-agent-toolkit[binary]'"
+            ),
+            failure_stage="extract",
+        )
+
+    @staticmethod
+    def _scanned_pdf_result(url: str, page_count: int) -> ExtractionResult:
+        """Build the actionable result for an image-only / scanned PDF.
+
+        A PDF with pages but no embedded text layer needs OCR, which
+        web_agent does not perform. Rather than a bare empty success,
+        surface why and what to do next.
+        """
+        logger.info(
+            "PDF appears image-only / scanned (no text layer) for {url} "
+            "({n} pages)",
+            url=url,
+            n=page_count,
+        )
+        return ExtractionResult(
+            url=url,
+            extraction_method="none",
+            content=None,
+            page_count=page_count,
+            error_message=(
+                "PDF appears to be image-only / scanned (no embedded text "
+                "layer); OCR is required and is not supported by web_agent -- "
+                "try a different source or an OCR tool."
+            ),
+            failure_stage="extract",
+        )
+
+    def _extract_pdf_pdfplumber(self, blob: bytes, url: str) -> ExtractionResult:
+        """Preferred PDF path: per-page text + markdown tables via pdfplumber.
+
+        Bounds table extraction by ``pdf_max_tables`` (total tables) and
+        ``pdf_max_table_cells`` (per-table cells); both truncate with a
+        WARNING and set ``truncated`` rather than silently dropping. The
+        document is streamed page-by-page; only the rendered strings are
+        retained, keeping peak memory bounded by the content cap rather
+        than the raw page objects.
+        """
+        from io import BytesIO
+
+        import pdfplumber
+
+        ext_cfg = self._config.extraction
+        emit_markers = ext_cfg.pdf_page_markers
+        want_tables = ext_cfg.pdf_extract_tables and ext_cfg.pdf_max_tables > 0
+        max_tables = ext_cfg.pdf_max_tables
+        max_cells = ext_cfg.pdf_max_table_cells
+
+        page_parts: list[str] = []
+        tables_md: list[str] = []
+        any_text = False
+        tables_truncated = False
+        title: Optional[str] = None
+        try:
+            with pdfplumber.open(BytesIO(blob)) as pdf:
+                title = _pdf_title_from_metadata(getattr(pdf, "metadata", None))
+                page_count = len(pdf.pages)
+                for index, page in enumerate(pdf.pages, start=1):
+                    segments: list[str] = []
+                    if emit_markers:
+                        segments.append(f"===== Page {index} =====")
+                    try:
+                        page_text = page.extract_text() or ""
+                    except Exception as page_exc:
+                        logger.debug(
+                            "pdfplumber page {n} text extract failed: {e}",
+                            n=index,
+                            e=page_exc,
+                        )
+                        page_text = ""
+                    if page_text.strip():
+                        any_text = True
+                        segments.append(page_text.strip())
+                    if want_tables:
+                        remaining = max_tables - len(tables_md)
+                        page_tables, dropped = self._render_pdf_tables(
+                            page,
+                            page_index=index,
+                            url=url,
+                            remaining=remaining,
+                            max_cells=max_cells,
+                        )
+                        if dropped:
+                            tables_truncated = True
+                        for md in page_tables:
+                            tables_md.append(md)
+                            segments.append(md)
+                    if len(segments) > (1 if emit_markers else 0):
+                        page_parts.append("\n\n".join(segments))
+                    elif emit_markers:
+                        # Keep the marker even for an empty page so page
+                        # numbers stay aligned for citation.
+                        page_parts.append(segments[0])
+        except Exception as exc:
+            logger.warning(
+                "pdfplumber extraction failed for {url}: {e}", url=url, e=exc
+            )
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+
+        if page_count == 0:
+            return ExtractionResult(url=url, extraction_method="none", content=None)
+        if not any_text and not tables_md:
+            # Pages exist but carry no extractable text layer or tables.
+            return self._scanned_pdf_result(url, page_count)
+
+        text = "\n\n".join(page_parts).strip()
+        result = ExtractionResult(
+            url=url,
+            title=title,
+            content=text if text else None,
+            extraction_method="pdfplumber",
+            content_length=len(text),
+            page_count=page_count,
+            tables=tables_md,
+        )
+        if tables_truncated:
+            result.truncated = True
+        return result
+
+    def _render_pdf_tables(
+        self,
+        page: Any,
+        *,
+        page_index: int,
+        url: str,
+        remaining: int,
+        max_cells: int,
+    ) -> tuple[list[str], int]:
+        """Extract a page's tables and render each as a markdown table.
+
+        ``remaining`` is the global per-document table budget still
+        available (``pdf_max_tables`` minus tables already rendered).
+        Renders at most ``remaining`` tables from this page; returns
+        ``(markdown_tables, dropped)`` where ``dropped`` is the number of
+        this page's tables that were NOT rendered because the budget ran
+        out (so the caller can flag ``truncated``). Per-table cell count
+        is bounded by ``max_cells`` (whole trailing rows dropped) with a
+        WARNING; an over-budget table is still emitted, just truncated.
         """
         try:
-            from pypdf import PdfReader
-        except ImportError:
+            raw_tables = page.extract_tables() or []
+        except Exception as exc:
+            logger.debug(
+                "pdfplumber table extract failed on page {n}: {e}",
+                n=page_index,
+                e=exc,
+            )
+            return [], 0
+
+        # Render only non-degenerate tables, capped by the remaining budget.
+        renderable = [
+            md
+            for md in (
+                _render_markdown_table(
+                    t, page_index=page_index, url=url, max_cells=max_cells
+                )
+                for t in raw_tables
+            )
+            if md
+        ]
+        budget = max(0, remaining)
+        if len(renderable) > budget:
+            dropped = len(renderable) - budget
             logger.warning(
-                "pypdf not installed; PDF extraction skipped. "
-                "Install with: pip install 'web-agent-toolkit[binary]'"
-            )
-            return ExtractionResult(
+                "PDF table cap reached for {url}; dropping {dropped} table(s) "
+                "(page {n})",
                 url=url,
-                extraction_method="none",
-                content=None,
+                dropped=dropped,
+                n=page_index,
             )
+            return renderable[:budget], dropped
+        return renderable, 0
 
+    def _extract_pdf_pypdf(self, blob: bytes, url: str) -> ExtractionResult:
+        """Fallback PDF path: page text via pypdf (no tables).
+
+        Adds per-page markers (when enabled) and ``page_count`` so the
+        fallback still supports page citation, and the same scanned /
+        no-text-layer detection as the pdfplumber path. ``extraction_
+        method='pdf'`` so callers/telemetry can see pypdf won (vs
+        ``'pdfplumber'``).
+        """
+        from io import BytesIO
+
+        from pypdf import PdfReader
+
+        emit_markers = self._config.extraction.pdf_page_markers
         try:
-            from io import BytesIO
-
             reader = PdfReader(BytesIO(blob))
             if reader.is_encrypted:
                 logger.info("PDF is encrypted, skipping: {url}", url=url)
-                return ExtractionResult(
-                    url=url,
-                    extraction_method="none",
-                    content=None,
-                )
-            parts: list[str] = []
-            for page in reader.pages:
+                return ExtractionResult(url=url, extraction_method="none", content=None)
+            page_parts: list[str] = []
+            any_text = False
+            page_count = len(reader.pages)
+            for index, page in enumerate(reader.pages, start=1):
                 try:
-                    parts.append(page.extract_text() or "")
+                    page_text = (page.extract_text() or "").strip()
                 except Exception as page_exc:
                     logger.debug("PDF page extract failed: {e}", e=page_exc)
-            text = "\n\n".join(p for p in parts if p).strip()
-            if not text:
-                return ExtractionResult(
-                    url=url,
-                    extraction_method="none",
-                    content=None,
-                )
-            # Pull /Title from the document info dict if available
-            title: Optional[str] = None
-            try:
-                info = reader.metadata
-                if info is not None and getattr(info, "title", None):
-                    title = str(info.title)
-            except Exception:
-                pass
+                    page_text = ""
+                if page_text:
+                    any_text = True
+                if emit_markers:
+                    marker = f"===== Page {index} ====="
+                    page_parts.append(f"{marker}\n\n{page_text}" if page_text else marker)
+                elif page_text:
+                    page_parts.append(page_text)
+            if page_count == 0:
+                return ExtractionResult(url=url, extraction_method="none", content=None)
+            if not any_text:
+                return self._scanned_pdf_result(url, page_count)
+            text = "\n\n".join(page_parts).strip()
+            title = _pdf_title_from_metadata(reader.metadata)
             return ExtractionResult(
                 url=url,
                 title=title,
-                content=text,
+                content=text if text else None,
                 extraction_method="pdf",
                 content_length=len(text),
+                page_count=page_count,
             )
         except Exception as exc:
             logger.warning("PDF extraction failed for {url}: {e}", url=url, e=exc)

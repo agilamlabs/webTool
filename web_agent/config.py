@@ -993,6 +993,54 @@ class ExtractionConfig(BaseSettings):
             "API remains unlimited unless max_chars is passed explicitly."
         ),
     )
+    # v1.7.0 Wave 3C: PDF extraction knobs. The PDF path prefers pdfplumber
+    # (per-page text + layout + tables), falls back to pypdf (page text
+    # only), then to extraction_method='none' with an install hint when
+    # neither is installed. These gate the pdfplumber-only features; the
+    # per-call content cap is reused from ``safety.max_chars_per_call``
+    # (no duplicate knob).
+    pdf_extract_tables: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0 Wave 3C: when True (default) and pdfplumber is used, "
+            "extract tables per page and render each as a "
+            "GitHub-flavoured markdown table (interleaved into the page "
+            "content and also exposed on ExtractionResult.tables). False "
+            "skips table extraction entirely (faster, text-only). No "
+            "effect on the pypdf fallback, which never extracts tables."
+        ),
+    )
+    pdf_page_markers: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0 Wave 3C: when True (default), emit a per-page "
+            "delimiter (``===== Page N =====``) between pages in the "
+            "extracted PDF text so an agent can cite specific pages. "
+            "False concatenates page text without markers."
+        ),
+    )
+    pdf_max_tables: int = Field(
+        default=50,
+        ge=0,
+        description=(
+            "v1.7.0 Wave 3C: cap on the number of tables extracted from a "
+            "single PDF (pdfplumber path). 0 disables table extraction "
+            "(equivalent to pdf_extract_tables=False). When a PDF has more "
+            "tables than this, the extras are dropped, a WARNING is "
+            "logged, and ExtractionResult.truncated is set."
+        ),
+    )
+    pdf_max_table_cells: int = Field(
+        default=2000,
+        ge=0,
+        description=(
+            "v1.7.0 Wave 3C: cap on the number of cells rendered for a "
+            "single PDF table (rows * columns). A pathological table is "
+            "truncated to this many cells (whole trailing rows dropped) "
+            "with a WARNING logged, bounding memory/token blow-up. 0 "
+            "disables the per-table cell cap (render every cell)."
+        ),
+    )
 
     # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_EXTRACTION__
     # so bare ``INCLUDE_TABLES`` / ``FAVOR_RECALL`` env vars can't override
@@ -1025,6 +1073,64 @@ class AutomationConfig(BaseSettings):
     # ``interact(url, ...)`` call against the same session_id opens a fresh
     # page within the session's BrowserContext.
     fresh_tab_per_call: bool = False
+
+    # v1.7.0 Wave 3B: paginated / scroll-to-exhaustion collection knobs.
+    # Defaults bound the ``Recipes.collect_across_pages`` walk and the
+    # ``BrowserActions.scroll_to_bottom`` action so an LLM / prompt-injection
+    # value can't make a walk unbounded. ``ScrollInput.infinite_scroll_max``
+    # is reused for the per-call scroll ceiling rather than adding a
+    # duplicate -- these fields cover only what that knob does not.
+    pagination_max_pages: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description=(
+            "Default / hard cap on the number of pages "
+            "``collect_across_pages`` will walk. A larger per-call value is "
+            "clamped to this ceiling so pagination can never run away."
+        ),
+    )
+    scroll_stable_rounds: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description=(
+            "How many consecutive scroll rounds must leave the document "
+            "scrollHeight unchanged before ``scroll_to_bottom`` declares a "
+            "stable bottom (lazy-loaded content settled)."
+        ),
+    )
+    scroll_settle_ms: int = Field(
+        default=1000,
+        ge=0,
+        le=30000,
+        description=(
+            "Milliseconds ``scroll_to_bottom`` waits after each scroll for "
+            "lazy / infinite-scroll content to load before re-measuring the "
+            "document height."
+        ),
+    )
+    pagination_next_texts: list[str] = Field(
+        # chr(0x203A) / chr(0x00BB) are the chevron glyphs ('>'-like) common
+        # in pagination controls. Written as chr() so the source carries no
+        # ambiguous Unicode literal (ruff RUF001) while still matching them.
+        default_factory=lambda: [
+            "next",
+            "older",
+            "more",
+            "load more",
+            "show more",
+            chr(0x203A),  # single right-pointing angle quotation mark
+            chr(0x00BB),  # right double-angle quotation mark
+        ],
+        description=(
+            "Case-insensitive substrings matched against a candidate 'next' "
+            "control's text / aria-label in the 'next_link' strategy. A "
+            "rel=next link and an aria-label*=next control are always tried "
+            "first regardless of this list. Override per-call via the "
+            "``next_texts`` recipe parameter."
+        ),
+    )
 
     # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_AUTOMATION__
     # so bare ``SCREENSHOT_DIR`` / ``STOP_ON_ERROR`` env vars can't override

@@ -115,6 +115,10 @@ _MINIMAL_PDF = (
 
 
 def test_pdf_extraction_returns_text():
+    # v1.7.0 Wave 3C: the PDF path now prefers pdfplumber when installed
+    # (extraction_method='pdfplumber') and falls back to pypdf
+    # (extraction_method='pdf'). Accept either so this test passes with or
+    # without pdfplumber present.
     pytest.importorskip("pypdf")
     fr = FetchResult(
         url="https://x.com/a.pdf",
@@ -124,7 +128,7 @@ def test_pdf_extraction_returns_text():
         content_type="application/pdf",
     )
     res = ContentExtractor(AppConfig()).extract(fr)
-    assert res.extraction_method == "pdf"
+    assert res.extraction_method in ("pdfplumber", "pdf")
     assert res.content is not None
     assert "Hello" in res.content
 
@@ -148,17 +152,23 @@ def test_pdf_extraction_with_garbage_returns_none():
 
 
 def test_pdf_missing_library_returns_none(monkeypatch):
-    """If pypdf is absent, _extract_pdf logs and returns extraction_method='none'."""
-    import builtins
+    """If neither pdfplumber nor pypdf is available, the PDF path degrades.
 
-    real_import = builtins.__import__
+    v1.7.0 Wave 3C: engine availability is decided via
+    ``content_extractor._module_available`` (importlib.util.find_spec), so we
+    patch that to report both PDF engines absent. The result preserves the
+    pre-Wave-3C contract: ``extraction_method='none'`` with an install hint.
+    """
+    import web_agent.content_extractor as ce_mod
 
-    def fake_import(name, *args, **kwargs):
-        if name == "pypdf":
-            raise ImportError("pypdf not installed (simulated)")
-        return real_import(name, *args, **kwargs)
+    real_available = ce_mod._module_available
 
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+    def fake_available(name: str) -> bool:
+        if name in ("pdfplumber", "pypdf"):
+            return False
+        return real_available(name)
+
+    monkeypatch.setattr(ce_mod, "_module_available", fake_available)
 
     fr = FetchResult(
         url="https://x.com/a.pdf",
@@ -169,3 +179,5 @@ def test_pdf_missing_library_returns_none(monkeypatch):
     )
     res = ContentExtractor(AppConfig()).extract(fr)
     assert res.extraction_method == "none"
+    assert res.error_message is not None
+    assert "binary" in res.error_message.lower()

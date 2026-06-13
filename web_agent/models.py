@@ -649,6 +649,42 @@ class ExtractionResult(BaseModel):
             "``injection.stripped_invisible_chars`` for the counts."
         ),
     )
+    # ------------------------------------------------------------------
+    # v1.7.0 Wave 3C: paged-document (PDF) extraction metadata. Populated
+    # by the PDF path (pdfplumber-preferred, pypdf fallback);
+    # ``page_count`` lets a caller cite "page N", ``tables`` exposes any
+    # PDF tables as GitHub-flavoured markdown for structured consumers
+    # (the same tables are also interleaved into ``content`` under their
+    # page marker). Both additive/defaulted -- pre-Wave-3C constructors
+    # and JSON dumps are unaffected; non-paged extractions leave
+    # ``page_count`` None and ``tables`` empty.
+    # ------------------------------------------------------------------
+    page_count: Optional[int] = Field(
+        default=None,
+        description=(
+            "v1.7.0 Wave 3C: number of pages in a paged document (PDF). "
+            "None for non-paged extractions (HTML/CSV/XLSX/DOCX). When "
+            "the content carries per-page markers "
+            "(``===== Page N =====``), this is the total page count an "
+            "agent can use to cite or page through the document."
+        ),
+    )
+    tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "v1.7.0 Wave 3C: tables extracted from a PDF (pdfplumber "
+            "path only), each rendered as a self-contained "
+            "GitHub-flavoured markdown table. The same tables are also "
+            "interleaved into ``content`` beneath their page marker; "
+            "this field exposes them separately for structured "
+            "consumers. Empty when no tables were found, when table "
+            "extraction is disabled "
+            "(``ExtractionConfig.pdf_extract_tables=False``), or for the "
+            "pypdf fallback / non-PDF extractions. Bounded by "
+            "``ExtractionConfig.pdf_max_tables``; ``truncated`` is set "
+            "when the cap drops further tables."
+        ),
+    )
 
 
 class CdpConnectionInfo(BaseModel):
@@ -1766,3 +1802,96 @@ class SkillApplicationResult(BaseModel):
 # (interaction-library Action types are defined above, before the Action
 # discriminated union -- see UploadFileInput / IframeClickInput /
 # ShadowDomClickInput / DragAndDropInput around the BaseAction block.)
+
+
+# ---------------------------------------------------------------------------
+# v1.7.0 Wave 3B: paginated / scroll-to-exhaustion collection
+# ---------------------------------------------------------------------------
+
+
+class CollectedPage(BaseModel):
+    """One page visited by :meth:`Recipes.collect_across_pages`.
+
+    A lighter-weight record than a full :class:`ExtractionResult`: it keeps
+    only what a caller assembling a multi-page listing needs (the URL that
+    was fetched, the extracted text, its length, and how the extractor
+    fared). Concatenate ``content`` across the ``pages`` list to rebuild
+    the full listing in visit order.
+    """
+
+    url: str = Field(description="URL that was fetched and extracted")
+    final_url: Optional[str] = Field(
+        default=None, description="URL after redirects (None if it never changed)"
+    )
+    title: Optional[str] = Field(default=None, description="Page title, if the extractor found one")
+    content: str = Field(default="", description="Extracted text content for this page")
+    content_length: int = Field(default=0, description="Character count of ``content``")
+    extraction_method: str = Field(
+        default="none",
+        description="Which extractor produced ``content``: trafilatura|bs4|raw|api_json|none.",
+    )
+
+
+class CollectionResult(BaseModel):
+    """Result of :meth:`Recipes.collect_across_pages`.
+
+    Walks a multi-page listing (infinite scroll, rel=next pagination, or a
+    ``?page=`` query param) and assembles the extracted content across
+    pages, bounded by ``max_pages`` and the per-call budget. Returned by
+    :meth:`Agent.collect_across_pages` and the matching MCP tool.
+
+    Each visited page is fetched+extracted through the injected
+    ``WebFetcher`` + ``ContentExtractor`` (so v1.7.0 challenge detection,
+    injection sanitize, robots, rate limiting, and SSRF re-gating all
+    apply), deduplicated by URL and content hash so a "next" control that
+    loops back never double-counts.
+    """
+
+    start_url: str = Field(description="The URL the walk started from")
+    strategy: str = Field(
+        description="Pagination strategy used: 'scroll' | 'next_link' | 'page_param'."
+    )
+    pages: list[CollectedPage] = Field(
+        default_factory=list,
+        description="Per-page extracted content, in visit order.",
+    )
+    pages_collected: int = Field(
+        default=0, description="Number of pages whose content was collected (== len(pages))."
+    )
+    total_content_length: int = Field(
+        default=0, description="Sum of content_length across all collected pages."
+    )
+    stopped_reason: str = Field(
+        default="",
+        description=(
+            "Why the walk stopped: 'no_next' (no further next control) | "
+            "'max_pages' (page cap hit) | 'budget' (per-call budget "
+            "exhausted) | 'cycle' (a next control looped back to a visited "
+            "URL) | 'blocked' (a page was blocked by SafetyConfig / a "
+            "bot-wall) | 'error' (an unexpected failure ended the walk) | "
+            "'empty_page' (page_param reached an empty/duplicate page) | "
+            "'scroll_complete' (the single-page 'scroll' strategy finished)."
+        ),
+    )
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Fatal issues that prevent the collection from being usable.",
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Non-fatal issues (a blocked/failed page mid-walk, a skipped duplicate).",
+    )
+    diagnostics: list[FetchDiagnostic] = Field(
+        default_factory=list,
+        description="Per-URL fetch outcomes for every page the walk attempted.",
+    )
+    structured_warnings: list[ToolMessage] = Field(
+        default_factory=list,
+        description="Structured form of ``warnings`` (code/message/url/severity).",
+    )
+    structured_errors: list[ToolMessage] = Field(
+        default_factory=list,
+        description="Structured form of ``errors`` (code/message/url/severity).",
+    )
+    correlation_id: Optional[str] = Field(default=None)
+    total_time_ms: float = Field(default=0.0)

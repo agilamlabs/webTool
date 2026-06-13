@@ -1791,6 +1791,170 @@ class BrowserActions:
             error_message=f"Text {text!r} not found after {max_scrolls} scrolls",
         )
 
+    async def scroll_to_bottom(
+        self,
+        *,
+        session_id: str,
+        tab_id: Optional[str] = None,
+        max_scrolls: Optional[int] = None,
+        settle_ms: Optional[int] = None,
+        stable_rounds: Optional[int] = None,
+    ) -> ActionResult:
+        """v1.7.0 Wave 3B: scroll to the bottom repeatedly until lazy content stops loading.
+
+        Repeatedly scroll the session tab to the bottom, waiting
+        ``settle_ms`` after each scroll for lazy / infinite-scroll content
+        to load, until the document ``scrollHeight`` stops growing for
+        ``stable_rounds`` consecutive rounds (a stable bottom) OR
+        ``max_scrolls`` is hit (the cap). This materializes the FULL
+        assembled DOM so a subsequent ``observe`` / extract on the same tab
+        sees every below-the-fold item -- the recurring failure mode where
+        scroll-triggered content never enters an agent's observation.
+
+        Thin, bounded browser action -- it does NOT extract; pair it with a
+        fetch/observe on the same tab.
+
+        Args:
+            session_id: Persistent browser session whose tab to scroll.
+            tab_id: Tab within the session (defaults to the current tab).
+            max_scrolls: Hard cap on scroll rounds. Defaults to
+                ``automation.infinite_scroll_max``. Clamped to ``[0, 1000]``
+                (same ceiling as ``scroll_until_text`` -- this path does not
+                go through a pydantic action model, so a hostile value is
+                clamped here).
+            settle_ms: Milliseconds to wait after each scroll for lazy
+                content. Defaults to ``automation.scroll_settle_ms``.
+            stable_rounds: Consecutive unchanged-height rounds required to
+                declare a stable bottom. Defaults to
+                ``automation.scroll_stable_rounds``. Clamped to ``>= 1``.
+
+        Returns:
+            ActionResult with ``data={"scrolls_used": int, "reached_bottom":
+            bool, "final_height": int}``. ``reached_bottom`` is True when the
+            height stabilized, False when ``max_scrolls`` was hit while the
+            page was still growing.
+        """
+        automation = self._config.automation
+        if max_scrolls is None:
+            # Reuse the existing infinite-scroll ceiling rather than a new knob.
+            max_scrolls = ScrollInput.model_fields["infinite_scroll_max"].default
+        if settle_ms is None:
+            settle_ms = automation.scroll_settle_ms
+        if stable_rounds is None:
+            stable_rounds = automation.scroll_stable_rounds
+        # Same 1000-round wall-clock clamp as scroll_until_text: each round
+        # costs an evaluate + a settle sleep, so an LLM / prompt-injection
+        # value like 10**8 would make total wall-clock attacker-controlled.
+        max_scrolls = max(0, min(int(max_scrolls), 1000))
+        settle_ms = max(0, int(settle_ms))
+        stable_rounds = max(1, int(stable_rounds))
+
+        if self._sessions is None:
+            raise RuntimeError("scroll_to_bottom requires a SessionManager")
+        tab_mgr = self._sessions.get_tab_manager(session_id)
+        page = tab_mgr.get_or_current(tab_id)
+        if page is None:
+            raise ValueError(f"Session {session_id!r} has no current tab. Open one first.")
+        self._sessions.touch(session_id)
+
+        # Re-gate the session tab's current URL before driving / reading it.
+        # A prior navigation may have parked this tab on a denied/private
+        # host; scrolling it (and surfacing its assembled content to a later
+        # extract) would be a deny-list bypass / content-exfil oracle.
+        if not check_domain_allowed(page.url, self._config.safety):
+            host = urlparse(page.url).hostname or ""
+            return ActionResult(
+                action=ActionType.SCROLL,
+                status=ActionStatus.FAILED,
+                error_message=(
+                    f"scroll_to_bottom: current page URL is on a disallowed domain: {host}"
+                ),
+            )
+
+        from .exceptions import ActionError
+
+        # v1.6.14 A-6 pattern: bound each evaluate so a hung page can't stall
+        # for up to max_scrolls x an unbounded wait. Page.evaluate takes no
+        # timeout kwarg, so wrap each call in asyncio.wait_for. A timed-out
+        # evaluate raises the builtin TimeoutError, which execute_action's
+        # caller surfaces as TIMEOUT; here we propagate it the same way the
+        # other session-driving actions do (the Agent wrapper runs inside
+        # _call_scope and the public surface returns result-based, but a
+        # timeout on a hung page is a genuine error worth surfacing).
+        eval_timeout = min(automation.default_action_timeout or 10000, 5000) / 1000
+
+        async def _scroll_height() -> int:
+            value = await asyncio.wait_for(
+                page.evaluate("document.documentElement.scrollHeight"),
+                timeout=eval_timeout,
+            )
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        try:
+            last_height = await _scroll_height()
+        except Exception as exc:
+            if page.is_closed():
+                raise ActionError(
+                    "scroll_to_bottom: page was closed before scrolling", action="scroll"
+                ) from exc
+            logger.debug("scroll_to_bottom initial height read failed: {e}", e=exc)
+            last_height = 0
+
+        scrolls_used = 0
+        stable = 0
+        reached_bottom = False
+        for _ in range(max_scrolls):
+            if page.is_closed():
+                raise ActionError("scroll_to_bottom: page was closed mid-scroll", action="scroll")
+            try:
+                await asyncio.wait_for(
+                    page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)"),
+                    timeout=eval_timeout,
+                )
+            except Exception as exc:
+                if page.is_closed():
+                    raise ActionError(
+                        "scroll_to_bottom: page was closed mid-scroll", action="scroll"
+                    ) from exc
+                logger.debug("scroll_to_bottom scroll step failed (transient): {e}", e=exc)
+            scrolls_used += 1
+            if settle_ms:
+                await asyncio.sleep(settle_ms / 1000)
+            try:
+                new_height = await _scroll_height()
+            except Exception as exc:
+                if page.is_closed():
+                    raise ActionError(
+                        "scroll_to_bottom: page was closed mid-scroll", action="scroll"
+                    ) from exc
+                logger.debug("scroll_to_bottom height read failed (transient): {e}", e=exc)
+                continue
+            if new_height <= last_height:
+                stable += 1
+                if stable >= stable_rounds:
+                    reached_bottom = True
+                    last_height = new_height
+                    break
+            else:
+                stable = 0
+            last_height = new_height
+
+        logger.debug(
+            "scroll_to_bottom: {n} scrolls, reached_bottom={b}, height={h}",
+            n=scrolls_used,
+            b=reached_bottom,
+            h=last_height,
+        )
+        return ActionResult(
+            action=ActionType.SCROLL,
+            status=ActionStatus.SUCCESS,
+            data={
+                "scrolls_used": scrolls_used,
+                "reached_bottom": reached_bottom,
+                "final_height": last_height,
+            },
+        )
+
     async def print_page_as_pdf(
         self,
         url: Optional[str] = None,
