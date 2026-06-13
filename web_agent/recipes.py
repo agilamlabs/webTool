@@ -65,6 +65,11 @@ if TYPE_CHECKING:
 # Callable that builds the terminal CollectionResult from a stopped_reason.
 _FinishT = Callable[[str], CollectionResult]
 
+# Ordering for the advisory injection-risk rollup on CollectionResult
+# (none < low < medium < high). Used to compute ``max_injection_risk``
+# across collected pages.
+_INJECTION_RISK_ORDER: dict[str, int] = {"none": 0, "low": 1, "medium": 2, "high": 3}
+
 
 def _selector_desc(sel: object) -> str:
     """v1.7.0: short human-readable description of a SelectorLike.
@@ -1262,27 +1267,41 @@ class Recipes:
         Bounded by ``max_pages`` (clamped to
         ``automation.pagination_max_pages``) and the per-call budget
         (``SafetyConfig.max_pages_per_call`` / ``max_chars_per_call`` /
-        ``max_time_per_call_seconds``). Every visited page is fetched +
-        extracted through the injected ``WebFetcher.fetch`` +
-        ``ContentExtractor`` -- so v1.7.0 challenge detection,
-        injection-sanitize, robots obedience, per-host rate limiting, and
-        SSRF re-gating all apply automatically. Pages are DEDUPLICATED by
-        URL and by content hash, so a "next" control that loops never
-        double-counts.
+        ``max_time_per_call_seconds``). Pages are DEDUPLICATED by URL and
+        by content hash, so a "next" control that loops never double-counts.
+
+        SAFETY GATES DIFFER BY STRATEGY. The ``"next_link"`` and
+        ``"page_param"`` strategies fetch every page through the injected
+        ``WebFetcher.fetch``, so v1.7.0 challenge detection,
+        injection-sanitize, **robots obedience, per-host rate limiting**, and
+        SSRF re-gating all apply to every navigation. The ``"scroll"``
+        strategy does NOT: it drives a raw ``page.goto`` on the session tab
+        (the scroll assembly needs a live tab, not a fetch), so it applies
+        only an SSRF re-gate (post-navigation ``check_domain_allowed`` +
+        deny-list) and the injection sanitize/scan baked into
+        ``ContentExtractor`` -- **robots.txt and rate limiting are NOT
+        consulted** for the scroll navigation. Use ``"scroll"`` only on a URL
+        you are already authorized to crawl interactively.
 
         Strategies:
           - ``"scroll"``: single URL. Uses scroll-to-exhaustion
             (:meth:`BrowserActions.scroll_to_bottom`) on a session tab to
             assemble all lazy/infinite-scroll content, then extracts the
-            page once. Requires ``session_id`` and an injected
+            page once. Raw navigation (SSRF + injection only -- see the
+            safety-gates note above). Requires ``session_id`` and an injected
             ``BrowserActions``.
           - ``"next_link"``: extract a page, find the "next" control (a
             ``rel=next`` link, an ``aria-label*=next`` link, or an ``<a>``
             whose text/aria matches ``next_texts``), navigate to it, repeat.
             Stops on no next control, a revisited URL (cycle guard),
-            ``max_pages``, or budget exhaustion.
+            ``max_pages``, or budget exhaustion. A page emptied by
+            ``injection_action='block'`` is flagged (``CollectedPage.
+            blocked_reason='injection_blocked'``) and the walk CONTINUES --
+            it is not treated as end-of-listing.
           - ``"page_param"``: increment a ``?page=`` / ``?p=`` query param
-            until an empty or duplicate page, ``max_pages``, or budget.
+            until an empty or duplicate page, ``max_pages``, or budget. A page
+            emptied by ``injection_action='block'`` is flagged and skipped
+            WITHOUT halting (only a genuinely empty page terminates).
 
         Args:
             url: The listing URL to start from.
@@ -1322,12 +1341,15 @@ class Recipes:
         )
 
         def _finish(stopped_reason: str) -> CollectionResult:
+            max_risk, n_with_injection = self._injection_rollup(pages)
             return CollectionResult(
                 start_url=url,
                 strategy=strategy,
                 pages=pages,
                 pages_collected=len(pages),
                 total_content_length=sum(p.content_length for p in pages),
+                max_injection_risk=max_risk,
+                pages_with_injection=n_with_injection,
                 stopped_reason=stopped_reason,
                 errors=bag.errors,
                 warnings=bag.warnings,
@@ -1428,6 +1450,44 @@ class Recipes:
 
             extracted = await self._extractor.extract_async(fr)
             content = extracted.content or ""
+
+            # B4: a page emptied by injection_action='block' (HIGH-risk scan)
+            # is NOT end-of-listing -- its content is withheld BY POLICY, not
+            # because the listing ran out. Detect it BEFORE the empty/dup
+            # checks below (which would otherwise read its empty content as a
+            # page_param 'empty_page' terminator or a duplicate). Record a
+            # warning + diagnostic, append the page flagged (carrying the
+            # injection report from B3 so the caller sees WHY it's blank), and
+            # keep walking: page_param advances to the next page; next_link
+            # still follows the page's "next" control.
+            if self._is_injection_blocked(extracted):
+                bag.warn(
+                    "injection_blocked",
+                    (
+                        f"Page content withheld by injection_action='block' "
+                        f"(HIGH-risk prompt-injection scan): {current}; the "
+                        "page was flagged, not treated as end-of-listing"
+                    ),
+                    url=current,
+                )
+                self._append_page(
+                    pages, current, fr, extracted, blocked_reason="injection_blocked"
+                )
+                diagnostics.append(
+                    self._page_diagnostic(
+                        current, fr, extracted, block_reason="injection_blocked"
+                    )
+                )
+                if strategy == "page_param":
+                    current = self._bump_page_param(current)
+                    if current is None:
+                        stopped_reason = "no_next"
+                else:
+                    current = self._find_next_link(fr, list(vocabulary))
+                    if current is None:
+                        stopped_reason = "no_next"
+                continue
+
             chash = self._content_hash(content)
             # Content-level dedup: a different URL that renders identical
             # content (e.g. a "next" that silently clamps at the last page)
@@ -1489,11 +1549,59 @@ class Recipes:
         return _finish(stopped_reason)
 
     @staticmethod
+    def _is_injection_blocked(extracted: ExtractionResult) -> bool:
+        """B4: did ``injection_action='block'`` empty this page's content?
+
+        The content extractor stamps ``failure_stage='injection_blocked'`` and
+        empties ``content`` when a HIGH-risk injection scan fires under
+        ``SafetyConfig.injection_action='block'``. We treat that as the
+        authoritative signal, with a defensive fallback to (HIGH report +
+        empty content) in case the stage marker is ever absent. This is
+        distinct from a genuinely empty page (no report / non-HIGH risk),
+        which must still terminate a ``page_param`` walk.
+        """
+        if extracted.failure_stage == "injection_blocked":
+            return True
+        report = extracted.injection
+        return (
+            report is not None
+            and report.risk == "high"
+            and not (extracted.content or "")
+        )
+
+    @staticmethod
+    def _injection_rollup(pages: list[CollectedPage]) -> tuple[Optional[str], int]:
+        """Roll the per-page injection reports up to a collection-level summary.
+
+        Returns ``(max_injection_risk, pages_with_injection)`` where the max
+        is the highest ``risk`` across pages that carry a report (ordered
+        none < low < medium < high), or ``None`` when no page carried one
+        (detection disabled). ``pages_with_injection`` counts pages scoring
+        above 'none'.
+        """
+        max_rank = -1
+        max_risk: Optional[str] = None
+        n_with_injection = 0
+        for page in pages:
+            report = page.injection
+            if report is None:
+                continue
+            rank = _INJECTION_RISK_ORDER.get(report.risk, 0)
+            if rank > max_rank:
+                max_rank = rank
+                max_risk = report.risk
+            if rank > 0:
+                n_with_injection += 1
+        return max_risk, n_with_injection
+
+    @staticmethod
     def _append_page(
         pages: list[CollectedPage],
         url: str,
         fr: FetchResult,
         extracted: ExtractionResult,
+        *,
+        blocked_reason: Optional[str] = None,
     ) -> None:
         pages.append(
             CollectedPage(
@@ -1503,18 +1611,25 @@ class Recipes:
                 content=extracted.content or "",
                 content_length=extracted.content_length,
                 extraction_method=extracted.extraction_method,
+                injection=extracted.injection,
+                blocked_reason=blocked_reason,
             )
         )
 
     @staticmethod
     def _page_diagnostic(
-        url: str, fr: FetchResult, extracted: ExtractionResult
+        url: str,
+        fr: FetchResult,
+        extracted: ExtractionResult,
+        *,
+        block_reason: Optional[str] = None,
     ) -> FetchDiagnostic:
         return FetchDiagnostic(
             url=url,
             final_url=fr.final_url,
             status=fr.status,
             status_code=fr.status_code,
+            block_reason=block_reason,
             content_length=extracted.content_length,
             response_time_ms=fr.response_time_ms,
             from_cache=fr.from_cache,
@@ -1590,11 +1705,24 @@ class Recipes:
     ) -> CollectionResult:
         """``"scroll"`` strategy: scroll-to-exhaustion then extract once.
 
-        Navigates the session's current tab to ``url``, drives
-        :meth:`BrowserActions.scroll_to_bottom` so the full assembled DOM
-        (all lazy / infinite-scroll content) materializes, then captures and
-        extracts the page once. Requires ``session_id`` (the scroll drives a
-        persistent tab) and an injected ``BrowserActions``.
+        Navigates the session's current tab to ``url`` via a RAW
+        ``page.goto`` (the scroll assembly needs a live tab, not a fetch),
+        drives :meth:`BrowserActions.scroll_to_bottom` so the full assembled
+        DOM (all lazy / infinite-scroll content) materializes, then captures
+        and extracts the page once. Requires ``session_id`` (the scroll drives
+        a persistent tab) and an injected ``BrowserActions``.
+
+        SAFETY GATES: because this is a raw navigation rather than a
+        ``WebFetcher.fetch``, only the SSRF re-gate below (post-navigation
+        ``check_domain_allowed`` + deny-list) and the injection
+        sanitize/scan inside ``ContentExtractor`` apply. **robots.txt
+        obedience and per-host rate limiting are NOT consulted here** --
+        ``Recipes`` has no handle on the ``RobotsChecker`` / ``RateLimiter``
+        (both are encapsulated inside ``WebFetcher``), so the scroll path
+        cannot acquire them without reaching across a module boundary. The
+        ``"next_link"`` / ``"page_param"`` strategies, which DO route through
+        ``fetch``, get the full gate set. This is documented honestly rather
+        than silently implied.
         """
         if session_id is None or self._sessions is None:
             bag.err(

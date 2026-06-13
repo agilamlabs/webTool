@@ -348,6 +348,7 @@ class Agent:
             rate_limiter=self._rate_limiter,
             robots=self._robots,
             network_collector=self._network_collector,
+            metrics=self._metrics,
         )
         self._actions = BrowserActions(
             self._bm,

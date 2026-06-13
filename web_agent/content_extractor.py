@@ -22,7 +22,12 @@ from bs4 import BeautifulSoup
 from loguru import logger
 
 from .config import AppConfig
-from .injection import detect_injection, strip_hidden_dom, strip_invisible_chars
+from .injection import (
+    detect_injection,
+    redact_injection,
+    strip_hidden_dom,
+    strip_invisible_chars,
+)
 from .models import ExtractionResult, FetchResult, FetchStatus, InjectionReport
 
 # v1.6.16 CE-3: URL fragments that mark a captured response as
@@ -594,19 +599,16 @@ class ContentExtractor:
         if action == "flag":
             return result
         if action == "redact":
+            # v1.7.0 (gap-fix): mask real match spans via redact_injection
+            # rather than reconstructing a needle from the truncated /
+            # whitespace-collapsed indicator snippet (which rarely appears
+            # verbatim, making the old loop a silent no-op).
             for field in ("content", "markdown"):
                 text = getattr(result, field)
                 if not text:
                     continue
-                for snippet in report.indicators:
-                    # Redact the indicator's leading phrase. Snippets are
-                    # truncated/whitespace-collapsed, so redact the longest
-                    # contiguous run that still appears verbatim; fall back to
-                    # nothing when no verbatim run is found (collapsed context).
-                    needle = snippet.split("...")[0].strip()
-                    if needle and needle in text:
-                        text = text.replace(needle, "[redacted: possible injection]")
-                setattr(result, field, text)
+                redacted, _ = redact_injection(text)
+                setattr(result, field, redacted)
             if result.content is not None:
                 result.content_length = len(result.content)
             return result

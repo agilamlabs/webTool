@@ -1894,6 +1894,17 @@ class BrowserActions:
             logger.debug("scroll_until_text initial body read failed: {e}", e=exc)
 
         for i in range(max_scrolls):
+            # R1 (concurrency): keep the idle clock warm for the WHOLE scroll.
+            # The entry touch() above only stamps last_used once; a long walk
+            # (up to 1000 rounds, each waiting ~2s) otherwise freezes the idle
+            # clock for the entire duration, so a concurrent create()/list()
+            # whose _reap_idle fires (busy-blind: SessionManager._idle_expired
+            # selects purely on now - last_used > session_idle_ttl_s) can
+            # close() this live tab out from under the active scroll. Re-touch
+            # once per round -- a cheap dict write -- so an actively-scrolling
+            # session is never seen as idle. self._sessions is non-None here
+            # (guarded at entry); touch() no-ops on an unknown id.
+            self._sessions.touch(session_id)
             # BR-8: a closed page can never yield more text -- surface it as a
             # genuine error instead of silently spinning to a misleading
             # "text not found after N scrolls".
@@ -2044,6 +2055,17 @@ class BrowserActions:
         stable = 0
         reached_bottom = False
         for _ in range(max_scrolls):
+            # R1 (concurrency): keep the idle clock warm for the WHOLE scroll.
+            # The entry touch() above only stamps last_used once; a long walk
+            # (up to 1000 rounds, each waiting settle_ms) otherwise freezes the
+            # idle clock for the entire duration, so a concurrent create()/list()
+            # whose _reap_idle fires (busy-blind: SessionManager._idle_expired
+            # selects purely on now - last_used > session_idle_ttl_s) can
+            # close() this live tab out from under the active scroll. Re-touch
+            # once per round -- a cheap dict write -- so an actively-scrolling
+            # session is never seen as idle. self._sessions is non-None here
+            # (guarded at entry); touch() no-ops on an unknown id.
+            self._sessions.touch(session_id)
             if page.is_closed():
                 raise ActionError("scroll_to_bottom: page was closed mid-scroll", action="scroll")
             try:
