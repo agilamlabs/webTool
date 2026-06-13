@@ -213,11 +213,15 @@ class BrowserConfig(BaseSettings):
 
     # --- v1.6.6: Isolation profile launcher -----------------------------
     isolation_mode: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Launch Chromium with a dedicated user-data-dir so cookies / "
             "localStorage / cache / downloads are isolated from the "
-            "user's real Chrome. Required when ``cdp_enabled=True``."
+            "user's real Chrome. Required when ``cdp_enabled=True``. "
+            "v1.7.0: ON by default (each Agent gets its own ephemeral "
+            "profile -- reproducible and isolated). Set ``isolation_mode=False`` "
+            "to launch a plain non-isolated browser; ``cdp_enabled`` then "
+            "auto-disables (it needs the owned user-data-dir)."
         ),
     )
     profile_mode: Literal["ephemeral", "named"] = Field(
@@ -352,12 +356,21 @@ class BrowserConfig(BaseSettings):
         ),
     )
     cdp_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Launch Chromium with ``--remote-debugging-port`` so external "
-            "tools can observe via CDP. Requires ``isolation_mode=True``. "
+            "tools (and webTool's own remote_cdp sibling-attach) can observe "
+            "and drive the browser via CDP. Requires ``isolation_mode=True``. "
             "Never attaches to existing/personal browsers -- webTool only "
-            "exposes CDP on browsers it launched itself."
+            "exposes CDP on browsers it launched itself. "
+            "v1.7.0: ON by default. SECURITY NOTE: this opens a "
+            "remote-debugging port bound to ``cdp_host`` (loopback only, "
+            "enforced). The Chrome DevTools Protocol on that port is NOT "
+            "authenticated, so ANY local process able to reach loopback can "
+            "drive the browser (read cookies, navigate, screenshot). webTool's "
+            "ownership-token only gates its OWN remote_cdp attach, not raw CDP. "
+            "On a shared/multi-tenant host, or when handling sensitive "
+            "authenticated sessions, set ``cdp_enabled=False``."
         ),
     )
     cdp_host: str = Field(
@@ -517,6 +530,28 @@ class BrowserConfig(BaseSettings):
     def _validate_isolation_and_cdp(self) -> BrowserConfig:
         """Enforce safety rules around isolation and CDP."""
         from .exceptions import ConfigError
+
+        # v1.7.0: ``isolation_mode`` and ``cdp_enabled`` default ON. Reconcile
+        # the new defaults with configs that are structurally incompatible with
+        # them, BEFORE the hard checks below -- so the common "turn one knob
+        # off" and the ``remote_cdp`` backend don't trip a validation error on a
+        # value the caller never explicitly chose. A value the caller set
+        # EXPLICITLY is left alone and still errors below if it conflicts.
+        was_set = self.model_fields_set
+        if self.backend == "remote_cdp":
+            # remote_cdp connects to an already-running browser: it owns no
+            # user-data-dir and never launches with a debug port. Silently clear
+            # the on-by-default isolation/cdp (an explicit True still errors).
+            if self.isolation_mode and "isolation_mode" not in was_set:
+                self.isolation_mode = False
+            if self.cdp_enabled and "cdp_enabled" not in was_set:
+                self.cdp_enabled = False
+        if self.cdp_enabled and not self.isolation_mode and "cdp_enabled" not in was_set:
+            # CDP needs isolation's user-data-dir (DevToolsActivePort lives
+            # there). The caller turned isolation off but left cdp at its
+            # on-by-default -- follow isolation and disable cdp too, rather than
+            # erroring on a knob they didn't touch.
+            self.cdp_enabled = False
 
         if self.attach_existing_browser:
             raise ConfigError(

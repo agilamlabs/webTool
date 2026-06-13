@@ -31,10 +31,10 @@ def _make_config(tmp_path: Path, **browser_overrides) -> AppConfig:
 
 @pytest.mark.asyncio
 async def test_isolation_off_no_user_data_dir_in_launch_args(tmp_path: Path) -> None:
-    """v1.6.5 baseline preserved: when isolation_mode is False (default),
-    chromium.launch is called with the four legacy flags and no
-    --user-data-dir."""
-    config = _make_config(tmp_path)
+    """When isolation_mode is False, chromium.launch is called with the four
+    legacy flags and no --user-data-dir. v1.7.0: isolation defaults ON, so
+    this non-isolated path must be opted into explicitly."""
+    config = _make_config(tmp_path, isolation_mode=False)
     assert config.browser.isolation_mode is False  # sanity
 
     bm = BrowserManager(config)

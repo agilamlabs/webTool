@@ -26,11 +26,67 @@ import pytest
 from web_agent.config import (
     AppConfig,
     AutomationConfig,
+    BrowserConfig,
     DownloadConfig,
     FetchConfig,
     SearchConfig,
 )
 from web_agent.exceptions import ConfigError
+from web_agent.ownership import OwnershipToken
+
+
+class TestV170IsolationCdpDefaults:
+    """v1.7.0: isolation_mode + cdp_enabled default ON, with graceful
+    reconciliation so toggling one off (or using remote_cdp) doesn't error on
+    a value the caller never explicitly chose."""
+
+    def test_both_on_by_default(self) -> None:
+        b = BrowserConfig()
+        assert b.isolation_mode is True
+        assert b.cdp_enabled is True
+        assert AppConfig().browser.cdp_enabled is True
+
+    def test_isolation_off_auto_disables_cdp(self) -> None:
+        # Turning isolation off must NOT error on the on-by-default cdp; cdp
+        # follows isolation off (it needs the owned user-data-dir).
+        b = BrowserConfig(isolation_mode=False)
+        assert b.isolation_mode is False
+        assert b.cdp_enabled is False
+
+    def test_explicit_cdp_with_isolation_off_still_errors(self) -> None:
+        # An EXPLICIT cdp_enabled=True with isolation off is a real misconfig.
+        with pytest.raises(ConfigError, match="isolation_mode"):
+            BrowserConfig(isolation_mode=False, cdp_enabled=True)
+
+    def test_cdp_off_keeps_isolation_on(self) -> None:
+        # Turning only cdp off leaves isolation on (no reverse coupling).
+        b = BrowserConfig(cdp_enabled=False)
+        assert b.cdp_enabled is False
+        assert b.isolation_mode is True
+
+    def test_remote_cdp_reconciles_default_isolation_and_cdp(self, tmp_path) -> None:
+        # remote_cdp connects to an existing browser; the on-by-default
+        # isolation/cdp must be auto-cleared rather than erroring.
+        token = OwnershipToken.issue(tmp_path)
+        b = BrowserConfig(
+            backend="remote_cdp",
+            remote_cdp_url="ws://127.0.0.1:9222/devtools/browser/x",
+            remote_cdp_ownership_token=token,
+            remote_cdp_profile_dir=str(tmp_path),
+        )
+        assert b.isolation_mode is False
+        assert b.cdp_enabled is False
+
+    def test_remote_cdp_with_explicit_isolation_still_errors(self, tmp_path) -> None:
+        token = OwnershipToken.issue(tmp_path)
+        with pytest.raises(ConfigError, match="isolation_mode"):
+            BrowserConfig(
+                backend="remote_cdp",
+                isolation_mode=True,
+                remote_cdp_url="ws://127.0.0.1:9222/devtools/browser/x",
+                remote_cdp_ownership_token=token,
+                remote_cdp_profile_dir=str(tmp_path),
+            )
 
 
 class TestFetchRetryBounds:
