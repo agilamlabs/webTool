@@ -10,6 +10,51 @@ Designed as a tool for AI agents that need to search the web, fetch JavaScript-h
 
 Slots in as a **local, no-API web backend** under autonomous agents like [OpenClaw](https://github.com/openclaw/openclaw), [LangGraph](https://github.com/langchain-ai/langgraph), and any MCP-compatible client (Claude Desktop, Claude Code, Cursor, OpenAI Codex). See [Using web_agent as a Backend for Local Agents](#using-web_agent-as-a-backend-for-local-agents).
 
+> **What's new in 1.7.0** — *Real-world hardening — make the toolkit solve
+> the problems autonomous agents actually hit on the live 2026 web.* Driven by
+> a market-research + full-codebase gap analysis, shipped in six waves, all
+> **additive** (no breaking changes to documented Python APIs):
+>
+> * **Honest bot-wall detection** (new `web_agent/challenge.py`) — structural
+>   (not prose-keyword) markers for Cloudflare / DataDome / Akamai / PerimeterX /
+>   reCAPTCHA / hCaptcha. A challenge served on HTTP 200 now returns the new
+>   `FetchStatus.BLOCKED` with an *actionable* `error_message` instead of
+>   SUCCESS-with-garbage; a managed-JS challenge a real browser auto-passes is
+>   settled-and-rechecked first. `ChallengeInfo` on `FetchResult.challenge`.
+> * **Token-blowout + failure transparency** (the #1 agentic-tool complaint) —
+>   a failed fetch now says *why* (`fetch_status` / `status_code` /
+>   `error_message` / `failure_stage` on `ExtractionResult`), and MCP responses
+>   return **one** representation (markdown default) capped at
+>   `extraction.default_max_chars` (40000) with `offset`/`next_offset` paging —
+>   no more content+markdown duplication or ~1 MB dumps.
+> * **Production lifecycle hardening** — fixed a real stealth-2.x launch break;
+>   added Chromium crash-recovery (auto-relaunch), an idle-session reaper + hard
+>   cap, orphaned-profile sweep on start, and a `doctor --quick` that finally
+>   catches a missing Chromium.
+> * **Auth persistence + login handoff** — `export_session_state` /
+>   `import_session_state` round-trip a logged-in `storage_state` to JSON:
+>   *log in once (human does 2FA/CAPTCHA), automate afterwards.* Plus a brand-new
+>   **MCP session surface** (`web_create_session`, `web_list_sessions`,
+>   `web_close_session`, `web_export_session`, `web_import_session`).
+> * **Search resilience + a cheap links-only primitive** — a per-provider
+>   circuit breaker, an "all providers blocked vs zero hits" distinction
+>   (`SearchResponse.search_blocked`), and `Agent.search(...)` /
+>   `web_search_links` that return links **without** N browser fetches.
+> * **Proxy support + fingerprint coherence** — new `ProxyConfig`
+>   (`WEB_AGENT_PROXY__*`, http/https/socks5, off by default) threaded into every
+>   launch + httpx side-path; `coherent_fingerprint` pins the rotated UA's OS
+>   family to the configured locale. Honest scope: operator controls for
+>   compliant access, **not** a stealth-bypass promise.
+>
+> Adds **6 new MCP tools** (server now exposes **45**), **5 new public exports**
+> (`ChallengeInfo`, `StorageStateResult`, `ProxyConfig`, `SearchEngine`,
+> `SearchOutcome` → **118** total), and grows the suite to **1324 passing**
+> (+28 `integration`-marked, opt-in). A 4-dimension adversarial close-out review
+> of the ~7,400-line diff found **no critical/high issues**. **Behaviour
+> changes:** bot-challenge pages return `BLOCKED` (was SUCCESS); MCP content is
+> single-representation + capped; a bare `pytest` run now excludes integration
+> tests (`-m integration` to opt in). See [CHANGELOG.md](CHANGELOG.md#170---2026-06-13).
+>
 > **What's new in 1.6.16** — *Review-hardening — 32 findings from a
 > full-codebase brutal review, adversarially verified.* Closes SSRF holes in
 > the secondary egress paths (`fetch_binary`, `classify_url`, the downloader
@@ -299,7 +344,8 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 ## Features
 
 ### Core web pipeline
-- **Web Search** — Free-first provider chain: SearXNG → DDGS → Playwright fallback. URL-as-query short-circuits to direct fetch.
+- **Web Search** — Free-first provider chain: SearXNG → DDGS → Playwright fallback. URL-as-query short-circuits to direct fetch. Per-provider circuit breaker + a links-only `Agent.search()` primitive (v1.7.0).
+- **Bot-Wall Detection** (v1.7.0) — Structural Cloudflare / DataDome / Akamai / PerimeterX / reCAPTCHA / hCaptcha detection; a challenge on HTTP 200 returns `FetchStatus.BLOCKED` with an actionable message instead of garbage.
 - **Page Fetching** — Renders JavaScript, retries with exponential backoff, detects download URLs. Optional disk cache (TTL-based).
 - **Content Extraction** — Three-tier fallback: trafilatura (F1 ≈ 0.958) → BeautifulSoup4 → raw text. CSV / PDF / XLSX / DOCX extraction via the `[binary]` extra.
 - **File Download** — Three strategies: httpx streaming → Playwright page save → Playwright JS download. Per-strategy size caps enforced.
@@ -564,6 +610,28 @@ See [config.example.yaml](config.example.yaml) for all available options.
 | `diagnostics` | `trace_enabled` | `false` | Write per-session JSONL action log to `trace_dir` |
 | `diagnostics` | `trace_dir` | `"./.webtool-audit/traces"` | Trace JSONL directory (resolved against `base_dir` if relative) |
 
+**Real-world hardening** (v1.7.0):
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `fetch` | `challenge_detection_enabled` | `true` | Detect bot-walls / CAPTCHAs and return `FetchStatus.BLOCKED` instead of garbage |
+| `fetch` | `challenge_settle_ms` | `3500` | Settle delay before re-capturing a managed-JS challenge the browser may auto-pass |
+| `fetch` | `challenge_max_rechecks` | `2` | Max settle-and-recheck attempts before giving up as `BLOCKED` |
+| `extraction` | `default_max_chars` | `40000` | Per-response content cap **at the MCP boundary only** (Python API stays unlimited) |
+| `browser` | `stealth_enabled` | `true` | Apply playwright-stealth per context |
+| `browser` | `auto_relaunch` | `true` | Transparently relaunch Chromium on disconnect/crash |
+| `browser` | `relaunch_max_attempts` | `3` | Bounded relaunch attempts |
+| `browser` | `relaunch_backoff_base_s` | `1.0` | Base backoff (seconds) between relaunch attempts |
+| `browser` | `session_max_count` | `32` | Hard cap on concurrent persistent sessions |
+| `browser` | `session_idle_ttl_s` | `1800` | Idle-session reaper TTL (seconds) |
+| `browser` | `profile_sweep_max_age_h` | `24` | Age (hours) above which orphaned ephemeral profile dirs are swept on start |
+| `browser` | `coherent_fingerprint` | `true` | Pin the rotated UA's OS family to the configured locale; coherent UA on httpx side-paths |
+| `search` | `circuit_cooldown_s` | `60.0` | Per-provider circuit-breaker cooldown after a block/error |
+| `proxy` | `server` | `None` | Proxy URL (`http` / `https` / `socks5`); inactive by default. Env `WEB_AGENT_PROXY__SERVER` |
+| `proxy` | `username` | `None` | Proxy auth username. Env `WEB_AGENT_PROXY__USERNAME` |
+| `proxy` | `password` | `None` | Proxy auth password. Env `WEB_AGENT_PROXY__PASSWORD` |
+| `proxy` | `bypass` | `None` | Comma-separated no-proxy hosts. Env `WEB_AGENT_PROXY__BYPASS` |
+
 **Safety** (additional v1.6.5+ knobs):
 
 | Section | Key | Default | Description |
@@ -643,6 +711,11 @@ class Agent:
     async def doctor(quick=False) -> DoctorReport
     def list_traces() -> list[str]
     async def replay_trace(trace_file) -> ActionSequenceResult
+
+    # --- Real-world hardening ---  (v1.7.0)
+    async def search(query, max_results=None, *, strict=False) -> SearchResponse        # links-only; sets search_blocked
+    async def export_session_state(session_id, filename) -> StorageStateResult          # save logged-in storage_state
+    async def import_session_state(filename, *, name=None) -> StorageStateResult         # rehydrate in a later process
 
     # --- Output ---
     async def save_results(result, output_path=None) -> Path
@@ -896,7 +969,24 @@ async with Agent() as agent:
     await agent.close_session(sid)
 ```
 
-In MCP, the equivalent flow is `create_browser_session` -> `web_interact(...session_id=sid)` -> `web_fetch(...session_id=sid)` -> `close_browser_session`.
+In MCP, the equivalent flow is `web_create_session` -> `web_interact(...session_id=sid)` -> `web_fetch(...session_id=sid)` -> `web_close_session` (all v1.7.0).
+
+### Auth persistence — log in once, automate later (v1.7.0)
+
+When login requires a human (password + 2FA + CAPTCHA), do it once interactively, then export the session's `storage_state` (cookies + origins) to a JSON file and rehydrate it in a later, fully-automated process:
+
+```python
+# Process 1 (human-assisted login):
+sid = await agent.create_session(name="my-app")
+# ... human logs in (headed handoff, or a one-time interactive run) ...
+await agent.export_session_state(sid, "my-app.state.json")   # confined to download_dir
+
+# Process 2 (unattended, days later):
+sid = await agent.import_session_state("my-app.state.json", name="my-app")
+dashboard = await agent.fetch_and_extract("https://app.example.com/dashboard", session_id=sid)
+```
+
+The state file is confined to `download.download_dir` via `safe_join_path` (traversal / absolute / UNC paths rejected) and import refuses files over 8 MB. Cookies rehydrate fully; per-origin `localStorage` is best-effort. The MCP equivalents are `web_export_session` / `web_import_session`.
 
 ## Safety Controls
 
@@ -1209,18 +1299,21 @@ python -m web_agent serve-mcp
 
 The server uses stdio transport -- it's invoked by the MCP client, not run standalone.
 
-### Exposed Tools (37 total)
+### Exposed Tools (45 total)
 
 **Single-shot pipeline tools** — one URL or query, one result:
 
 | Tool | Description |
 |------|-------------|
 | `web_search` | Search the web and extract content from top results |
+| `web_search_links` | Links-only search (no fetch/extract); reports `search_blocked` (v1.7.0) |
 | `web_fetch` | Fetch a single URL and extract main content |
 | `web_download` | Download a file or save a web page |
 | `web_screenshot` | Take a screenshot of a page |
 | `web_interact` | Execute a browser action sequence |
 | `web_fill_form_and_extract` | Fill a form (`FormFilterSpec`) and extract the result page |
+
+Content-returning tools (`web_fetch`, `web_search`, `web_search_best`, `web_research`, `web_fill_form_and_extract`) accept per-call `max_chars` / `offset` / `format` and return **one** representation (markdown default) capped at `extraction.default_max_chars` (v1.7.0).
 
 **High-level recipes** — composite workflows:
 
@@ -1230,13 +1323,15 @@ The server uses stdio transport -- it's invoked by the MCP client, not run stand
 | `web_find_and_download` | Search + download first matching file |
 | `web_research` | Multi-page research with citations |
 
-**Browser session management** (cookies / login continuity):
+**Browser session management** (cookies / login continuity; create/export/import new in v1.7.0):
 
 | Tool | Description |
 |------|-------------|
-| `create_browser_session` | Create a persistent session |
-| `close_browser_session` | Close a session, free its context |
-| `list_browser_sessions` | List all live sessions |
+| `web_create_session` | Create a persistent session (v1.7.0) |
+| `web_list_sessions` | List all live sessions (v1.7.0) |
+| `web_close_session` | Close a session, free its context (v1.7.0) |
+| `web_export_session` | Export a logged-in `storage_state` to JSON (v1.7.0) |
+| `web_import_session` | Rehydrate a session from an exported `storage_state` (v1.7.0) |
 
 **Tab management** (v1.6.6):
 
@@ -1311,7 +1406,7 @@ Add:
 }
 ```
 
-Restart Claude Desktop. The 12 tools should appear in the tool picker.
+Restart Claude Desktop. All 45 tools should appear in the tool picker.
 
 ### Claude Code Setup
 
@@ -1433,7 +1528,7 @@ WEB_AGENT_CACHE__ENABLED = "true"
 WEB_AGENT_CACHE__CACHE_DIR = "/var/cache/openclaw/web_agent"
 ```
 
-OpenClaw will auto-discover all 12 tools (`web_search`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the 4 recipes including `web_fill_form_and_extract`, plus the 3 session-management tools).
+OpenClaw will auto-discover all 45 tools (`web_search` / `web_search_links`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the recipes including `web_fill_form_and_extract`, the 5 session-management tools, plus the tab / coordinate / observe / domain-skill / interaction-library surfaces).
 
 **Path B: As a Python library** (for OpenClaw skills / custom hooks where you need fine control):
 
@@ -1570,11 +1665,11 @@ CI runs `ruff check`, `ruff format --check`, `mypy`, and the unit-test job on Py
 ## Project Structure
 
 ```
-web_agent/                       # 30 modules, ~5,100 LOC, mypy strict-clean
-  __init__.py                    # v1.6.8 -- 87 public exports
+web_agent/                       # 31 modules, mypy strict-clean
+  __init__.py                    # v1.7.0 -- 118 public exports
   py.typed                       # PEP 561 marker
   exceptions.py                  # WebAgentError hierarchy
-  config.py                      # AppConfig + 12 sub-configs (programmatic / env / YAML)
+  config.py                      # AppConfig + 13 sub-configs incl. ProxyConfig (programmatic / env / YAML)
   models.py                      # 40+ Pydantic v2 models (single source of wire shape)
   utils.py                       # async_retry, safe_join_path, is_private_address, BudgetTracker
   correlation.py                 # ContextVar correlation IDs + loguru patcher
@@ -1584,9 +1679,10 @@ web_agent/                       # 30 modules, ~5,100 LOC, mypy strict-clean
   rate_limiter.py                # Per-host async token-bucket gate
   robots.py                      # robots.txt fetcher + TTL cache
   agent.py                       # Public Agent orchestrator (entry point)
-  browser_manager.py             # Chromium lifecycle + stealth + 3 backends (playwright | cdp_owned | remote_cdp)
+  browser_manager.py             # Chromium lifecycle + per-context stealth + crash auto-relaunch + 3 backends (playwright | cdp_owned | remote_cdp)
+  challenge.py                   # Bot-wall / CAPTCHA detection -> ChallengeInfo (v1.7.0)
   browser_actions.py             # 19 action handlers + per-action verify screenshot + trace recording
-  session_manager.py             # Persistent named BrowserContext sessions
+  session_manager.py             # Persistent named BrowserContext sessions + storage_state export/import + idle reaper (v1.7.0)
   tab_manager.py                 # Per-session tab lifecycle + popup auto-register (v1.6.6)
   doctor.py                      # 14 capability probes + DoctorReport (v1.6.6)
   domain_skills.py               # Skill registry + dispatcher (v1.6.7)
@@ -1594,16 +1690,16 @@ web_agent/                       # 30 modules, ~5,100 LOC, mypy strict-clean
   builtin_skills/                # 3 bundled skills: sec.gov / github.com / ec.europa.eu (v1.6.7)
   network_collector.py           # Per-Page request/response/download event collector (v1.6.8)
   trace_recorder.py              # Per-session JSONL action traces for replay (v1.6.8)
-  search_engine.py               # Multi-provider search chain
+  search_engine.py               # Multi-provider search chain + per-provider circuit breaker (v1.7.0)
   search_providers.py            # SearchProvider ABC + SearXNG / DDGS / Playwright impls
   web_fetcher.py                 # Page + binary fetch with retry, safety, debug, sessions, cache
   content_extractor.py           # trafilatura -> BS4 -> raw; PDF / XLSX / DOCX / CSV via [binary]
   downloader.py                  # Three-strategy file/page download with safety + sessions
   recipes.py                     # search_and_open_best, find_and_download, web_research, fill_form_and_extract
-  mcp_server.py                  # FastMCP server -- 37 tools
+  mcp_server.py                  # FastMCP server -- 45 tools
   main.py                        # CLI: search / fetch / download / interact / screenshot / observe / skills / doctor / replay
 docker/searxng/                  # Self-hosted SearXNG quickstart (compose + tuned settings)
-tests/                           # 48 test files; mirrors the package layout
+tests/                           # 56 test files; mirrors the package layout (28 integration-marked, opt-in)
 config.example.yaml              # Reference configuration (annotated)
 sample_data/                     # Test fixtures and example action sequences
 ```
