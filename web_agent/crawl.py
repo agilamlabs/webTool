@@ -369,6 +369,18 @@ class SiteCrawler:
                 for child_url in parsed.urls[:_MAX_CHILD_SITEMAPS]:
                     if len(candidate) >= sitemap_max_urls:
                         break
+                    # Scope-gate the child sitemap URL ITSELF before fetching it:
+                    # a hostile sitemap index must not make us fetch a child
+                    # document on an off-scope host. (The per-fetch SSRF/domain
+                    # gates still apply, but they don't enforce crawl host scope.)
+                    child_host = (urlparse(child_url).hostname or "").lower()
+                    if not _in_scope(
+                        child_host,
+                        scope_host=scope_host,
+                        same_registrable_domain=same_registrable_domain,
+                    ):
+                        logger.debug("Skipping off-scope child sitemap {u}", u=child_url)
+                        continue
                     child_fr = await self._fetcher.fetch(child_url, session_id=session_id)
                     if child_fr.status != FetchStatus.SUCCESS or not child_fr.html:
                         continue
@@ -527,6 +539,11 @@ class SiteCrawler:
 
         # --- BFS main loop, wrapped so one bad page never kills the crawl ---
         stopped_reason = "frontier_empty"
+        # True once we refuse to fetch a frontier item for being over max_depth
+        # (only reachable when sitemap seeds at depth 1 exceed a max_depth of 0;
+        # the link-harvest path never enqueues beyond max_depth). Lets the drain
+        # report 'max_depth' rather than a misleading 'frontier_empty'.
+        depth_capped = False
         try:
             while frontier and len(pages) < max_pages:
                 # Wall-clock budget check (before popping the next page).
@@ -544,6 +561,7 @@ class SiteCrawler:
                 # Past the depth ceiling: never fetch (defensive -- we also
                 # avoid enqueueing beyond max_depth below).
                 if depth > max_depth:
+                    depth_capped = True
                     continue
 
                 try:
@@ -614,9 +632,15 @@ class SiteCrawler:
                 )
 
             else:
-                # Loop exited via the while-condition, not a break: either the
-                # frontier drained or the page cap was hit.
-                stopped_reason = "max_pages" if len(pages) >= max_pages else "frontier_empty"
+                # Loop exited via the while-condition, not a break: the page cap
+                # was hit, or the frontier drained (possibly because the only
+                # remaining items were over the depth ceiling).
+                if len(pages) >= max_pages:
+                    stopped_reason = "max_pages"
+                elif depth_capped:
+                    stopped_reason = "max_depth"
+                else:
+                    stopped_reason = "frontier_empty"
         except Exception as exc:  # catastrophic failure ends the crawl
             errors.append(f"Crawl aborted by unexpected error: {exc}")
             logger.exception("crawl: catastrophic failure: {e}", e=exc)

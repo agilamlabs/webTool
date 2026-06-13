@@ -1202,6 +1202,30 @@ class Recipes:
         store = self._snapshot_store()
         baseline = store.load(label_key)
         new_snap = await self._capture_snapshot(url, label=label_key, session_id=session_id)
+
+        # A FAILED capture must NOT diff against the baseline: ``new_snap`` would
+        # be empty, so diff_snapshots would report changed=True with every
+        # baseline line "removed" -- a false change signal on a transient fetch
+        # failure. Surface the failure instead (changed=False, error in summary)
+        # and leave the baseline untouched.
+        if new_snap.fetch_status is not None:
+            logger.info(
+                "diff_page: capture failed for {u} ({s}); reporting no-change + error",
+                u=url,
+                s=new_snap.fetch_status,
+            )
+            return SnapshotDiff(
+                url=url,
+                changed=False,
+                is_first_snapshot=baseline is None,
+                similarity=1.0,
+                old_hash=baseline.content_hash if baseline is not None else None,
+                new_hash="",
+                old_captured_at=baseline.captured_at if baseline is not None else None,
+                summary=f"capture failed ({new_snap.fetch_status}): {new_snap.error_message}",
+                correlation_id=new_snap.correlation_id,
+            )
+
         diff = diff_snapshots(
             baseline, new_snap, max_lines=self._config.monitoring.diff_max_lines
         )
@@ -1240,6 +1264,12 @@ class Recipes:
         double-fetches. ``max_pages`` / ``max_depth`` are CLAMPED to the
         ``CrawlConfig`` ceilings so a large caller value can never make the crawl
         unbounded; the crawl is also bounded by ``SafetyConfig.max_time_per_call_seconds``.
+
+        Scope is the exact start host by default. ``same_registrable_domain=True``
+        widens it via a last-2-labels heuristic that is APPROXIMATE for multi-part
+        public suffixes (``co.uk`` / ``com.au``) -- for crawling an UNTRUSTED
+        target, set ``SafetyConfig.allowed_domains`` to pin scope precisely
+        instead of relying on the heuristic.
 
         Args:
             start_url: Seed URL; its host (or registrable domain) defines scope.

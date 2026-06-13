@@ -232,6 +232,29 @@ class TestLoginHandoff:
         sm.export_state.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_zero_poll_interval_is_floored(self) -> None:
+        # Review fix #6: a 0/negative poll interval must NOT busy-spin -- the
+        # loop floors it to >= 0.1 so each sleep makes real progress.
+        sm, _page, clock = _sm()
+        slept: list[float] = []
+
+        async def fake_sleep(s: float) -> None:
+            slept.append(s)
+            clock.now += s
+
+        sm._sleep = fake_sleep  # type: ignore[assignment]
+        await sm.login_handoff(
+            login_url="https://login.example/start",
+            storage_state_path="state.json",
+            session_id="sid",
+            success_url_substring="/never",
+            timeout_s=1.0,
+            poll_interval_s=0.0,
+        )
+        # Every sleep was the floored value, never 0 (which would spin forever).
+        assert slept and all(s >= 0.1 for s in slept)
+
+    @pytest.mark.asyncio
     async def test_goto_failure_is_non_fatal(self) -> None:
         sm, page, clock = _sm()
         page.goto = AsyncMock(side_effect=RuntimeError("nav blew up"))

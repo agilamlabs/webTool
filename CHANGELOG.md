@@ -451,7 +451,7 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
 - New optional dependency: `pdfplumber` in the `[binary]` extra (Wave 3C).
 
 **Tests**
-- Suite went from ~1133 to **1736 passing** (28 `integration` deselected,
+- Suite went from ~1133 to **1740 passing** (28 `integration` deselected,
   opt-in). Earlier-wave files: `test_challenge_detection`,
   `test_failure_transparency`, `test_token_efficiency`, `test_lifecycle`,
   `test_auth_persistence`, `test_search_resilience`, `test_proxy_fingerprint`,
@@ -468,8 +468,10 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   attempt loop with authoritative re-detection, exception / timeout / recapture
   isolation, early concede, sync-hook event-loop-block warning, Agent wiring,
   config bounds). Wave 8 adds `test_monitoring` (36), `test_crawl` (34),
-  `test_sitemap` (17), `test_login_handoff` (11), and `test_v8_wiring` (11 —
-  the snapshot/diff/crawl recipe glue + Agent delegations).
+  `test_sitemap` (17), `test_login_handoff` (12), and `test_v8_wiring` (13 —
+  the snapshot/diff/crawl recipe glue + Agent delegations + the review-fix
+  regressions: off-scope child-sitemap skip, `max_depth` stop reason,
+  diff-on-failed-capture, poll-interval floor).
 
 ## [1.6.16] - 2026-06-02
 

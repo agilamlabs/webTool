@@ -17,6 +17,7 @@ import pytest
 import web_agent.recipes as recipes_mod
 from web_agent.agent import Agent
 from web_agent.config import AppConfig
+from web_agent.crawl import SiteCrawler
 from web_agent.models import (
     CrawlResult,
     ExtractionResult,
@@ -134,6 +135,32 @@ class TestDiffPageRecipe:
         assert "beta" in third.removed_lines
 
     @pytest.mark.asyncio
+    async def test_failed_capture_reports_no_false_change(self, tmp_path) -> None:
+        # Review fix #3: a transient fetch failure must NOT report changed=True
+        # (which would fire a false "page changed" alert), nor clobber the baseline.
+        cfg = AppConfig(base_dir=str(tmp_path))
+        blocked = FetchResult(
+            url="https://example.com/p",
+            final_url="https://example.com/p",
+            status=FetchStatus.BLOCKED,
+            error_message="bot wall",
+        )
+        fetcher = MagicMock()
+        fetcher.fetch_smart = AsyncMock(side_effect=[_fr(), blocked])
+        extractor = MagicMock()
+        extractor.extract_async = AsyncMock(return_value=_ext("alpha\nbeta"))
+        r = Recipes(MagicMock(), fetcher, extractor, MagicMock(), cfg)
+
+        await r.snapshot_page("https://example.com/p", label="m")  # good baseline
+        d = await r.diff_page("https://example.com/p", label="m")
+        assert d.changed is False
+        assert d.removed_lines == []
+        assert "capture failed" in d.summary
+        # baseline preserved (not overwritten by the empty failed snapshot)
+        kept = r._snapshot_store().load("m")
+        assert kept is not None and kept.content == "alpha\nbeta"
+
+    @pytest.mark.asyncio
     async def test_update_false_keeps_fixed_baseline(self, tmp_path) -> None:
         r = _recipes(
             tmp_path,
@@ -197,6 +224,99 @@ class TestCrawlSiteRecipe:
         assert captured["max_pages"] == 5
         assert captured["max_depth"] == 1
         assert captured["same_registrable_domain"] is True
+
+
+# ----------------------------------------------------------------------
+# SiteCrawler review fixes (#1 off-scope child sitemap, #4 max_depth reason)
+# ----------------------------------------------------------------------
+
+
+class _DictFetcher:
+    """Fake WebFetcher: returns canned FetchResults keyed by URL, records fetches."""
+
+    def __init__(self, pages: dict) -> None:
+        self._pages = pages
+        self.fetched: list[str] = []
+
+    async def fetch(self, url, session_id=None):
+        self.fetched.append(url)
+        return self._pages.get(url) or FetchResult(
+            url=url, final_url=url, status=FetchStatus.NETWORK_ERROR
+        )
+
+
+class _PassExtractor:
+    async def extract_async(self, fr):
+        return ExtractionResult(url=fr.url, markdown=fr.html or "", extraction_method="raw")
+
+
+def _ok(url: str, html: str = "<html></html>") -> FetchResult:
+    return FetchResult(url=url, final_url=url, status=FetchStatus.SUCCESS, html=html)
+
+
+class TestCrawlReviewFixes:
+    @pytest.mark.asyncio
+    async def test_offscope_child_sitemap_not_fetched(self, tmp_path) -> None:
+        # Review fix #1: a sitemap INDEX pointing at an off-scope child sitemap
+        # host must NOT cause the crawler to fetch that off-scope document.
+        index = (
+            "<sitemapindex>"
+            "<sitemap><loc>https://evil.com/sitemap.xml</loc></sitemap>"
+            "<sitemap><loc>https://example.com/sitemap2.xml</loc></sitemap>"
+            "</sitemapindex>"
+        )
+        child = "<urlset><url><loc>https://example.com/page1</loc></url></urlset>"
+        pages = {
+            "https://example.com": _ok("https://example.com"),
+            "https://example.com/sitemap.xml": _ok("https://example.com/sitemap.xml", index),
+            "https://example.com/sitemap2.xml": _ok("https://example.com/sitemap2.xml", child),
+            "https://evil.com/sitemap.xml": _ok(
+                "https://evil.com/sitemap.xml",
+                "<urlset><url><loc>https://evil.com/x</loc></url></urlset>",
+            ),
+            "https://example.com/page1": _ok("https://example.com/page1"),
+        }
+        fetcher = _DictFetcher(pages)
+        crawler = SiteCrawler(fetcher, _PassExtractor(), AppConfig(base_dir=str(tmp_path)))
+        result = await crawler.crawl(
+            "https://example.com",
+            max_pages=10,
+            max_depth=2,
+            same_registrable_domain=False,
+            use_sitemap=True,
+            sitemap_max_urls=100,
+            per_page_link_cap=50,
+        )
+        assert "https://evil.com/sitemap.xml" not in fetcher.fetched  # off-scope, skipped
+        assert result.sitemap_used is True
+        # The in-scope child WAS fetched + its page crawled.
+        assert "https://example.com/sitemap2.xml" in fetcher.fetched
+        assert any(p.url == "https://example.com/page1" for p in result.pages)
+
+    @pytest.mark.asyncio
+    async def test_max_depth_stop_reason(self, tmp_path) -> None:
+        # Review fix #4: max_depth=0 + a sitemap seed at depth 1 drains the
+        # frontier via the over-depth skip -> stopped_reason 'max_depth'.
+        sitemap = "<urlset><url><loc>https://example.com/deep</loc></url></urlset>"
+        pages = {
+            "https://example.com": _ok("https://example.com"),
+            "https://example.com/sitemap.xml": _ok("https://example.com/sitemap.xml", sitemap),
+            "https://example.com/deep": _ok("https://example.com/deep"),
+        }
+        fetcher = _DictFetcher(pages)
+        crawler = SiteCrawler(fetcher, _PassExtractor(), AppConfig(base_dir=str(tmp_path)))
+        result = await crawler.crawl(
+            "https://example.com",
+            max_pages=10,
+            max_depth=0,
+            same_registrable_domain=False,
+            use_sitemap=True,
+            sitemap_max_urls=100,
+            per_page_link_cap=50,
+        )
+        assert result.stopped_reason == "max_depth"
+        # The depth-1 seed was never fetched (over the depth-0 ceiling).
+        assert "https://example.com/deep" not in fetcher.fetched
 
 
 # ----------------------------------------------------------------------

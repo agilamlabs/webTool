@@ -2155,7 +2155,10 @@ class CrawlConfig(BaseSettings):
         le=5_000,
         description=(
             "Cap on how many in-scope links are harvested from a single page into "
-            "the frontier, so one link-farm page can't explode the frontier."
+            "the frontier, so one link-farm page can't explode the frontier. NOTE: "
+            "the crawl's in-memory frontier + discovered set are worst-case "
+            "O(max_pages * per_page_link_cap), so keep this modest when raising "
+            "max_pages (the defaults 20 * 200 are trivial; 500 * 5000 is not)."
         ),
     )
 

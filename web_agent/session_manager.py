@@ -598,6 +598,9 @@ class SessionManager:
         signal: Optional[str]
         has_condition = bool(success_url_substring or success_selector)
         deadline = started + max(0.0, timeout_s)
+        # Floor the poll interval so a 0/negative value can't busy-spin the event
+        # loop against the real clock until the (possibly 5-minute) deadline.
+        poll = max(0.1, poll_interval_s)
 
         if not has_condition:
             # No auto-detect: give the human the full window, then export.
@@ -618,7 +621,7 @@ class SessionManager:
                             break
                     except Exception:  # pragma: no cover -- page mid-navigation
                         pass
-                await self._sleep(poll_interval_s)
+                await self._sleep(poll)
 
         elapsed = max(0.0, self._clock() - started)
         state = await self.export_state(session_id, storage_state_path)
