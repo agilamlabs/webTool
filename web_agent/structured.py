@@ -137,10 +137,21 @@ def _coerce_value(value: Any, *, max_chars: int) -> Any:
     text = value.strip()
     if _PURE_NUMBER.match(text):
         cleaned = text.replace(",", "")
-        try:
-            return int(cleaned) if "." not in cleaned else float(cleaned)
-        except ValueError:  # pragma: no cover -- regex already guards this
-            pass
+        body = cleaned[1:] if cleaned[:1] in "+-" else cleaned
+        digits = body.replace(".", "")
+        # Conservative coercion: only coerce genuine QUANTITIES, never
+        # IDENTIFIERS whose exact form is meaningful. A leading '+' marks an
+        # (international) phone; a leading-zero integer is a SKU / ZIP / code
+        # ("007", "02134"); a >15-digit run is a phone / UPC / EAN. Decimals
+        # ("0.5", "1,299.00") are real quantities and coerce fine.
+        is_phone_plus = text[:1] == "+"
+        is_leading_zero_int = "." not in body and len(body) > 1 and body[:1] == "0"
+        too_many_digits = len(digits) > 15
+        if not (is_phone_plus or is_leading_zero_int or too_many_digits):
+            try:
+                return int(cleaned) if "." not in cleaned else float(cleaned)
+            except ValueError:  # pragma: no cover -- regex already guards this
+                pass
     return text[:max_chars]
 
 
@@ -360,6 +371,12 @@ def _match_key(
     if field_norm in norm_keys:
         return norm_keys[field_norm]
 
+    # A single-token field must not bind to a long (>2-token) key: a generic
+    # word inside a label sentence ("price" in "Price Match Guarantee", "name"
+    # in a "Display Name Policy") is almost never the field's value. Short keys
+    # and multi-token fields are specific enough to trust.
+    field_multi = len(field_tokens) >= 2
+
     # 2. alias equivalence: expand the field tokens to their alias siblings,
     # then look for a key whose tokens intersect that expanded set on a
     # known alias axis.
@@ -369,6 +386,8 @@ def _match_key(
             field_alias |= group
     for kn, original in norm_keys.items():
         ktoks = _tokens(kn)
+        if not field_multi and len(ktoks) > 2:
+            continue
         # Require the overlap to be on an alias axis OR a shared real token, so
         # a coincidental token (e.g. "the") cannot trigger an alias match.
         if (ktoks & field_alias) and (
@@ -377,17 +396,28 @@ def _match_key(
         ):
             return original
 
-    # 3. substring containment
+    # 3. token-subset: every requested-field token appears as a key token.
+    # For a SINGLE-token field, only accept a SHORT key (<= 2 tokens) so a
+    # generic word buried in a long label ("price" in "Price Match Guarantee")
+    # can't bind, while a wrapper path ("offers.price" -> "offers price",
+    # "author.name" -> "author name") still matches. Camel-case keys
+    # ("priceCurrency" -> one token "pricecurrency"; "authoredOn") are single
+    # tokens, so a single-token field is correctly NOT bound to them.
     for kn, original in norm_keys.items():
-        if field_norm and (field_norm in kn or kn in field_norm):
+        ktoks = _tokens(kn)
+        if field_tokens and field_tokens <= ktoks and (field_multi or len(ktoks) <= 2):
             return original
 
-    # 4. token overlap (include hint words to help sparse names)
+    # 4. token overlap (include hint words to help a sparse field name). Skip
+    # long (>2-token) keys for a single-token field, same anti-label guard.
     search_tokens = field_tokens | hint_tokens
     best: Optional[str] = None
     best_overlap = 0
     for kn, original in norm_keys.items():
-        overlap = len(_tokens(kn) & search_tokens)
+        ktoks = _tokens(kn)
+        if not field_multi and len(ktoks) > 2:
+            continue
+        overlap = len(ktoks & search_tokens)
         if overlap > best_overlap:
             best_overlap = overlap
             best = original

@@ -633,3 +633,75 @@ def test_structured_result_backward_compat_defaults() -> None:
     assert r.status_code is None
     assert r.error_message is None
     assert r.correlation_id is None
+
+
+# ----------------------------------------------------------------------
+# Review fixes: conservative coercion + token-aware matching
+# ----------------------------------------------------------------------
+
+
+class TestCoercionPreservesIdentifiers:
+    """Numeric coercion must NOT corrupt identifiers (SKU/ZIP/phone)."""
+
+    @pytest.mark.parametrize(
+        "value",
+        ["007", "0099", "02134", "+15551234567", "00000"],
+    )
+    def test_leading_zero_or_plus_kept_as_string(self, value: str) -> None:
+        fields, _src, _u = resolve_fields(
+            {"code": "the code"}, json_ld=[{"code": value}], html="", content=""
+        )
+        assert fields["code"] == value  # exact string, not int-coerced
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [("1,299.00", 1299.0), ("1299", 1299), ("0", 0), ("0.5", 0.5), ("12.5", 12.5)],
+    )
+    def test_genuine_quantities_still_coerced(self, value: str, expected: object) -> None:
+        fields, _src, _u = resolve_fields(
+            {"price": "the price"}, json_ld=[{"price": value}], html="", content=""
+        )
+        assert fields["price"] == expected
+
+
+class TestMatchingRejectsGarbage:
+    """A field must stay unresolved rather than bind to an unrelated key."""
+
+    def test_price_not_bound_to_price_currency(self) -> None:
+        fields, _s, unresolved = resolve_fields(
+            {"price": "the price"}, json_ld=[{"priceCurrency": "USD"}], html="", content=""
+        )
+        assert "price" not in fields
+        assert "price" in unresolved
+
+    def test_author_not_bound_to_authored_on(self) -> None:
+        _fields, _s, unresolved = resolve_fields(
+            {"author": "who wrote it"}, json_ld=[{"authoredOn": "2020"}], html="", content=""
+        )
+        assert "author" in unresolved
+
+    def test_price_not_bound_to_long_dom_label(self) -> None:
+        html = "<dl><dt>Price Match Guarantee</dt><dd>Yes we match</dd></dl>"
+        _fields, _s, unresolved = resolve_fields(
+            {"price": "the price"}, json_ld=[], html=html, content=""
+        )
+        assert "price" in unresolved
+
+    def test_name_not_bound_to_username(self) -> None:
+        html = "<dl><dt>Username</dt><dd>jdoe</dd></dl>"
+        _fields, _s, unresolved = resolve_fields(
+            {"name": "the name"}, json_ld=[], html=html, content=""
+        )
+        assert "name" in unresolved
+
+    def test_real_nested_and_wrapper_paths_still_resolve(self) -> None:
+        # The tightening must NOT break legitimate wrapper-path matches.
+        fields, sources, _u = resolve_fields(
+            {"price": "the price", "author": "who wrote it"},
+            json_ld=[{"offers": {"price": "19.99"}, "author": {"name": "Jane Doe"}}],
+            html="",
+            content="",
+        )
+        assert fields["price"] == 19.99
+        assert fields["author"] == "Jane Doe"
+        assert sources["price"] == "json-ld"
