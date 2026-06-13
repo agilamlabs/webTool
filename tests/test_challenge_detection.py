@@ -125,6 +125,19 @@ TURNSTILE_NORMAL_PAGE_HTML = (
     + "</body></html>"
 )
 
+# SHORT login page embedding reCAPTCHA: a form is not much prose, so the
+# page is "challenge-shaped" by the tiny-text heuristic -- but its title is
+# ordinary and it is served HTTP 200. This is a REAL, common page, NOT a
+# wall. Regression guard for the v1.7.0 false-positive that hard-BLOCKED it.
+SHORT_LOGIN_RECAPTCHA_HTML = (
+    "<!DOCTYPE html><html><head><title>Sign in</title>"
+    '<script src="https://www.google.com/recaptcha/api.js" async defer></script>'
+    "</head><body><h1>Sign in</h1>"
+    '<form><input name="email"><input name="password" type="password">'
+    '<div class="g-recaptcha" data-sitekey="k"></div>'
+    '<button type="submit">Log in</button></form></body></html>'
+)
+
 # Marker-free article used as the post-settle "real content" state.
 CLEAN_ARTICLE_HTML = (
     "<!DOCTYPE html><html><head><title>Industry report</title></head><body>"
@@ -276,6 +289,20 @@ class TestFalsePositiveGuards:
     @pytest.mark.asyncio
     async def test_recaptcha_widget_on_normal_page_is_none(self) -> None:
         assert detect_challenge(RECAPTCHA_NORMAL_PAGE_HTML, 200) is None
+
+    @pytest.mark.asyncio
+    async def test_short_login_with_recaptcha_on_200_is_none(self) -> None:
+        """Regression: a SHORT HTTP-200 login page (little prose, ordinary
+        title) embedding reCAPTCHA must NOT be marked a challenge. "Short"
+        alone is not an interstitial -- forms are short too. Pre-fix this
+        scored 0.75 and hard-BLOCKED the page."""
+        assert detect_challenge(SHORT_LOGIN_RECAPTCHA_HTML, 200) is None
+
+    @pytest.mark.asyncio
+    async def test_short_login_with_recaptcha_no_status_is_none(self) -> None:
+        """Same page seen on a settle-recheck (status_code=None) is still
+        not a challenge."""
+        assert detect_challenge(SHORT_LOGIN_RECAPTCHA_HTML, None) is None
 
     @pytest.mark.asyncio
     async def test_turnstile_widget_on_normal_page_below_threshold(self) -> None:

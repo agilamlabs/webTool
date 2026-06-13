@@ -1,0 +1,147 @@
+diff --git a/web_agent/utils.py b/web_agent/utils.py
+index f6a70b5..f25c206 100644
+--- a/web_agent/utils.py
++++ b/web_agent/utils.py
+@@ -33,32 +33,116 @@ T = TypeVar("T")
+ # ---------------------------------------------------------------------------
+ # User Agent Pool -- real, recent browser strings across OS/browser combos
+ # ---------------------------------------------------------------------------
+-USER_AGENTS: list[str] = [
+-    # Chrome 131 - Windows
+-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+-    # Chrome 131 - macOS
+-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 "
+-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+-    # Chrome 131 - Linux
+-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+-    # Chrome 130 - Windows
+-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+-    # Firefox 132 - Windows
+-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+-    # Safari 18 - macOS
+-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 "
+-    "(KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+-    # Edge 131 - Windows
+-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+-]
+-
+-
+-def get_random_user_agent() -> str:
+-    """Return a random user-agent string from the pool."""
++# v1.7.0 (Wave 2F): the pool is now keyed by OS family so a coherent,
++# single-identity UA can be requested. ``UA_PLATFORM`` is the Chromium
++# ``navigator.platform`` token that matches each family -- used by the
++# fingerprint-coherence path in :mod:`web_agent.browser_manager` to stop
++# the launched context from advertising a UA whose OS contradicts the
++# context platform/locale. Engine note: ``windows`` / ``macos`` / ``linux``
++# entries are all Chromium-engine (AppleWebKit/537.36 + Chrome/Edg) so a
++# coherent identity keeps the Sec-CH-UA platform claims consistent too.
++UA_FAMILIES: dict[str, list[str]] = {
++    "windows": [
++        # Chrome 131 - Windows
++        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
++        # Chrome 130 - Windows
++        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
++        # Edge 131 - Windows
++        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
++    ],
++    "macos": [
++        # Chrome 131 - macOS
++        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 "
++        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
++    ],
++    "linux": [
++        # Chrome 131 - Linux
++        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
++        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
++    ],
++}
++
++# v1.7.0 (Wave 2F): Chromium ``navigator.platform`` token per OS family.
++# Passed to ``new_context(... )`` nowhere directly (Playwright derives
++# navigator.platform from the UA / OS), but exposed so the coherence layer
++# and tests can assert "the platform implied by the chosen UA matches the
++# configured locale's OS family" without re-parsing the UA string.
++UA_PLATFORM: dict[str, str] = {
++    "windows": "Win32",
++    "macos": "MacIntel",
++    "linux": "Linux x86_64",
++}
++
++# Backward-compatible flat pool. Existing callers
++# (``random.choice(USER_AGENTS)`` semantics via ``get_random_user_agent``)
++# keep seeing the same cross-OS spread. Built from the families so the two
++# never drift.
++USER_AGENTS: list[str] = [ua for _family in ("windows", "macos", "linux") for ua in UA_FAMILIES[_family]]
++
++
++def ua_os_family(user_agent: str) -> str | None:
++    """v1.7.0 (Wave 2F): classify a UA string into an OS family.
++
++    Returns ``"windows"`` / ``"macos"`` / ``"linux"`` from structural
++    markers in the UA platform token, or ``None`` when the string matches
++    no known family (caller treats unknown as "no coherence claim"). Pure
++    string inspection -- never raises.
++    """
++    ua = user_agent.lower()
++    if "windows" in ua or "win64" in ua or "win32" in ua:
++        return "windows"
++    if "macintosh" in ua or "mac os x" in ua:
++        return "macos"
++    if "linux" in ua or "x11" in ua:
++        return "linux"
++    return None
++
++
++def locale_os_family(locale: str | None) -> str:
++    """v1.7.0 (Wave 2F): map a locale to a coherent desktop OS family.
++
++    The coherence guarantee webTool provides is *intra-context*: for a
++    given ``BrowserConfig.locale`` the rotated UA must always come from a
++    single, stable OS family so the UA OS never contradicts the context's
++    locale/platform/timezone. A locale string (``"en-US"``, ``"de-DE"``)
++    does not by itself pin an OS, so we pick a deterministic family per
++    locale rather than rotating across OSes:
++
++    * ``windows`` is the default -- it is the dominant desktop OS world-
++      wide and the family with the broadest UA coverage in the pool, so a
++      Windows identity is the least surprising / most blendable choice for
++      an arbitrary locale.
++
++    The point is determinism + consistency, not guessing the operator's
++    real OS. ``None`` / empty falls back to ``windows`` too. Always
++    returns one of the keys in :data:`UA_FAMILIES`.
++    """
++    # Reserved hook for locale-specific overrides if a future need arises
++    # (e.g. pinning a CJK locale to a different family). Today every locale
++    # maps to the stable default; the function exists so the coherence
++    # policy lives in ONE place instead of being inlined in browser_manager.
++    return "windows"
++
++
++def get_random_user_agent(os_family: str | None = None) -> str:
++    """Return a random user-agent string from the pool.
++
++    Args:
++        os_family: When ``None`` (default, backward-compatible), pick from
++            the full cross-OS pool exactly as before. When one of
++            ``"windows"`` / ``"macos"`` / ``"linux"``, pick only from that
++            family so the returned UA is internally consistent with a
++            context pinned to the same OS (v1.7.0 fingerprint coherence).
++            An unrecognised value falls back to the full pool rather than
++            raising, so callers can pass a best-effort hint safely.
++    """
++    if os_family is not None:
++        family = UA_FAMILIES.get(os_family.lower())
++        if family:
++            return random.choice(family)
+     return random.choice(USER_AGENTS)
+ 
+ 

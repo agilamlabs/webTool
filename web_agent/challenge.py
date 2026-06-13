@@ -277,21 +277,43 @@ def _marker_candidate(
 
 def _generic_captcha_candidate(
     lowered: str,
+    title: str,
     denial_status: bool,
     challenge_shaped: bool,
 ) -> Optional[_Candidate]:
     """hCaptcha / reCAPTCHA script present AND the page looks like a gate.
 
-    The script alone is NOT enough -- countless legitimate login and
-    signup pages embed these. It only counts when the response status is
-    a denial (403/429/503) or the page itself is challenge-shaped.
+    The script alone is NOT enough -- countless legitimate login, signup,
+    and contact pages embed these, and many of them are SHORT (a form is
+    not much prose). So on an HTTP-200 response the page must carry an
+    access-denial ``<title>`` ("Just a moment" / "Access denied" / ...) --
+    a soft-200 interstitial. "Short visible text" alone does NOT qualify a
+    200 page: a plain login form (title "Sign in") stays SUCCESS. This
+    fixes the v1.7.0 false-positive that hard-BLOCKED short login/signup
+    pages merely for embedding reCAPTCHA.
+
+    On a denial status (403/429/503) the status itself is the block
+    signal, so a captcha script alone scores high -- a forbidden response
+    serving a CAPTCHA is a wall regardless of page shape.
     """
     matched = [m for m in _GENERIC_CAPTCHA_SCRIPT_MARKERS if m in lowered]
-    if not matched or not (denial_status or challenge_shaped):
+    if not matched:
         return None
-    confidence = 0.9 if denial_status else 0.75
+    denial_title = _matched_denial_title(title)
+    if denial_status:
+        confidence = 0.9
+    elif denial_title is not None:
+        # Soft-200 interstitial: some CDNs serve challenges as HTTP 200
+        # with a "just a moment" / "access denied" title.
+        confidence = 0.75
+    else:
+        # CAPTCHA widget on an ordinary HTTP-200 page (login / signup /
+        # contact) -- not a wall. Leave it as SUCCESS.
+        return None
     evidence = list(matched)
-    if challenge_shaped:
+    if denial_title is not None:
+        evidence.append(f"denial_title:{denial_title}")
+    elif challenge_shaped:
         evidence.append("challenge_shaped_page")
     return _Candidate(
         "generic_captcha", "captcha", confidence, evidence[:_MAX_EVIDENCE], len(matched)
@@ -347,7 +369,7 @@ def detect_challenge(
         )
         if candidate is not None:
             candidates.append(candidate)
-    generic = _generic_captcha_candidate(lowered, denial_status, challenge_shaped)
+    generic = _generic_captcha_candidate(lowered, title, denial_status, challenge_shaped)
     if generic is not None:
         candidates.append(generic)
 

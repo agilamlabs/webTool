@@ -53,6 +53,11 @@ from .utils import safe_join_path
 if TYPE_CHECKING:  # pragma: no cover -- avoid import cycle at runtime
     from .network_collector import NetworkCollector
 
+# v1.7.0: upper bound on a storage_state file accepted by ``import_state``.
+# Real exported states are a few KB to tens of KB; 8 MB is a generous
+# ceiling that still bounds a pathological/hostile file before json.loads.
+_MAX_STORAGE_STATE_BYTES = 8 * 1024 * 1024
+
 
 class SessionManager:
     """Tracks named persistent BrowserContext objects for an Agent.
@@ -558,6 +563,20 @@ class SessionManager:
 
         if not safe_path.is_file():
             raise ValueError(f"storage_state file not found: {safe_path}")
+
+        # Bound the read: a real storage_state is a few KB to tens of KB.
+        # An 8 MB ceiling stops a pathological / hostile file (even one
+        # already inside the sandbox) from being slurped whole into memory
+        # before json.loads.
+        try:
+            state_size = safe_path.stat().st_size
+        except OSError as exc:
+            raise ValueError(f"Could not stat storage_state file {safe_path}: {exc}") from exc
+        if state_size > _MAX_STORAGE_STATE_BYTES:
+            raise ValueError(
+                f"storage_state file {safe_path} is {state_size} bytes, over the "
+                f"{_MAX_STORAGE_STATE_BYTES}-byte limit; refusing to load."
+            )
 
         try:
             raw = safe_path.read_text(encoding="utf-8")

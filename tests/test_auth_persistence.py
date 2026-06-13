@@ -241,6 +241,27 @@ async def test_import_state_missing_file_raises(tmp_path: Path) -> None:
         await mgr.import_state("nope.json")
 
 
+@pytest.mark.asyncio
+async def test_import_state_rejects_oversize_file(tmp_path: Path) -> None:
+    """An oversize storage_state file (even one inside the sandbox) is refused
+    before being read into memory -- bounds a pathological/hostile import."""
+    from web_agent.session_manager import _MAX_STORAGE_STATE_BYTES
+
+    ctx = _make_ctx()
+    mgr, cfg = _make_manager(tmp_path, ctx)
+
+    root = Path(cfg.download.download_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    big = root / "huge.json"
+    # A valid-JSON-prefixed blob padded just past the cap; the size gate
+    # must fire before any json.loads / add_cookies work happens.
+    big.write_text('{"cookies": []}' + " " * (_MAX_STORAGE_STATE_BYTES + 1), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="over the"):
+        await mgr.import_state("huge.json")
+    ctx.add_cookies.assert_not_awaited()
+
+
 # ----------------------------------------------------------------------
 # PATH TRAVERSAL (security-critical)
 # ----------------------------------------------------------------------
