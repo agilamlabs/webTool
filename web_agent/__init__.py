@@ -45,6 +45,7 @@ __version__ = "1.7.0"
 from .agent import Agent
 from .audit import AuditLogger
 from .cache import Cache, DiskCache
+from .captcha import CaptchaContext, CaptchaResolution, CaptchaResolver, normalize_resolution
 from .config import (
     AppConfig,
     AuditConfig,
@@ -220,6 +221,11 @@ __all__ = [
     "strip_hidden_dom",
     "strip_invisible_chars",
     "wrap_untrusted",
+    # CAPTCHA / bot-challenge resolver hook (v1.7.0 Wave 7)
+    "CaptchaContext",
+    "CaptchaResolution",
+    "CaptchaResolver",
+    "normalize_resolution",
     # Politeness + audit
     "AuditLogger",
     "RateLimiter",

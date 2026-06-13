@@ -23,6 +23,8 @@ Optional features:
 from __future__ import annotations
 
 import asyncio
+import inspect
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
@@ -35,6 +37,12 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from .browser_manager import BrowserManager
 from .cache import Cache
+from .captcha import (
+    CaptchaContext,
+    CaptchaResolution,
+    CaptchaResolver,
+    normalize_resolution,
+)
 from .challenge import CHALLENGE_CONFIDENCE_ACTION_THRESHOLD, detect_challenge
 from .config import AppConfig
 from .correlation import get_correlation_id
@@ -338,6 +346,9 @@ class WebFetcher:
         config: Application configuration.
         sessions: Optional SessionManager for persistent browser sessions.
         debug: Optional DebugCapture for failure artifact capture.
+        captcha_resolver: Optional in-process CAPTCHA / bot-challenge
+            resolver hook (see :mod:`web_agent.captcha`). Invoked on a
+            standing wall before BLOCKED; None disables the hook.
     """
 
     def __init__(
@@ -351,6 +362,7 @@ class WebFetcher:
         cache: Optional[Cache] = None,
         network_collector: Optional[Any] = None,
         metrics: Optional[MetricsRegistry] = None,
+        captcha_resolver: Optional[CaptchaResolver] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
@@ -369,6 +381,19 @@ class WebFetcher:
         # is a single cheap call (no per-site None guard) and existing call
         # sites are unaffected.
         self._metrics = get_metrics(metrics)
+        # v1.7.0 (Wave 7): optional in-process CAPTCHA / bot-challenge
+        # resolver hook. None == no hook (a standing wall returns BLOCKED
+        # exactly as before). Mutable post-construction via the property.
+        self._captcha_resolver = captcha_resolver
+
+    @property
+    def captcha_resolver(self) -> Optional[CaptchaResolver]:
+        """The configured CAPTCHA / bot-challenge resolver hook, or None."""
+        return self._captcha_resolver
+
+    @captcha_resolver.setter
+    def captcha_resolver(self, resolver: Optional[CaptchaResolver]) -> None:
+        self._captcha_resolver = resolver
 
     # ------------------------------------------------------------------
     # v1.6.12: shared 429 signalling helper
@@ -966,6 +991,18 @@ class WebFetcher:
                             still, html, html_capture_source = await self._settle_challenge(
                                 page, url, detected, html, html_capture_source
                             )
+                        resolved_via_hook = False
+                        if still is not None:
+                            # Settle couldn't clear it (or it was never
+                            # auto-settle-likely -- a CAPTCHA / block page):
+                            # give a configured resolver hook a bounded,
+                            # re-verified chance before returning BLOCKED.
+                            still, html, html_capture_source = (
+                                await self._attempt_captcha_resolution(
+                                    page, url, still, html, html_capture_source
+                                )
+                            )
+                            resolved_via_hook = still is None
                         if still is not None:
                             return self._blocked_challenge_result(
                                 url=url,
@@ -974,8 +1011,14 @@ class WebFetcher:
                                 html=html,
                                 info=still,
                             )
-                        # Cleared: the page re-navigated to real content.
-                        challenge_note = detected
+                        # Cleared: the page re-navigated to real content
+                        # (auto-settle and/or the resolver hook). The advisory
+                        # note records whether the hook was what cleared it.
+                        challenge_note = (
+                            self._mark_resolution(detected, succeeded=True)
+                            if resolved_via_hook
+                            else detected
+                        )
                         final_url = self._recheck_url_after_settle(page, url, status_code)
                     else:
                         challenge_note = detected
@@ -1205,12 +1248,22 @@ class WebFetcher:
             if still is None:
                 return info
             info = still
+        # A standing 403/503 wall: give a configured resolver hook a
+        # bounded, re-verified attempt before fast-failing to BLOCKED.
+        standing, html, capture_source = await self._attempt_captcha_resolution(
+            page, url, info, html, capture_source
+        )
+        if standing is None:
+            # Resolved -- return a stamped advisory ChallengeInfo so the
+            # success tail records that a wall was here and the hook cleared
+            # it (the caller proceeds to capture the now-real content).
+            return self._mark_resolution(info, succeeded=True)
         return self._blocked_challenge_result(
             url=url,
             final_url=page.url or url,
             status_code=status_code,
             html=html,
-            info=info,
+            info=standing,
         )
 
     def _blocked_challenge_result(
@@ -1258,6 +1311,176 @@ class WebFetcher:
             challenge=info,
             error_message=guidance,
         )
+
+    # ------------------------------------------------------------------
+    # v1.7.0 (Wave 7): pluggable CAPTCHA / bot-challenge resolver hook
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mark_resolution(info: ChallengeInfo, *, succeeded: bool) -> ChallengeInfo:
+        """Stamp the resolver-outcome flags onto a ChallengeInfo copy."""
+        return info.model_copy(
+            update={"resolution_attempted": True, "resolution_succeeded": succeeded}
+        )
+
+    async def _invoke_captcha_resolver(
+        self, resolver: CaptchaResolver, ctx: CaptchaContext
+    ) -> CaptchaResolution:
+        """Call the hook (sync or async), bounding an async hook by timeout.
+
+        A synchronous hook is not timed -- it blocks the event loop, so the
+        contract is "keep it fast" (use ``async def`` for anything that
+        waits). An async hook is wrapped in :func:`asyncio.wait_for` with
+        ``FetchConfig.captcha_attempt_timeout_s`` (0 disables the bound).
+        The return value is normalized to a :class:`CaptchaResolution`.
+        Exceptions (incl. timeout) propagate to the caller, which isolates
+        them.
+
+        A sync hook that overruns the budget can't be interrupted (it has
+        already blocked the loop by the time it returns), but we measure it
+        and warn after the fact so the operator knows to switch to ``async``.
+        """
+        timeout = self._config.fetch.captcha_attempt_timeout_s
+        started = time.monotonic()
+        outcome = resolver(ctx)
+        if inspect.isawaitable(outcome):
+            if timeout and timeout > 0:
+                outcome = await asyncio.wait_for(outcome, timeout=timeout)
+            else:
+                outcome = await outcome
+        else:
+            # Sync hook: it already ran to completion on this thread, blocking
+            # the event loop. Can't bound it retroactively -- but if it
+            # overran the budget, surface that so it can be made async.
+            elapsed = time.monotonic() - started
+            if timeout and timeout > 0 and elapsed > timeout:
+                logger.warning(
+                    "Synchronous CAPTCHA resolver blocked the event loop for "
+                    "{e:.1f}s (over the {t:.1f}s budget). Make the hook "
+                    "'async def' so it is bounded by captcha_attempt_timeout_s "
+                    "and does not stall other concurrent work.",
+                    e=elapsed,
+                    t=timeout,
+                )
+        return normalize_resolution(outcome)
+
+    async def _attempt_captcha_resolution(
+        self,
+        page: Page,
+        url: str,
+        info: ChallengeInfo,
+        html: str,
+        capture_source: HtmlCaptureSource,
+    ) -> tuple[Optional[ChallengeInfo], str, HtmlCaptureSource]:
+        """Give a configured resolver hook a bounded chance at a standing wall.
+
+        Loops up to :attr:`FetchConfig.captcha_max_attempts`: invoke the
+        hook, then -- crucially -- RE-RUN :func:`detect_challenge` against
+        the freshly captured page. The hook's own ``resolved`` flag is
+        advisory; only a clean (or sub-threshold) re-detection clears the
+        wall. A hook that returns ``resolved=False`` concedes the wall and
+        the loop stops early. Hook exceptions / timeouts / a failed
+        re-capture are isolated -- they end the loop and leave the wall
+        standing, never crashing the fetch.
+
+        Returns:
+            ``(None, html, source)`` when re-detection confirms the wall
+            cleared (``html`` is the post-resolution capture), or
+            ``(stamped_info, html, source)`` -- ``stamped_info`` carries
+            ``resolution_attempted=True, resolution_succeeded=False`` -- when
+            the wall still stands. A no-op (no resolver / disabled / zero
+            budget) returns ``(info, html, source)`` unchanged and untouched.
+        """
+        cfg = self._config.fetch
+        resolver = self._captcha_resolver
+        if resolver is None or not cfg.captcha_resolution_enabled or cfg.captcha_max_attempts <= 0:
+            return info, html, capture_source
+
+        current = info
+        for attempt in range(1, cfg.captcha_max_attempts + 1):
+            ctx = CaptchaContext(
+                page=page,
+                challenge=current,
+                url=url,
+                final_url=page.url,
+                attempt=attempt,
+                max_attempts=cfg.captcha_max_attempts,
+                correlation_id=get_correlation_id(),
+            )
+            self._metrics.incr("captcha_resolution_attempt", vendor=current.vendor)
+            try:
+                resolution = await self._invoke_captcha_resolver(resolver, ctx)
+            except (asyncio.TimeoutError, TimeoutError):
+                # asyncio.wait_for raises asyncio.TimeoutError; on Python 3.10
+                # that is a DISTINCT class from the builtin TimeoutError, so we
+                # catch both -- this also classifies a resolver that self-raises
+                # a builtin TimeoutError as a timeout, not a generic error.
+                logger.warning(
+                    "CAPTCHA resolver timed out (>{s}s) for {url} on attempt {n}/{m}",
+                    s=cfg.captcha_attempt_timeout_s,
+                    url=url,
+                    n=attempt,
+                    m=cfg.captcha_max_attempts,
+                )
+                self._metrics.incr("captcha_resolution_outcome", result="timeout")
+                break
+            except Exception as exc:
+                logger.warning(
+                    "CAPTCHA resolver raised for {url} on attempt {n}/{m}: {e}",
+                    url=url,
+                    n=attempt,
+                    m=cfg.captcha_max_attempts,
+                    e=exc,
+                )
+                self._metrics.incr("captcha_resolution_outcome", result="error")
+                break
+
+            # Authoritative re-detection: the resolver's verdict is advisory.
+            # Re-read the live page and re-run structural detection; only a
+            # clean / sub-threshold result clears the wall.
+            try:
+                html, capture_source = await safe_page_content(page)
+            except Exception as exc:
+                logger.debug(
+                    "Could not re-capture page after CAPTCHA resolver for {url}: {e}",
+                    url=url,
+                    e=exc,
+                )
+                self._metrics.incr("captcha_resolution_outcome", result="error")
+                break
+            redetected = detect_challenge(html, None, None, page.url)
+            if redetected is None or redetected.confidence < CHALLENGE_CONFIDENCE_ACTION_THRESHOLD:
+                suffix = "" if resolution.detail is None else f" ({resolution.detail})"
+                logger.info(
+                    "CAPTCHA resolver cleared {vendor}/{kind} wall for {url} "
+                    "after {n} attempt(s){suffix}",
+                    vendor=current.vendor,
+                    kind=current.kind,
+                    url=url,
+                    n=attempt,
+                    suffix=suffix,
+                )
+                self._metrics.incr("captcha_resolution_outcome", result="resolved")
+                return None, html, capture_source
+            current = redetected
+            if not resolution.resolved:
+                # The resolver conceded this wall -- stop rather than burn the
+                # remaining attempt budget on something it has given up on.
+                logger.debug(
+                    "CAPTCHA resolver conceded {vendor}/{kind} for {url} on attempt {n}",
+                    vendor=current.vendor,
+                    kind=current.kind,
+                    url=url,
+                    n=attempt,
+                )
+                self._metrics.incr("captcha_resolution_outcome", result="failed")
+                break
+        else:
+            # Loop exhausted: every attempt ran, the hook kept claiming
+            # progress, but re-detection never cleared the wall.
+            self._metrics.incr("captcha_resolution_outcome", result="failed")
+
+        return self._mark_resolution(current, succeeded=False), html, capture_source
 
     async def fetch_many(
         self,

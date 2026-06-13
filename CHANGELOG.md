@@ -349,6 +349,37 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   resolver can't reach with its own model. `ExtractionConfig` gains
   `schema_max_fields` / `schema_max_value_chars` / `schema_max_dom_pairs`.
 
+**Pluggable CAPTCHA / bot-challenge resolver hook** (new `web_agent/captcha.py`)
+- web_agent DETECTS bot walls (Cloudflare / DataDome / Akamai / PerimeterX /
+  CAPTCHA) and, by default, surfaces an unbeaten one honestly as BLOCKED. It
+  ships NO solver of its own. This adds a clean extension point so an operator
+  can plug in their OWN strategy — a human-in-the-loop handoff, a headed-browser
+  handoff, a paid solver API, an audio-CAPTCHA transcriber — via
+  `Agent(captcha_resolver=hook)` (or `agent.captcha_resolver = hook`).
+- The hook is invoked on a standing wall at BOTH BLOCKED return sites (HTTP-200
+  interstitial + 403/503 sniff), so every recipe (search / research / collection
+  / download) gets resolution for free — it lives at the single `WebFetcher.fetch`
+  choke point.
+- **Honesty by construction:** the hook's own `resolved` verdict is ADVISORY.
+  After it runs, the fetcher RE-RUNS `detect_challenge` against the freshly
+  captured live page and only clears the wall when detection itself comes back
+  clean. A hook that claims success while the interstitial still stands does NOT
+  turn BLOCKED into SUCCESS. Bounded by `captcha_max_attempts`; an async hook is
+  bounded by `captcha_attempt_timeout_s`; a hook that raises / times out / leaves
+  the page uncapturable is isolated (the wall stands, the fetch never crashes).
+- New `web_agent/captcha.py`: `CaptchaContext` (the live page + the detected
+  `ChallengeInfo` + attempt counters), `CaptchaResolution` (`resolved` / `detail`
+  / `method`), the `CaptchaResolver` type alias, and `normalize_resolution`
+  (lenient `bool | None | CaptchaResolution | duck-typed` coercion so a hook can
+  just `return True`). `ChallengeInfo` gains `resolution_attempted` /
+  `resolution_succeeded` (additive, default False) — they ride along on a SUCCESS
+  result that records a hook-cleared wall. `FetchConfig` gains
+  `captcha_resolution_enabled` / `captcha_max_attempts` / `captcha_attempt_timeout_s`
+  (a pure no-op when no resolver is configured). New metrics:
+  `captcha_resolution_attempt{vendor}` / `captcha_resolution_outcome{result}`.
+- Like `llm_extractor`, the hook is a Python callable and is NEVER accepted over
+  the MCP wire — it is configured in-process by whoever constructs the Agent.
+
 **New public surface (all additive)**
 - Waves 0–2F added 5 names — `ChallengeInfo`, `StorageStateResult`, `ProxyConfig`,
   `SearchEngine`, `SearchOutcome`. Wave 3 adds 7 more — `InjectionReport`,
@@ -357,8 +388,9 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   `wrap_untrusted`). Wave 4 adds 4 more — `MetricsRegistry`, `MetricsSnapshot`,
   `MetricsConfig`, `InteractiveElement`. The gap-analysis pass adds 1 more —
   `redact_injection` (a fifth injection helper); schema extraction adds
-  `StructuredExtractionResult` — bringing the package root from 118 to
-  **131 exports**.
+  `StructuredExtractionResult`; the CAPTCHA resolver hook adds 4 more —
+  `CaptchaContext`, `CaptchaResolution`, `CaptchaResolver`, `normalize_resolution`
+  — bringing the package root from 118 to **135 exports**.
 - Waves 0–2F added 6 MCP tools (`web_search_links` + the five session tools);
   Wave 3 adds 2 more (`web_scroll_to_bottom`, `web_collect_pages`); Wave 4 adds
   `web_metrics`. The gap-analysis pass then **removed 3 duplicate** session tools
@@ -366,12 +398,12 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   schema extraction adds `web_extract_fields`; the MCP server tool count nets to
   **45**.
 - New sub-config: `MetricsConfig` (Wave 4A) — `config.py` now has **15**
-  `BaseSettings` sub-configs (was 14). New modules `web_agent/metrics.py` and
-  `web_agent/structured.py`.
+  `BaseSettings` sub-configs (was 14). New modules `web_agent/metrics.py`,
+  `web_agent/structured.py`, and `web_agent/captcha.py`.
 - New optional dependency: `pdfplumber` in the `[binary]` extra (Wave 3C).
 
 **Tests**
-- Suite went from ~1133 to **1548 passing** (28 `integration` deselected,
+- Suite went from ~1133 to **1627 passing** (28 `integration` deselected,
   opt-in). Earlier-wave files: `test_challenge_detection`,
   `test_failure_transparency`, `test_token_efficiency`, `test_lifecycle`,
   `test_auth_persistence`, `test_search_resilience`, `test_proxy_fingerprint`,
@@ -382,7 +414,12 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   `test_metrics` / `test_v4_docker` / `test_a11y_targeting`. The gap-analysis pass
   adds `test_v5_download_proxy_metrics` / `test_v5_reaper_touch` plus
   act-by-ref-over-MCP, duplicate-tool-removal, and `redact_injection` coverage in
-  `test_v170_wiring` / `test_injection_containment` / `test_collection`.
+  `test_v170_wiring` / `test_injection_containment` / `test_collection`. Schema
+  extraction adds `test_structured_extraction`; the CAPTCHA resolver hook adds
+  `test_captcha_resolver` (33 tests — normalize coercion, the bounded
+  attempt loop with authoritative re-detection, exception / timeout / recapture
+  isolation, early concede, sync-hook event-loop-block warning, Agent wiring,
+  config bounds).
 
 ## [1.6.16] - 2026-06-02
 

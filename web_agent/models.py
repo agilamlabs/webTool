@@ -246,6 +246,26 @@ class ChallengeInfo(BaseModel):
             "challenges). False for CAPTCHAs, block pages, and rate limits."
         ),
     )
+    resolution_attempted: bool = Field(
+        default=False,
+        description=(
+            "v1.7.0: True when a configured CAPTCHA resolver hook "
+            "(Agent(captcha_resolver=...)) was invoked against this wall. "
+            "False when no resolver was configured or the wall auto-settled "
+            "before the hook was reached."
+        ),
+    )
+    resolution_succeeded: bool = Field(
+        default=False,
+        description=(
+            "v1.7.0: True when the resolver hook ran AND fresh structural "
+            "re-detection confirmed the wall cleared (the resolver's own "
+            "verdict is advisory -- re-detection is authoritative). When "
+            "True this ChallengeInfo rides along on a SUCCESS result as the "
+            "record of a cleared wall; when resolution_attempted is True but "
+            "this is False, the hook ran and the wall still stood (BLOCKED)."
+        ),
+    )
 
 
 class FetchResult(BaseModel):

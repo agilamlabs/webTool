@@ -55,6 +55,7 @@ from .audit import AuditLogger
 from .browser_actions import BrowserActions
 from .browser_manager import BrowserManager
 from .cache import Cache, DiskCache
+from .captcha import CaptchaResolver
 from .config import AppConfig
 from .content_extractor import ContentExtractor
 from .correlation import correlation_scope, get_correlation_id
@@ -254,8 +255,18 @@ class Agent:
             (no config file needed).
     """
 
-    def __init__(self, config: AppConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig | None = None,
+        *,
+        captcha_resolver: CaptchaResolver | None = None,
+    ) -> None:
         self._config = config or AppConfig()
+        # v1.7.0 (Wave 7): optional in-process CAPTCHA / bot-challenge
+        # resolver hook (see web_agent.captcha). Threaded into the fetcher so
+        # EVERY fetch path -- search, research, collection, download -- gets
+        # resolution for free. Mutable post-construction via the property.
+        self._captcha_resolver = captcha_resolver
         # v1.7.0 (Wave 4A): the Agent owns its own metrics registry so two
         # Agents in one process don't share counters. When disabled, every
         # increment is a no-op enforced inside the registry.
@@ -339,6 +350,7 @@ class Agent:
             cache=self._cache,
             network_collector=self._network_collector,
             metrics=self._metrics,
+            captcha_resolver=self._captcha_resolver,
         )
         self._extractor = ContentExtractor(self._config)
         self._downloader = Downloader(
@@ -381,6 +393,23 @@ class Agent:
         # are enforced on read/write, not on construction. Audit-logged
         # when both audit.enabled and workspace.audit_helper_usage are True.
         self._workspace = Workspace(self._config, audit=self._audit)
+
+    @property
+    def captcha_resolver(self) -> CaptchaResolver | None:
+        """The configured CAPTCHA / bot-challenge resolver hook, or None.
+
+        Set it post-construction to wire (or swap) a resolver on a live
+        Agent; the change propagates to the fetcher so every subsequent
+        fetch path uses it::
+
+            agent.captcha_resolver = my_human_handoff_hook
+        """
+        return self._captcha_resolver
+
+    @captcha_resolver.setter
+    def captcha_resolver(self, resolver: CaptchaResolver | None) -> None:
+        self._captcha_resolver = resolver
+        self._fetcher.captcha_resolver = resolver
 
     @asynccontextmanager
     async def _call_scope(

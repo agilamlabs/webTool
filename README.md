@@ -16,6 +16,7 @@ It is built as a backend/tool for AI agents that must use the **real** web relia
 - **Fetch + 3-tier extraction** — render with headless Chromium, then `trafilatura → BeautifulSoup → raw` for HTML, emitting clean markdown, JSON-LD `structured_data`, and **schema-guided field extraction**.
 - **Schema-guided fields** — `extract_fields(url, {field: hint})` deterministically maps your fields onto a page's structured signals (JSON-LD / OpenGraph / meta / microdata / labelled DOM); an optional LLM hook fills the rest.
 - **Bot-wall / challenge detection** — structural detection of Cloudflare / DataDome / Akamai / PerimeterX / reCAPTCHA / hCaptcha returns an honest `BLOCKED` with an actionable reason, never SUCCESS-with-garbage.
+- **Pluggable CAPTCHA resolver hook** — wire `Agent(captcha_resolver=...)` to plug in your own strategy (human handoff, headed handoff, a paid solver API) on a detected wall; the hook's verdict is advisory — the fetcher re-detects to confirm before clearing it.
 - **Prompt-injection containment** — hidden-from-humans content (invisible Unicode + `display:none`/off-screen DOM) is stripped before extraction; visible injection is flagged with an advisory risk rating.
 - **Token-efficient responses** — content-returning surfaces emit a single representation (markdown by default) with `offset` / `next_offset` paging instead of duplicated megabyte dumps.
 - **19 browser actions + set-of-marks targeting** — click / type / scroll / upload / drag / iframe / shadow-DOM and more; `observe()` returns numbered interactive elements you can act on by `ref` instead of guessing selectors.
@@ -271,6 +272,29 @@ Security-relevant defaults to know:
 - **Safety stack** — SSRF / private-IP egress blocking, robots.txt obedience, and per-host rate limiting are on by default; downloads, JS evaluation, and form submission are gated by explicit `safety.allow_*` flags (`safety.safe_mode=True` forces them all off).
 
 See [AGENTS.md](AGENTS.md) for the full configuration surface and [SECURITY.md](SECURITY.md) for the threat model and hardening recommendations.
+
+---
+
+## CAPTCHA / challenge resolution
+
+webTool **detects** bot walls and, by default, returns an honest `BLOCKED` — it ships **no solver of its own**. When you have a resolution strategy (a human in the loop, a headed-browser handoff, a paid solver API, an audio-CAPTCHA transcriber), plug it in as a hook and webTool calls it on a detected wall — across **every** fetch path (search, research, collection, download):
+
+```python
+from web_agent import Agent, CaptchaContext, CaptchaResolution
+
+async def resolve(ctx: CaptchaContext) -> CaptchaResolution:
+    # ctx.page is the LIVE Playwright page parked on the wall;
+    # ctx.challenge.vendor / .kind tell you what you're up against.
+    token = await my_solver_api(ctx.challenge.vendor, ctx.url)
+    await ctx.page.evaluate(_INJECT_TOKEN_JS, token)
+    await ctx.page.click("button[type=submit]")
+    return CaptchaResolution(resolved=True, method="my-solver")   # or just: return True
+
+async with Agent(captcha_resolver=resolve) as agent:   # or: agent.captcha_resolver = resolve
+    page = await agent.fetch_and_extract("https://gated.example/report")
+```
+
+**The hook's verdict is advisory — re-detection is authoritative.** After your hook runs, webTool re-reads the live page and re-runs structural detection; the wall is only cleared when detection itself comes back clean. A hook that returns `resolved=True` while the interstitial still stands does **not** turn a `BLOCKED` into a `SUCCESS`. The loop is bounded by `fetch.captcha_max_attempts`, an async hook by `fetch.captcha_attempt_timeout_s`, and a hook that raises / times out / leaves the page uncapturable is isolated — the wall just stands. Like the `llm_extractor` hook, the resolver is **Python-only and never exposed over the MCP wire** (it runs caller code); an MCP operator wires it where they construct the `Agent`.
 
 ---
 

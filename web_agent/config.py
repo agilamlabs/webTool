@@ -864,6 +864,42 @@ class FetchConfig(BaseSettings):
             "challenge_max_rechecks per challenged fetch."
         ),
     )
+    # v1.7.0 (Wave 7): CAPTCHA / bot-challenge resolver hook. These gate the
+    # optional in-process resolver supplied via Agent(captcha_resolver=...).
+    # They are a NO-OP when no resolver is configured -- a wall with no
+    # resolver behind it still returns BLOCKED exactly as before.
+    captcha_resolution_enabled: bool = Field(
+        default=True,
+        description=(
+            "When a CAPTCHA resolver hook is configured "
+            "(Agent(captcha_resolver=...)), invoke it on a standing wall "
+            "before returning BLOCKED. No effect without a resolver. Set "
+            "False to keep a configured resolver dormant without removing it."
+        ),
+    )
+    captcha_max_attempts: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description=(
+            "Maximum resolver-hook attempts against a single standing wall "
+            "before giving up and returning BLOCKED. Each attempt invokes "
+            "the hook then re-runs structural detection to verify. 0 "
+            "disables the hook (immediate BLOCKED, as if unconfigured)."
+        ),
+    )
+    captcha_attempt_timeout_s: float = Field(
+        default=60.0,
+        ge=0.0,
+        le=600.0,
+        description=(
+            "Per-attempt wall-clock timeout (seconds) for an ASYNC resolver "
+            "hook; a hook that exceeds it is abandoned for that attempt and "
+            "the wall stands. 0 disables the timeout (wait indefinitely -- "
+            "use only with a trusted, self-bounding hook). Synchronous hooks "
+            "are not timed (they block the event loop; keep them fast)."
+        ),
+    )
 
     @model_validator(mode="after")
     def _apply_retry_policy(self) -> FetchConfig:
