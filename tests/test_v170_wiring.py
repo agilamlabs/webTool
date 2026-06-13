@@ -35,6 +35,7 @@ from web_agent.models import (
     SearchResponse,
     SessionInfo,
     StorageStateResult,
+    StructuredExtractionResult,
 )
 
 
@@ -319,6 +320,44 @@ class TestMcpCollection:
         agent.scroll_to_bottom.assert_awaited_once()
         assert isinstance(out, dict)
         assert out["status"] == "success"
+
+
+# ----------------------------------------------------------------------
+# Wave 6: schema-guided structured extraction wiring
+# ----------------------------------------------------------------------
+
+
+class TestExtractFieldsWiring:
+    @pytest.mark.asyncio
+    async def test_agent_extract_fields_delegates(self) -> None:
+        agent = _bare_agent()
+        agent._debug = MagicMock()
+        expected = StructuredExtractionResult(url="https://e/x", fields={"price": "9.99"})
+        agent._recipes = MagicMock()
+        agent._recipes.extract_fields = AsyncMock(return_value=expected)
+
+        out = await agent.extract_fields("https://e/x", {"price": "the price"})
+
+        agent._recipes.extract_fields.assert_awaited_once()
+        _args, kwargs = agent._recipes.extract_fields.call_args
+        assert kwargs["strict"] is False
+        assert kwargs["llm_extractor"] is None
+        assert out is expected
+
+    @pytest.mark.asyncio
+    async def test_web_extract_fields_is_deterministic_only(self) -> None:
+        agent = MagicMock()
+        expected = StructuredExtractionResult(
+            url="u", fields={"sku": "X1"}, field_sources={"sku": "json-ld"}
+        )
+        agent.extract_fields = AsyncMock(return_value=expected)
+
+        out = await mcp_server.web_extract_fields(_ctx_for(agent), "u", {"sku": "product id"})
+
+        agent.extract_fields.assert_awaited_once_with("u", {"sku": "product id"}, session_id=None)
+        # No llm_extractor is ever passed over the MCP boundary.
+        assert "llm_extractor" not in agent.extract_fields.call_args.kwargs
+        assert out is expected
 
 
 # ----------------------------------------------------------------------

@@ -1082,6 +1082,43 @@ class ExtractionConfig(BaseSettings):
         ),
     )
 
+    # v1.7.0 Wave 6: schema-guided structured extraction bounds. Gate
+    # ``Recipes.extract_fields`` / ``web_agent.structured.resolve_fields`` so a
+    # hostile or huge page (a giant requested schema, a multi-KB value, a
+    # 100k-row table) can never blow up the StructuredExtractionResult.
+    schema_max_fields: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description=(
+            "v1.7.0 Wave 6: cap on the number of fields ``extract_fields`` "
+            "resolves from a single page. A requested schema larger than this "
+            "still works -- the excess field names are reported as "
+            "``unresolved`` rather than silently dropped."
+        ),
+    )
+    schema_max_value_chars: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            "v1.7.0 Wave 6: cap on the length of each resolved field value. A "
+            "longer page value is truncated to this many characters so a "
+            "single pathological field cannot blow out the result / an LLM "
+            "context window."
+        ),
+    )
+    schema_max_dom_pairs: int = Field(
+        default=2000,
+        ge=1,
+        le=50000,
+        description=(
+            "v1.7.0 Wave 6: cap on the number of labelled-DOM pairs "
+            "(``<dt>/<dd>``, ``<th>/<td>``, ``<label>``+input) and microdata "
+            "``[itemprop]`` elements ``extract_fields`` scans on one page, "
+            "bounding the resolver to O(cap) on a hostile table-heavy page."
+        ),
+    )
+
     # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_EXTRACTION__
     # so bare ``INCLUDE_TABLES`` / ``FAVOR_RECALL`` env vars can't override
     # extraction settings. Nested ``WEB_AGENT_EXTRACTION__<FIELD>`` via

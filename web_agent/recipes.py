@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import re
 import time
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Optional
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from loguru import logger
@@ -29,7 +30,7 @@ from loguru import logger
 from .browser_actions import BrowserActions
 from .browser_manager import BrowserManager
 from .config import AppConfig
-from .content_extractor import ContentExtractor
+from .content_extractor import ContentExtractor, build_fetch_failure_result
 from .correlation import get_correlation_id
 from .downloader import Downloader
 from .models import (
@@ -45,9 +46,11 @@ from .models import (
     FormFilterSpec,
     ResearchResult,
     SearchResultItem,
+    StructuredExtractionResult,
 )
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
+from .structured import resolve_fields
 from .utils import BudgetTracker, check_domain_allowed, safe_page_content
 from .web_fetcher import (
     _EXT_TO_KIND,
@@ -64,6 +67,16 @@ if TYPE_CHECKING:
 
 # Callable that builds the terminal CollectionResult from a stopped_reason.
 _FinishT = Callable[[str], CollectionResult]
+
+# v1.7.0 Wave 6: optional injected LLM-extractor hook for ``extract_fields``.
+# Python-API ONLY (it runs CALLER code, so it is never wired over MCP). Given
+# the UNRESOLVED-schema subset (field_name -> hint) and the cleaned page
+# content, it returns a dict of field_name -> value the deterministic resolver
+# could not reach. May be sync or async (a coroutine is awaited).
+LlmExtractor = Callable[
+    [dict[str, str], str],
+    Union[dict[str, Any], Awaitable[dict[str, Any]]],
+]
 
 # Ordering for the advisory injection-risk rollup on CollectionResult
 # (none < low < medium < high). Used to compute ``max_injection_risk``
@@ -870,6 +883,206 @@ class Recipes:
             correlation_id=get_correlation_id(),
             total_time_ms=elapsed,
         )
+
+    # ------------------------------------------------------------------
+    # Recipe: extract_fields (v1.7.0 Wave 6 -- schema-guided extraction)
+    # ------------------------------------------------------------------
+
+    async def extract_fields(
+        self,
+        url: str,
+        schema: Union[dict[str, str], list[str]],
+        *,
+        session_id: Optional[str] = None,
+        strict: bool = False,
+        llm_extractor: Optional[LlmExtractor] = None,
+    ) -> StructuredExtractionResult:
+        """Fetch ``url`` and map a requested field SCHEMA to typed values.
+
+        Schema-guided structured extraction (the headline capability of
+        Firecrawl / ScrapeGraphAI / AgentQL): give a ``schema`` of field names
+        (a ``list[str]``) or field-name -> hint pairs (a ``dict[str, str]``) and
+        get back a ``fields`` map. Resolution is DETERMINISTIC and LLM-free --
+        each field is matched against the strongest available STRUCTURED page
+        signal (JSON-LD, then OpenGraph, then ``<meta>``, then microdata, then
+        labelled DOM), with the winning source recorded per field in
+        ``field_sources``. This covers the large slice of the real web that
+        ships structured data (e-commerce, articles, orgs, events).
+
+        The fetch goes through the injected :class:`WebFetcher` and
+        :class:`ContentExtractor` (NOT a raw navigation), so SSRF / robots /
+        rate-limit / bot-wall / injection-sanitize all apply, and JSON-LD is
+        reused from ``ExtractionResult.structured_data`` rather than re-parsed.
+
+        Args:
+            url: Page to extract from.
+            schema: Field names (``list[str]``) or field-name -> human-hint
+                pairs (``dict[str, str]``). Hints sharpen fuzzy matching.
+            session_id: Optional persistent browser session for the fetch.
+            strict: When True, raise :class:`NavigationError` on a non-success
+                fetch instead of returning a failure-transparent result (mirrors
+                the other strict recipe paths).
+            llm_extractor: OPTIONAL callable
+                ``(unresolved_schema_subset, cleaned_content) -> dict``
+                (sync or async). When provided AND fields remain unresolved
+                after the deterministic pass, it is called with ONLY the
+                unresolved subset + the cleaned page content to fill the rest;
+                its results merge in tagged ``field_sources[...]='llm'``. This
+                runs CALLER code, so it is **Python-API only** -- never wired
+                over MCP. A raising / misbehaving hook is caught and logged; it
+                never crashes the recipe (the fields simply stay unresolved).
+
+        Returns:
+            StructuredExtractionResult with ``fields`` / ``field_sources`` /
+            ``unresolved``, ``extraction_method='structured-signals'`` when any
+            field resolved (else ``'none'``), and failure-transparency fields
+            (``fetch_status`` / ``status_code`` / ``error_message``) populated
+            on a failed fetch.
+        """
+        logger.info("Recipe: extract_fields url={u}", u=url)
+
+        if not check_domain_allowed(url, self._config.safety):
+            if strict:
+                from .exceptions import NavigationError
+
+                raise NavigationError(
+                    f"domain of {url} is blocked by the SafetyConfig allow/deny rules",
+                    url=url,
+                )
+            return StructuredExtractionResult(
+                url=url,
+                extraction_method="none",
+                fetch_status="blocked",
+                error_message=(
+                    f"domain of {url} is blocked by the SafetyConfig allow/deny "
+                    "rules; do not retry this URL -- choose a source on an "
+                    "allowed domain"
+                ),
+                correlation_id=get_correlation_id(),
+            )
+
+        fr = await self._fetcher.fetch(url, session_id=session_id)
+
+        if fr.status != FetchStatus.SUCCESS or not fr.html:
+            if strict:
+                from .exceptions import NavigationError
+
+                raise NavigationError(
+                    f"Failed to fetch {url}: {fr.error_message}",
+                    url=url,
+                    status_code=fr.status_code,
+                )
+            # Reuse the established failure-transparency helper so the message /
+            # status mapping matches every other extract path.
+            failed = build_fetch_failure_result(fr)
+            return StructuredExtractionResult(
+                url=url,
+                extraction_method="none",
+                fetch_status=failed.fetch_status,
+                status_code=failed.status_code,
+                error_message=failed.error_message,
+                correlation_id=get_correlation_id(),
+            )
+
+        extracted = await self._extractor.extract_async(fr)
+
+        ext_cfg = self._config.extraction
+        fields, field_sources, unresolved = resolve_fields(
+            schema,
+            json_ld=extracted.structured_data,
+            html=fr.html,
+            content=extracted.content,
+            max_fields=ext_cfg.schema_max_fields,
+            max_value_chars=ext_cfg.schema_max_value_chars,
+            max_dom_pairs=ext_cfg.schema_max_dom_pairs,
+        )
+
+        # Optional LLM completion of the still-unresolved subset (Python-API
+        # only). Never let a misbehaving hook crash the recipe.
+        if llm_extractor is not None and unresolved:
+            await self._run_llm_extractor(
+                llm_extractor,
+                schema=schema,
+                unresolved=unresolved,
+                content=extracted.content or "",
+                fields=fields,
+                field_sources=field_sources,
+                max_fields=ext_cfg.schema_max_fields,
+                max_value_chars=ext_cfg.schema_max_value_chars,
+            )
+
+        return StructuredExtractionResult(
+            url=url,
+            fields=fields,
+            field_sources=field_sources,
+            unresolved=unresolved,
+            extraction_method="structured-signals" if fields else "none",
+            correlation_id=get_correlation_id(),
+        )
+
+    @staticmethod
+    def _schema_hints(schema: Union[dict[str, str], list[str]]) -> dict[str, str]:
+        """Normalize a schema to a field-name -> hint dict (hint '' for a list)."""
+        if isinstance(schema, dict):
+            return {k: (v if isinstance(v, str) else "") for k, v in schema.items()}
+        return {name: "" for name in schema if isinstance(name, str)}
+
+    async def _run_llm_extractor(
+        self,
+        llm_extractor: LlmExtractor,
+        *,
+        schema: Union[dict[str, str], list[str]],
+        unresolved: list[str],
+        content: str,
+        fields: dict[str, Any],
+        field_sources: dict[str, str],
+        max_fields: int,
+        max_value_chars: int,
+    ) -> None:
+        """Call the injected hook for the unresolved subset; merge its results.
+
+        Mutates ``fields`` / ``field_sources`` / ``unresolved`` IN PLACE: every
+        field the hook returns with a non-empty value is added tagged
+        ``'llm'`` and removed from ``unresolved``. Guarded end-to-end -- a
+        raising or wrong-typed hook is logged and leaves the fields unresolved.
+        """
+        all_hints = self._schema_hints(schema)
+        subset = {name: all_hints.get(name, "") for name in unresolved}
+        # Typed as Any on purpose: the hook is CALLER code whose declared return
+        # type we cannot trust, so the runtime isinstance guard below stays
+        # meaningful (mypy would otherwise prove it unreachable from the alias).
+        result: Any
+        try:
+            result = llm_extractor(subset, content)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:  # caller code must not crash the recipe
+            logger.warning("extract_fields: llm_extractor raised; skipping ({e})", e=exc)
+            return
+        if not isinstance(result, dict):
+            logger.warning(
+                "extract_fields: llm_extractor returned {t}, expected dict; ignoring",
+                t=type(result).__name__,
+            )
+            return
+
+        unresolved_set = set(unresolved)
+        for name, value in result.items():
+            if name not in unresolved_set:
+                continue  # only fill what we asked for and did not already have
+            if len(fields) >= max_fields:
+                break
+            if value is None:
+                continue
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    continue
+                value = value[:max_value_chars]
+            fields[name] = value
+            field_sources[name] = "llm"
+            unresolved_set.discard(name)
+        unresolved[:] = [name for name in unresolved if name in unresolved_set]
 
     # ------------------------------------------------------------------
     # Recipe 4: fill_form_and_extract (Phase 7 / v1.6.1)
