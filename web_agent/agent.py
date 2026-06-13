@@ -67,6 +67,7 @@ from .models import (
     AgentResult,
     CdpConnectionInfo,
     ClickXYInput,
+    CollectionResult,
     DoctorReport,
     DomainSkill,
     DownloadResult,
@@ -350,6 +351,7 @@ class Agent:
             self._config,
             browser_manager=self._bm,
             sessions=self._sessions,
+            actions=self._actions,
         )
         # v1.6.7: domain-skills registry. Loaded lazily so an Agent
         # configured with both skills disabled does no filesystem walk.
@@ -1031,6 +1033,83 @@ class Agent:
             response = outcome.response
             response.search_blocked = outcome.blocked
             return response
+
+    async def scroll_to_bottom(
+        self,
+        *,
+        session_id: str,
+        tab_id: str | None = None,
+        max_scrolls: int | None = None,
+        settle_ms: int | None = None,
+        stable_rounds: int | None = None,
+    ) -> ActionResult:
+        """Scroll a session tab to exhaustion so lazy / infinite-scroll content loads.
+
+        v1.7.0: repeatedly scrolls to the bottom (waiting ``settle_ms`` for
+        lazy content) until the page stops growing for ``stable_rounds``
+        rounds or ``max_scrolls`` is hit (bounded). Pair with
+        ``observe`` / ``fetch_and_extract`` on the SAME tab to read the
+        full assembled DOM. Returns scrolls_used + reached_bottom.
+        """
+        async with self._call_scope(
+            "scroll_to_bottom",
+            {"session_id": session_id, "tab_id": tab_id, "max_scrolls": max_scrolls},
+        ):
+            return await self._actions.scroll_to_bottom(
+                session_id=session_id,
+                tab_id=tab_id,
+                max_scrolls=max_scrolls,
+                settle_ms=settle_ms,
+                stable_rounds=stable_rounds,
+            )
+
+    async def collect_across_pages(
+        self,
+        url: str,
+        *,
+        strategy: str = "next_link",
+        max_pages: int | None = None,
+        session_id: str | None = None,
+        next_texts: list[str] | None = None,
+        settle_ms: int | None = None,
+        stable_rounds: int | None = None,
+        max_scrolls: int | None = None,
+    ) -> CollectionResult:
+        """Collect a full multi-page listing into one result.
+
+        v1.7.0: walks a paginated / infinite-scroll listing and assembles the
+        extracted content across pages, so below-the-fold and next-page items
+        are not missed. ``strategy``:
+
+        - ``"next_link"`` (default): follow the page's "next" control
+          (rel=next, an aria-label*=next link, or an anchor whose text
+          matches ``next_texts``) until there is none, a cycle, ``max_pages``,
+          or budget exhaustion.
+        - ``"page_param"``: increment a ``?page=`` / ``?p=`` query param until
+          an empty or duplicate page.
+        - ``"scroll"``: a single infinite-scroll URL -- scroll to exhaustion
+          then extract once. Requires ``session_id``.
+
+        Every page is fetched + extracted through the normal pipeline, so
+        robots, rate limiting, bot-wall detection, injection-sanitize, and
+        SSRF gating all apply. Pages are de-duplicated (URL + content) and the
+        walk is bounded by ``max_pages`` and the per-call budget.
+        """
+        async with self._call_scope(
+            "collect_across_pages",
+            {"url": url, "strategy": strategy, "max_pages": max_pages},
+        ):
+            self._debug.reset()
+            return await self._recipes.collect_across_pages(
+                url,
+                strategy=strategy,
+                max_pages=max_pages,
+                session_id=session_id,
+                next_texts=next_texts,
+                settle_ms=settle_ms,
+                stable_rounds=stable_rounds,
+                max_scrolls=max_scrolls,
+            )
 
     # ------------------------------------------------------------------
     # v1.6.6 Tabs (Feature 3)

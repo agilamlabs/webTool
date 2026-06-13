@@ -25,7 +25,14 @@ import pytest
 from web_agent import mcp_server
 from web_agent.agent import Agent
 from web_agent.config import AppConfig
-from web_agent.models import SearchResponse, SessionInfo, StorageStateResult
+from web_agent.models import (
+    ActionResult,
+    ActionStatus,
+    CollectionResult,
+    SearchResponse,
+    SessionInfo,
+    StorageStateResult,
+)
 
 
 def _ctx_for(agent: MagicMock) -> MagicMock:
@@ -214,3 +221,81 @@ class TestMcpSearchLinks:
 
         _args, kwargs = agent.search.call_args
         assert kwargs["max_results"] == 1  # clamped to the floor
+
+
+# ----------------------------------------------------------------------
+# Wave 3B: page-collection wiring (Agent + MCP)
+# ----------------------------------------------------------------------
+
+
+class TestAgentCollection:
+    @pytest.mark.asyncio
+    async def test_collect_across_pages_delegates(self) -> None:
+        agent = _bare_agent()
+        agent._debug = MagicMock()
+        expected = CollectionResult(start_url="https://e/list", strategy="next_link")
+        agent._recipes = MagicMock()
+        agent._recipes.collect_across_pages = AsyncMock(return_value=expected)
+
+        out = await agent.collect_across_pages("https://e/list", strategy="next_link", max_pages=5)
+
+        agent._recipes.collect_across_pages.assert_awaited_once()
+        _args, kwargs = agent._recipes.collect_across_pages.call_args
+        assert kwargs["strategy"] == "next_link"
+        assert kwargs["max_pages"] == 5
+        assert out is expected
+
+    @pytest.mark.asyncio
+    async def test_scroll_to_bottom_delegates(self) -> None:
+        agent = _bare_agent()
+        expected = ActionResult(action="scroll", status=ActionStatus.SUCCESS)
+        agent._actions = MagicMock()
+        agent._actions.scroll_to_bottom = AsyncMock(return_value=expected)
+
+        out = await agent.scroll_to_bottom(session_id="s1", max_scrolls=20)
+
+        agent._actions.scroll_to_bottom.assert_awaited_once()
+        _args, kwargs = agent._actions.scroll_to_bottom.call_args
+        assert kwargs["session_id"] == "s1"
+        assert kwargs["max_scrolls"] == 20
+        assert out is expected
+
+
+class TestMcpCollection:
+    @pytest.mark.asyncio
+    async def test_web_collect_pages_calls_agent(self) -> None:
+        agent = MagicMock()
+        expected = CollectionResult(start_url="https://e/list", strategy="next_link")
+        agent.collect_across_pages = AsyncMock(return_value=expected)
+
+        out = await mcp_server.web_collect_pages(_ctx_for(agent), "https://e/list", max_pages=5)
+
+        agent.collect_across_pages.assert_awaited_once()
+        _args, kwargs = agent.collect_across_pages.call_args
+        assert kwargs["max_pages"] == 5
+        assert out is expected
+
+    @pytest.mark.asyncio
+    async def test_web_collect_pages_clamps_max_pages(self) -> None:
+        agent = MagicMock()
+        agent.collect_across_pages = AsyncMock(
+            return_value=CollectionResult(start_url="u", strategy="next_link")
+        )
+
+        await mcp_server.web_collect_pages(_ctx_for(agent), "u", max_pages=10**6)
+
+        _args, kwargs = agent.collect_across_pages.call_args
+        assert kwargs["max_pages"] == 100  # clamped to the ceiling
+
+    @pytest.mark.asyncio
+    async def test_web_scroll_to_bottom_returns_dict(self) -> None:
+        agent = MagicMock()
+        agent.scroll_to_bottom = AsyncMock(
+            return_value=ActionResult(action="scroll", status=ActionStatus.SUCCESS)
+        )
+
+        out = await mcp_server.web_scroll_to_bottom(_ctx_for(agent), "s1")
+
+        agent.scroll_to_bottom.assert_awaited_once()
+        assert isinstance(out, dict)
+        assert out["status"] == "success"
