@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # 1506 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
+python -m pytest -v          # 1548 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -90,7 +90,7 @@ tests/                 # All tests; mirrors the package layout 1:1
 
 ## Public API surface
 
-Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **129 names** as of v1.7.0):
+Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **130 names** as of v1.7.0):
 
 ```python
 from web_agent import (
@@ -229,7 +229,7 @@ of the ~7,400-line diff, a Wave-3 injection + collection/PDF pass, and
 a Wave-4 observability / Docker / a11y-targeting pass — that found
 **no critical/high issues** and confirmed the SSRF, path-traversal,
 cookie-domain, and session-isolation guarantees survive the refactor.
-Gates: **1506 passed / 28 deselected**, ruff clean, mypy strict clean.
+Gates: **1548 passed / 28 deselected**, ruff clean, mypy strict clean.
 
 **Wave 0 — Hermetic suite + toolchain.** 28 live-network /
 real-browser tests are now quarantined behind the `integration`
@@ -460,15 +460,19 @@ path is injection-proof via `_REF_PATTERN.fullmatch`.
 `CollectedPage`, `CollectionResult`, and the four injection helpers
 (`detect_injection`, `strip_hidden_dom`, `strip_invisible_chars`,
 `wrap_untrusted`). Wave 4 adds 4 more — `MetricsRegistry`,
-`MetricsSnapshot`, `MetricsConfig`, `InteractiveElement` — so the root
-goes 118 → **129**. 9 new MCP tools total (`web_search_links` + 5
-session tools + `web_scroll_to_bottom` + `web_collect_pages` +
-`web_metrics`); MCP server count ~39 → **~48**. New sub-config
+`MetricsSnapshot`, `MetricsConfig`, `InteractiveElement`. The
+gap-analysis pass adds 1 more — `redact_injection` (so the injection
+helpers are now five) — so the root goes 118 → **130**. MCP tools: the
+waves added 9 (`web_search_links` + 5 session tools +
+`web_scroll_to_bottom` + `web_collect_pages` + `web_metrics`), and the
+gap-fix pass then removed 3 duplicate session tools
+(`create_browser_session` / `close_browser_session` /
+`list_browser_sessions`); MCP server count ~39 → **44**. New sub-config
 `MetricsConfig` (Wave 4A) — `config.py` now has **15** `BaseSettings`
 sub-configs (was 14). New module `web_agent/metrics.py`. New optional
 dep: `pdfplumber` in the `[binary]` extra.
 
-**Tests.** ~1133 → **1506 passing** (28 `integration` deselected,
+**Tests.** ~1133 → **1548 passing** (28 `integration` deselected,
 opt-in). Earlier-wave files: `test_challenge_detection`,
 `test_failure_transparency`, `test_token_efficiency`,
 `test_lifecycle`, `test_auth_persistence`, `test_search_resilience`,
@@ -477,7 +481,11 @@ opt-in). Earlier-wave files: `test_challenge_detection`,
 `test_v169_persistent_profile` for the new launch path. Wave 3 adds
 `test_injection_containment` / `test_collection` /
 `test_pdf_extraction` plus additions to `test_v170_wiring`. Wave 4 adds
-`test_metrics` / `test_v4_docker` / `test_a11y_targeting`.
+`test_metrics` / `test_v4_docker` / `test_a11y_targeting`. The
+gap-analysis pass adds `test_v5_download_proxy_metrics` /
+`test_v5_reaper_touch` plus act-by-ref-over-MCP, duplicate-tool-removal,
+and `redact_injection` coverage in `test_v170_wiring` /
+`test_injection_containment` / `test_collection`.
 
 **Behaviour changes (non-breaking but visible).** (1) A bot-challenge
 page that used to return `SUCCESS` now returns `FetchStatus.BLOCKED`.
@@ -492,6 +500,59 @@ extraction; `content_sanitized` flags when it ran) and visible
 injection is flagged advisorily on `ExtractionResult.injection` —
 never blocked unless `safety.injection_action` is raised to
 `'redact'` / `'block'`.
+
+**Defaults flip — isolation + CDP on by default.**
+`BrowserConfig.isolation_mode` and `cdp_enabled` now default **`True`**
+(were `False`). Every `Agent` launches an isolated, ephemeral-profile
+browser with a loopback CDP debug port out of the box. Both stay fully
+toggleable off, and the validator reconciles gracefully: setting
+`isolation_mode=False` auto-disables `cdp_enabled`;
+`backend="remote_cdp"` auto-clears both; an **explicit** conflicting
+`True` still errors. Security note (also in SECURITY.md / README): the
+loopback CDP port is **unauthenticated** — any local process able to
+reach loopback can drive the browser (read cookies, navigate,
+screenshot), and webTool's ownership token gates only its own
+`remote_cdp` attach, not the raw CDP endpoint. Set `cdp_enabled=False`
+on shared / multi-tenant hosts or with sensitive authenticated
+sessions. In Docker the port is not published (no `EXPOSE` / `ports:`),
+so it's reachable only inside the container's netns — fine for the
+standard single-process container, but a sidecar sharing the netns
+could reach it. **This is a visible behaviour change** (new agents now
+launch isolated + CDP-on by default), though additive — every prior
+explicit config keeps working.
+
+**Gap-analysis fixes (post-Wave-4 pass).**
+- **Act-by-ref now works over MCP (the big one).** `web_interact` /
+  `Agent.interact` accept an **omitted `url`** and act on the
+  session's current tab *in place* (no navigation), so the
+  `data-webtool-ref` stamps from `web_observe` survive. The reliable
+  set-of-marks loop is `web_create_session` →
+  `web_observe(session_id)` (reads refs) →
+  `web_interact(session_id, actions=[{"action":"click","selector":{"ref":"e3"}}])`
+  with `url` omitted. Previously `web_interact` always navigated and
+  wiped the refs.
+- **Removed 3 duplicate MCP tools** —
+  `create_browser_session` / `close_browser_session` /
+  `list_browser_sessions` shadowed the canonical
+  `web_create_session` / `web_close_session` / `web_list_sessions`.
+  MCP server count **47 → 44**.
+- **Downloader proxy + metrics.** `agent.download()` now threads the
+  configured proxy on its httpx path (was leaking the host IP past a
+  configured proxy) and emits `download_total` /
+  `download_outcome{status}` / `download_bytes`.
+- **Collection injection surfacing.** `collect_across_pages` surfaces
+  the per-page injection report (`CollectedPage.injection`) plus a
+  `CollectionResult.max_injection_risk` / `pages_with_injection`
+  rollup; an `injection_action=block` page mid-walk is flagged +
+  **skipped** (not walk-ending). The `scroll` strategy docstring was
+  narrowed (raw navigation → SSRF + sanitize only, not robots /
+  rate-limit).
+- **Injection precision.** The role-framing regex was tightened so an
+  HTML `<s>` strikethrough no longer escalates to HIGH; a new
+  exported `redact_injection()` helper makes `injection_action=redact`
+  actually mask the override (was a silent no-op).
+- **Reaper-touch.** `scroll_to_bottom` / `scroll_until_text` touch the
+  session each round so a long scroll isn't reaped mid-walk.
 
 ## What v1.6.14 added
 
@@ -1021,7 +1082,10 @@ adjusted to webTool's structured architecture and safety stance:
 - `BrowserConfig.cdp_enabled` -- adds `--remote-debugging-port` to
   the launch args and exposes `Agent.get_cdp_endpoint()` for
   external observers. CDP requires isolation; `attach_existing_browser`
-  is rejected at config validation.
+  is rejected at config validation. **Both `isolation_mode` and
+  `cdp_enabled` default `True` since v1.7.0** (see the defaults-flip
+  note under "What v1.7.0 added"); the loopback CDP port is
+  unauthenticated, so set `cdp_enabled=False` on shared hosts.
 
 **Tabs (Feature 3)**
 - New `TabManager` per session: `agent.list_tabs / current_tab /
@@ -1048,7 +1112,7 @@ adjusted to webTool's structured architecture and safety stance:
   snapshot. Powers the observe -> act -> verify loop.
 
 **Doctor (Feature 6)**
-- `Agent.doctor(quick=False)` runs 14 capability probes and returns
+- `Agent.doctor(quick=False)` runs 19 capability probes and returns
   a `DoctorReport` with summary `healthy` | `usable_with_warnings` |
   `unusable`. CLI: `web-agent doctor [--quick] [--json]` -- exits 2
   on `unusable` so CI can gate on it.

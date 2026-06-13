@@ -32,7 +32,10 @@ def _make_config(tmp_path: Path, **browser_overrides) -> AppConfig:
 
 @pytest.mark.asyncio
 async def test_cdp_off_no_remote_debugging_port_in_args(tmp_path: Path) -> None:
-    config = _make_config(tmp_path)
+    # v1.7.0: cdp + isolation default ON. This test exercises the cdp-OFF
+    # raw-launch path, so opt out explicitly (isolation_mode=False also
+    # auto-disables cdp via the validator's reconciliation).
+    config = _make_config(tmp_path, isolation_mode=False)
     assert config.browser.cdp_enabled is False
 
     bm = BrowserManager(config)

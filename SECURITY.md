@@ -31,7 +31,7 @@ reproduction publicly.
 ## Supported Versions
 
 Active maintenance is on `main`. Latest released version: see
-[CHANGELOG.md](CHANGELOG.md). Security fixes target the latest 1.6.x
+[CHANGELOG.md](CHANGELOG.md). Security fixes target the latest 1.7.x
 release; older 1.x versions are best-effort only.
 
 ## Threat Model
@@ -191,6 +191,73 @@ attack surface around browser process control:
   queries, so a prompt injection like `"x OR site:evil.com"` can't
   break out of the intended scope.
 
+### Isolation + CDP on by default (v1.7.0)
+
+v1.7.0 flips two `BrowserConfig` defaults to **on**:
+`isolation_mode=True` and `cdp_enabled=True`. Out of the box, every
+`Agent` now launches an isolated, ephemeral-profile Chromium with a
+loopback CDP debug port. Both remain fully toggleable off, and the
+validator reconciles them gracefully: setting `isolation_mode=False`
+auto-disables `cdp_enabled`; `backend="remote_cdp"` auto-clears both;
+an **explicit** conflicting `True` still errors.
+
+- **The CDP debug port is loopback-bound but UNAUTHENTICATED.**
+  `cdp_enabled=True` opens a `--remote-debugging-port` on a loopback
+  address (enforced via `_is_loopback_host`; non-loopback is rejected
+  at validation). The bind keeps the port off the network, but the
+  Chrome DevTools Protocol on that port has **no authentication** --
+  any local process able to reach loopback can drive the browser
+  (read cookies, navigate, screenshot). webTool's filesystem-anchored
+  ownership token (see v1.6.9 above) gates only webTool's **own**
+  `remote_cdp` attach; it does **not** protect the raw CDP endpoint
+  from other local processes.
+- **Guidance: set `cdp_enabled=False` on shared / multi-tenant hosts**
+  or when handling sensitive authenticated sessions. On a
+  single-tenant host where you trust every local process, the default
+  is fine and gives you live debugger / MCP / browser-use access.
+- **Docker: the port is not published.** The shipped image does not
+  `EXPOSE` the debug port and the compose file declares no `ports:`
+  mapping, so the port is reachable only inside the container's
+  network namespace -- fine for the standard single-process container.
+  A sidecar container sharing the netns (`network_mode: "container:..."`
+  or a shared pod) **could** reach it; don't co-locate untrusted
+  sidecars with `cdp_enabled=True`.
+
+### Other v1.7.0 security surfaces
+
+- **Bot-wall challenge detection.** When a fetch lands on a
+  bot-management interstitial (challenge / "are you human" wall),
+  webTool classifies the response as `BLOCKED` rather than returning a
+  `SUCCESS` carrying challenge-page garbage. This keeps a downstream
+  agent from treating the wall's HTML as the real page content. (This
+  is detection-and-honest-reporting, not a bypass -- defeating
+  bot-management remains out of scope, see below.)
+- **Prompt-injection containment.** Fetched/observed content is run
+  through an injection pass that strips hidden content (off-screen /
+  zero-size / `display:none` text used to smuggle instructions) and
+  emits an advisory `injection.risk` rating on the result. The
+  `injection_action` flag controls enforcement: `flag` (annotate
+  only), `redact` (mask the detected override text via the exported
+  `redact_injection()` helper), or `block` (refuse the content). The
+  role-framing detector is tuned to avoid escalating benign markup
+  (e.g. an HTML `<s>` strikethrough no longer trips a HIGH rating).
+  In `collect_across_pages`, an `injection_action=block` hit
+  mid-walk flags and **skips** the offending page instead of ending
+  the walk, and the run surfaces a `max_injection_risk` /
+  `pages_with_injection` rollup.
+- **`storage_state` file confinement.** Saved/loaded Playwright
+  `storage_state` JSON (cookies + origin localStorage) is confined to
+  the configured download directory via `safe_join_path()` -- a
+  caller cannot point it at `~/.ssh/` or other arbitrary paths. The
+  loader also enforces an **8 MB cap** on the state file so a hostile
+  or corrupt state blob can't exhaust memory.
+- **Proxy-credential handling.** Proxy credentials are **never
+  logged**: the proxy URL is redacted in audit / debug output and
+  user-info is URL-encoded when composing the proxy URL. v1.7.0 also
+  threads the configured proxy onto the downloader's httpx path so
+  `Agent.download()` no longer leaks the host's real IP past a
+  configured proxy.
+
 ### Known limitations / out of scope
 
 These are documented limitations. PRs welcome.
@@ -266,7 +333,11 @@ The current safety layers, in order of when they apply:
     real Chrome profile.
 15. **CDP loopback enforcement** (v1.6.6 + v1.6.8) — `cdp_host` and
     `remote_cdp_url` are validated as loopback-only; the
-    `attach_existing_browser` knob is rejected unconditionally.
+    `attach_existing_browser` knob is rejected unconditionally. Note
+    (v1.7.0): `cdp_enabled` now defaults **on**, so the debug port is
+    open out of the box; loopback bind keeps it off the network but
+    the CDP endpoint itself is unauthenticated — set
+    `cdp_enabled=False` on shared hosts (see the v1.7.0 section above).
 16. **Workspace mode gates** (v1.6.7) — default
     `markdown_skills_only` blocks Python writes; even
     `reviewed_python_helpers` requires a second opt-in
@@ -318,9 +389,13 @@ If you're embedding `web-agent-toolkit` in a production agent:
    `cleanup_on_exit=True` for short-lived agents; use
    `profile_mode="named"` for logged-in workflows that should survive
    restarts.
-10. **CDP attach** (v1.6.6 + v1.6.8): only enable when an external
-    observer (debugger, browser-use, MCP client) genuinely needs CDP
-    access. Keep `cdp_host="127.0.0.1"`; rely on the validator to
+10. **CDP attach** (v1.6.6 + v1.6.8; default-on in v1.7.0):
+    `cdp_enabled` now defaults `True`, so the loopback debug port is
+    open out of the box. On shared / multi-tenant hosts, or whenever
+    the agent handles sensitive authenticated sessions, set
+    `browser.cdp_enabled=False` — the port is loopback-bound but the
+    CDP endpoint is unauthenticated, so any local process can drive
+    the browser. Keep `cdp_host="127.0.0.1"`; rely on the validator to
     reject anything else. When using `backend="remote_cdp"`, the
     remote browser process must already be locked down — webTool
     only inherits the security posture of the endpoint it connects to.

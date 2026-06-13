@@ -81,6 +81,7 @@ from .exceptions import (
 )
 from .injection import (
     detect_injection,
+    redact_injection,
     strip_hidden_dom,
     strip_invisible_chars,
     wrap_untrusted,
@@ -214,6 +215,7 @@ __all__ = [
     "safe_page_content",
     # Injection-containment helpers (v1.7.0 Wave 3A)
     "detect_injection",
+    "redact_injection",
     "strip_hidden_dom",
     "strip_invisible_chars",
     "wrap_untrusted",

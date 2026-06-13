@@ -35,6 +35,7 @@ from web_agent.models import (
     ExtractionResult,
     FetchResult,
     FetchStatus,
+    InjectionReport,
 )
 from web_agent.recipes import Recipes
 
@@ -627,3 +628,288 @@ def test_collected_page_defaults_backward_compat() -> None:
     assert p.content_length == 0
     assert p.extraction_method == "none"
     assert p.final_url is None
+    # v1.7.0 additive defaults (B3/B4)
+    assert p.injection is None
+    assert p.blocked_reason is None
+
+
+# ======================================================================
+# B3: collection carries the per-page injection report + a rollup
+# ======================================================================
+
+
+def _extraction_with_injection(
+    url: str, content: str, *, risk: str, method: str = "raw"
+) -> ExtractionResult:
+    """An ExtractionResult that carries an advisory InjectionReport, mirroring
+    what ContentExtractor stamps when detect_prompt_injection is on.
+    """
+    return ExtractionResult(
+        url=url,
+        content=content,
+        content_length=len(content),
+        extraction_method=method if content else "none",
+        injection=InjectionReport(
+            risk=risk,  # type: ignore[arg-type]
+            indicators=["..."] if risk != "none" else [],
+            score={"none": 0.0, "low": 1.0, "medium": 3.0, "high": 6.0}[risk],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_b3_each_page_carries_injection_report() -> None:
+    """Every CollectedPage carries the per-page injection report (was dropped
+    pre-fix) and the CollectionResult rolls the highest risk up.
+    """
+    htmls = {
+        "https://site/list?p=1": _page_html("AAA", next_href="https://site/list?p=2"),
+        "https://site/list?p=2": _page_html("BBB", next_href="https://site/list?p=3"),
+        "https://site/list?p=3": _page_html("CCC"),  # no next
+    }
+    risks = {
+        "https://site/list?p=1": "none",
+        "https://site/list?p=2": "high",  # the worst page mid-walk
+        "https://site/list?p=3": "low",
+    }
+    contents = {
+        "https://site/list?p=1": "AAA",
+        "https://site/list?p=2": "BBB",
+        "https://site/list?p=3": "CCC",
+    }
+
+    async def _fetch(url: str, **_kw: object) -> FetchResult:
+        return _fetch_result(url, htmls[url])
+
+    async def _extract(fr: FetchResult, **_kw: object) -> ExtractionResult:
+        return _extraction_with_injection(fr.url, contents[fr.url], risk=risks[fr.url])
+
+    recipes = _make_recipes(fetch_side=_fetch, extract_side=_extract)
+    result = await recipes.collect_across_pages(
+        "https://site/list?p=1", strategy="next_link", max_pages=10
+    )
+
+    assert result.pages_collected == 3
+    # Each page kept its report (B3: was discarded before the fix).
+    assert [p.injection.risk for p in result.pages if p.injection] == ["none", "high", "low"]
+    # Rollup reflects the HIGHEST risk across pages, ordered none<low<medium<high.
+    assert result.max_injection_risk == "high"
+    # 'high' + 'low' score above none; 'none' does not.
+    assert result.pages_with_injection == 2
+
+
+@pytest.mark.asyncio
+async def test_b3_clean_walk_rolls_up_to_none() -> None:
+    """A walk where every page scans clean -> max_injection_risk='none',
+    pages_with_injection=0 (distinct from None = detection disabled).
+    """
+    htmls = {
+        "https://s/a": _page_html("A", next_href="https://s/b"),
+        "https://s/b": _page_html("B"),
+    }
+    contents = {"https://s/a": "A", "https://s/b": "B"}
+
+    async def _fetch(url: str, **_kw: object) -> FetchResult:
+        return _fetch_result(url, htmls[url])
+
+    async def _extract(fr: FetchResult, **_kw: object) -> ExtractionResult:
+        return _extraction_with_injection(fr.url, contents[fr.url], risk="none")
+
+    recipes = _make_recipes(fetch_side=_fetch, extract_side=_extract)
+    result = await recipes.collect_across_pages("https://s/a", strategy="next_link")
+
+    assert result.pages_collected == 2
+    assert result.max_injection_risk == "none"
+    assert result.pages_with_injection == 0
+
+
+@pytest.mark.asyncio
+async def test_b3_detection_disabled_rolls_up_to_none_sentinel() -> None:
+    """When pages carry NO injection report (detection disabled), the rollup
+    is None (not 'none') and pages_with_injection stays 0.
+    """
+
+    async def _fetch(url: str, **_kw: object) -> FetchResult:
+        return _fetch_result(url, _page_html("only"))
+
+    async def _extract(fr: FetchResult, **_kw: object) -> ExtractionResult:
+        return _extraction(fr.url, "only")  # no injection report attached
+
+    recipes = _make_recipes(fetch_side=_fetch, extract_side=_extract)
+    result = await recipes.collect_across_pages("https://s/x", strategy="next_link")
+
+    assert result.pages_collected == 1
+    assert result.pages[0].injection is None
+    assert result.max_injection_risk is None
+    assert result.pages_with_injection == 0
+
+
+# ======================================================================
+# B4: injection_action='block' does not fight the walk
+# ======================================================================
+
+
+def _blocked_extraction(url: str) -> ExtractionResult:
+    """Mirror what ContentExtractor produces under injection_action='block'
+    on a HIGH-risk page: content emptied, failure_stage stamped, report kept.
+    """
+    return ExtractionResult(
+        url=url,
+        content=None,
+        content_length=0,
+        extraction_method="raw",
+        failure_stage="injection_blocked",
+        error_message="content blocked: high-confidence prompt-injection indicators",
+        injection=InjectionReport(risk="high", indicators=["ignore all..."], score=6.0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_b4_page_param_does_not_stop_at_blocked_page() -> None:
+    """With injection_action='block', a HIGH-risk page mid-walk (content
+    emptied + failure_stage='injection_blocked') must NOT be read as the
+    page_param empty-page terminator. The walk continues; a genuinely empty
+    page later still terminates.
+    """
+    # page1 ok, page2 BLOCKED (empty by policy), page3 ok, page4 genuinely empty.
+    bodies = {
+        "https://api/list?page=1": "rows1",
+        "https://api/list?page=2": "__BLOCKED__",
+        "https://api/list?page=3": "rows3",
+        "https://api/list?page=4": "",  # genuinely empty -> end of listing
+    }
+
+    async def _fetch(url: str, **_kw: object) -> FetchResult:
+        return _fetch_result(url, _page_html(bodies.get(url, "")))
+
+    async def _extract(fr: FetchResult, **_kw: object) -> ExtractionResult:
+        if bodies.get(fr.url) == "__BLOCKED__":
+            return _blocked_extraction(fr.url)
+        return _extraction(fr.url, bodies.get(fr.url, ""))
+
+    recipes = _make_recipes(
+        fetch_side=_fetch,
+        extract_side=_extract,
+        config=_offline_config(injection_action="block"),
+    )
+    result = await recipes.collect_across_pages(
+        "https://api/list?page=1", strategy="page_param", max_pages=10
+    )
+
+    # The walk did NOT halt at the blocked page2 -- it reached page3 and
+    # terminated only at the genuinely-empty page4.
+    assert result.stopped_reason == "empty_page"
+    urls = [p.url for p in result.pages]
+    assert urls == [
+        "https://api/list?page=1",
+        "https://api/list?page=2",  # blocked page IS recorded (flagged)
+        "https://api/list?page=3",
+    ]
+    # The blocked page is flagged so the caller sees WHY it's blank.
+    blocked = result.pages[1]
+    assert blocked.blocked_reason == "injection_blocked"
+    assert blocked.content == ""
+    assert blocked.injection is not None and blocked.injection.risk == "high"
+    # Warning + diagnostic surfaced for it.
+    assert any("injection_action='block'" in w for w in result.warnings)
+    assert any(
+        d.url == "https://api/list?page=2" and d.block_reason == "injection_blocked"
+        for d in result.diagnostics
+    )
+    # Rollup reflects the blocked page's HIGH risk.
+    assert result.max_injection_risk == "high"
+
+
+@pytest.mark.asyncio
+async def test_b4_next_link_blocked_page_flagged_and_walk_continues() -> None:
+    """For next_link, a blocked page is appended flagged (not a blank
+    mystery page) and the walk follows that page's own next control.
+    """
+    htmls = {
+        "https://site/1": _page_html("ONE", next_href="https://site/2"),
+        "https://site/2": _page_html("BLOCKED-MARKUP", next_href="https://site/3"),
+        "https://site/3": _page_html("THREE"),  # no next
+    }
+
+    async def _fetch(url: str, **_kw: object) -> FetchResult:
+        return _fetch_result(url, htmls[url])
+
+    async def _extract(fr: FetchResult, **_kw: object) -> ExtractionResult:
+        if fr.url == "https://site/2":
+            return _blocked_extraction(fr.url)
+        return _extraction(fr.url, {"https://site/1": "ONE", "https://site/3": "THREE"}[fr.url])
+
+    recipes = _make_recipes(
+        fetch_side=_fetch,
+        extract_side=_extract,
+        config=_offline_config(injection_action="block"),
+    )
+    result = await recipes.collect_across_pages(
+        "https://site/1", strategy="next_link", max_pages=10
+    )
+
+    # All three pages recorded; the blocked one is flagged but the walk
+    # followed its next link to page3 and stopped there naturally.
+    assert [p.url for p in result.pages] == [
+        "https://site/1",
+        "https://site/2",
+        "https://site/3",
+    ]
+    assert result.stopped_reason == "no_next"
+    assert result.pages[1].blocked_reason == "injection_blocked"
+    assert result.pages[0].blocked_reason is None
+    assert result.pages[2].blocked_reason is None
+
+
+@pytest.mark.asyncio
+async def test_b4_genuinely_empty_page_still_terminates_page_param() -> None:
+    """Regression guard: with injection_action='block' active but NO page
+    blocked, a genuinely empty page_param page still terminates the walk
+    (the B4 fix must not break normal empty-page termination).
+    """
+    bodies = {
+        "https://api/p?page=1": "rows1",
+        "https://api/p?page=2": "",  # genuinely empty
+    }
+
+    async def _fetch(url: str, **_kw: object) -> FetchResult:
+        return _fetch_result(url, _page_html(bodies.get(url, "")))
+
+    async def _extract(fr: FetchResult, **_kw: object) -> ExtractionResult:
+        return _extraction(fr.url, bodies.get(fr.url, ""))
+
+    recipes = _make_recipes(
+        fetch_side=_fetch,
+        extract_side=_extract,
+        config=_offline_config(injection_action="block"),
+    )
+    result = await recipes.collect_across_pages(
+        "https://api/p?page=1", strategy="page_param", max_pages=10
+    )
+    assert result.pages_collected == 1
+    assert result.stopped_reason == "empty_page"
+
+
+# ======================================================================
+# Contract: scroll strategy uses a RAW navigation (no robots / rate-limit)
+# ======================================================================
+
+
+def test_contract_scroll_docstring_narrowed_to_raw_navigation() -> None:
+    """Contract fix: the scroll strategy does a raw page.goto (SSRF +
+    injection only) -- it does NOT route through WebFetcher.fetch, so robots
+    + rate-limiting do not apply. We chose to NARROW the docstring (the
+    honest, lower-risk option) rather than add gates Recipes can't reach:
+    the RobotsChecker / RateLimiter are encapsulated inside WebFetcher and
+    are not handed to Recipes. Assert the docstrings now say so.
+    """
+    # Normalize wrapped whitespace so line-broken phrases match as one token.
+    main_doc = " ".join((Recipes.collect_across_pages.__doc__ or "").split())
+    scroll_doc = " ".join((Recipes._collect_scroll.__doc__ or "").split())
+    # The main docstring no longer claims robots/rate-limit apply to EVERY page.
+    assert "safety gates differ by strategy" in main_doc.lower()
+    assert "robots.txt and rate limiting are NOT consulted" in main_doc
+    assert "raw ``page.goto``" in main_doc
+    # The scroll helper docstring is explicit about the raw navigation.
+    assert "raw" in scroll_doc.lower()
+    assert "robots.txt obedience and per-host rate limiting are NOT consulted" in scroll_doc

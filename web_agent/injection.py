@@ -42,6 +42,7 @@ from .models import InjectionReport
 
 __all__ = [
     "detect_injection",
+    "redact_injection",
     "strip_hidden_dom",
     "strip_invisible_chars",
     "wrap_untrusted",
@@ -411,12 +412,28 @@ _IMPERATIVE_YOU_RE = re.compile(
 
 # Speaker-role framing: an injected payload often forges a role turn to make
 # its override look authoritative -- a literal ``SYSTEM:`` / ``ASSISTANT:``
-# label at line/speaker position, or a ``</system>`` / ``[/INST]`` style tag.
+# label at line/speaker position, a ``</system>`` / ``<assistant>`` / ``[/INST]``
+# tag, or a chat-template end-of-turn marker (Llama ``</s>``, ``<|im_end|>``).
 # Descriptive prose mentioning "the system prompt" does NOT match (that is a
 # weak phrase pattern, not a forged role turn).
+#
+# The Llama ``s`` end-of-turn marker is special-cased because ``<s>`` / ``</s>``
+# is ALSO HTML strikethrough, which legitimate prose carries. The previous bare
+# ``s`` alternative matched ``<s>`` / ``</s>`` / ``< s >`` ANYWHERE, so a single
+# visible override phrase plus a stray strikethrough close-tag wrongly escalated
+# to HIGH (role framing is NOT gated by the discussion-context veto). We now
+# require ``</s>`` at TURN position -- start of text/line (optionally indented)
+# -- which is how a real forged transcript emits an end-of-turn token; an inline
+# ``</s>`` discussed in running prose ("the closing tag is </s>") no longer
+# counts, and an opening / spaced ``<s>`` / ``< s >`` never counts. The
+# ``<|...|>`` ChatML-style turn markers are matched anywhere (they have no benign
+# HTML collision). ``system`` / ``assistant`` / ``developer`` / ``inst`` still
+# match either open OR close form, since none collide with benign markup.
 _ROLE_FRAMING_RE = re.compile(
     r"(?:^|\n)\s*(?:system|assistant|developer)\s*:"
-    r"|</?\s*(?:system|assistant|s|inst)\s*>"
+    r"|</?\s*(?:system|assistant|developer|inst)\s*>"
+    r"|(?:^|\n)\s*</\s*s\s*>"
+    r"|<\|\s*(?:im_(?:start|end)|start|end)_?(?:of_turn)?\s*\|>"
     r"|\[/?\s*INST\s*\]",
     re.IGNORECASE,
 )
@@ -667,6 +684,92 @@ def _decide_risk(
     if score >= _THRESHOLD_LOW:
         return "low"
     return "none"
+
+
+# ----------------------------------------------------------------------
+# Layer 2b: span-accurate redaction primitive
+# ----------------------------------------------------------------------
+
+# Placeholder substituted for each redacted injection span. Kept identical to
+# the marker the content extractor previously emitted so downstream callers /
+# tests see a stable token.
+_REDACTION_PLACEHOLDER = "[redacted: possible injection]"
+
+# Patterns whose match spans represent an actual override / exfil / payload
+# marker -- the genuine attack signal worth masking. Weak CONTEXTUAL phrases
+# ("system prompt", "api key", "password") are deliberately EXCLUDED: they
+# occur constantly in legitimate prose, so masking them would corrupt benign
+# content and defeat the point. Redaction targets the strong markers + a long
+# base64 blob, which is what makes an override actionable.
+_REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *(p.regex for p in _STRONG_PATTERNS),
+    _BASE64_BLOB_RE,
+)
+
+
+def redact_injection(text: str) -> tuple[str, int]:
+    """Mask real prompt-injection match spans in ``text``.
+
+    Re-runs the strong detection patterns (imperative overrides, exfiltration
+    bait, tool-call / role-tag forgery, long base64 blobs) over ``text`` and
+    replaces every matched span -- ``match.start()``:``match.end()`` -- with a
+    fixed placeholder. Because it masks the ACTUAL spans found in the supplied
+    text (not a whitespace-collapsed, context-padded indicator snippet), the
+    override is reliably removed: there is no snippet-reconstruction step that
+    can silently fail to find its needle.
+
+    Overlapping or adjacent matches are merged into one placeholder so the
+    surrounding text is never corrupted and the marker is never duplicated.
+    Weak contextual phrases ("system prompt", "api key") are intentionally NOT
+    redacted -- they appear in legitimate content, so masking them would damage
+    benign text without neutralizing an attack.
+
+    This is the robust primitive behind ``SafetyConfig.injection_action=
+    'redact'``: the content extractor calls it on the visible ``content`` /
+    ``markdown`` instead of reconstructing needles from report snippets.
+
+    Args:
+        text: The visible text to redact (already hidden-DOM /
+            invisible-char sanitized, the same input ``detect_injection`` sees).
+
+    Returns:
+        ``(redacted_text, count)`` where ``count`` is the number of distinct
+        (post-merge) spans masked. ``count == 0`` means nothing matched and the
+        original ``text`` is returned unchanged.
+    """
+    if not text:
+        return text, 0
+
+    spans: list[tuple[int, int]] = []
+    for regex in _REDACT_PATTERNS:
+        for match in regex.finditer(text):
+            if match.end() > match.start():  # skip any zero-width match
+                spans.append((match.start(), match.end()))
+    if not spans:
+        return text, 0
+
+    # Merge overlapping / adjacent spans so a single placeholder covers a run
+    # of touching matches (e.g. "ignore previous instructions" abutting a
+    # "send it to https://..." clause) rather than corrupting the text with
+    # nested / duplicated markers.
+    spans.sort()
+    merged: list[tuple[int, int]] = [spans[0]]
+    for start, end in spans[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+
+    # Rebuild left-to-right, substituting the placeholder for each merged span.
+    out: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        out.append(text[cursor:start])
+        out.append(_REDACTION_PLACEHOLDER)
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out), len(merged)
 
 
 # ----------------------------------------------------------------------

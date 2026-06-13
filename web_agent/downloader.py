@@ -34,6 +34,7 @@ from .browser_manager import BrowserManager
 from .config import AppConfig
 from .correlation import get_correlation_id
 from .debug import DebugCapture
+from .metrics import MetricsRegistry, get_metrics
 from .models import DownloadResult, FetchStatus
 from .rate_limiter import RateLimiter
 from .robots import RobotsChecker
@@ -114,6 +115,8 @@ class Downloader:
         config: Application configuration.
         sessions: Optional SessionManager for persistent browser sessions.
         debug: Optional DebugCapture for failure artifact capture.
+        metrics: Optional MetricsRegistry for download outcome counters.
+            Defaults to the shared no-op registry (zero cost when unset).
     """
 
     def __init__(
@@ -125,6 +128,7 @@ class Downloader:
         rate_limiter: Optional[RateLimiter] = None,
         robots: Optional[RobotsChecker] = None,
         network_collector: Optional[Any] = None,
+        metrics: Optional[MetricsRegistry] = None,
     ) -> None:
         self._bm = browser_manager
         self._config = config
@@ -132,6 +136,10 @@ class Downloader:
         self._debug = debug or DebugCapture(config)
         self._rate_limiter = rate_limiter
         self._robots = robots
+        # v1.7.0 (Wave 4A): observability. Defaults to the shared no-op
+        # registry so existing call sites that don't pass one pay nothing per
+        # increment (mirrors WebFetcher / SearchEngine).
+        self._metrics = get_metrics(metrics)
         self._download_dir = Path(config.download.download_dir)
         # v1.6.8: shared NetworkCollector. The downloader's own
         # expect_download() consumer still owns saving the file; this
@@ -139,6 +147,41 @@ class Downloader:
         # so the download URL is recorded even when capture_download_intents
         # is on. None when no Agent provided one (older test scaffolding).
         self._network_collector = network_collector
+
+    # ------------------------------------------------------------------
+    # v1.7.0 (Wave 4A): observability -- record at the outcome chokepoint
+    # ------------------------------------------------------------------
+
+    def _record_download_outcome(self, result: DownloadResult) -> DownloadResult:
+        """Stamp ``download_total`` + ``download_outcome{status}`` for a result.
+
+        Called at each :meth:`download` return so every finalized
+        DownloadResult is counted exactly once (blocks, successes, transport
+        failures all funnel here). ``download_bytes`` is observed on the
+        success path. Counters only; no control-flow or value changes. Returns
+        ``result`` so callers can ``return self._record_download_outcome(...)``
+        inline. Mirrors ``WebFetcher._record_fetch_outcome``; no-op on the
+        disabled registry; never raises.
+        """
+        self._metrics.incr("download_total")
+        self._metrics.incr("download_outcome", status=result.status.value)
+        if result.status == FetchStatus.SUCCESS and result.size_bytes is not None:
+            self._metrics.observe("download_bytes", float(result.size_bytes))
+        return result
+
+    def _httpx_proxy_kwargs(self) -> dict[str, Any]:
+        """v1.7.0 (Wave 2F): ``proxy=`` kwarg for the httpx download path.
+
+        Returns ``{"proxy": <url>}`` when ``ProxyConfig.server`` is set, else
+        an EMPTY dict so the ``proxy`` key is omitted entirely from
+        ``httpx.AsyncClient(...)`` (httpx 0.28 takes a single ``proxy=`` URL).
+        Mirrors ``WebFetcher._httpx_proxy_kwargs`` so the downloader's primary
+        (Strategy 1) path egresses through the configured proxy instead of the
+        host's real IP. The Playwright fallback strategies inherit the proxy
+        from the browser launch, so only this httpx path needed the fix.
+        """
+        proxy_url = self._config.proxy.httpx_proxy_url()
+        return {"proxy": proxy_url} if proxy_url is not None else {}
 
     async def download(
         self,
@@ -163,42 +206,48 @@ class Downloader:
         # Domain allow/deny gate
         if not check_domain_allowed(url, self._config.safety):
             host = urlparse(url).hostname or ""
-            return DownloadResult(
-                url=url,
-                filepath="",
-                filename="",
-                status=FetchStatus.BLOCKED,
-                error_message=f"Domain not allowed by SafetyConfig: {host}",
-                correlation_id=cid,
+            return self._record_download_outcome(
+                DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename="",
+                    status=FetchStatus.BLOCKED,
+                    error_message=f"Domain not allowed by SafetyConfig: {host}",
+                    correlation_id=cid,
+                )
             )
 
         # Granular safety: file downloads gated by allow_downloads
         if not self._config.safety.allow_downloads:
-            return DownloadResult(
-                url=url,
-                filepath="",
-                filename="",
-                status=FetchStatus.BLOCKED,
-                error_message=(
-                    "File downloads blocked: safety.allow_downloads=False "
-                    "(set allow_downloads=True or disable safe_mode to opt in)"
-                ),
-                correlation_id=cid,
+            return self._record_download_outcome(
+                DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename="",
+                    status=FetchStatus.BLOCKED,
+                    error_message=(
+                        "File downloads blocked: safety.allow_downloads=False "
+                        "(set allow_downloads=True or disable safe_mode to opt in)"
+                    ),
+                    correlation_id=cid,
+                )
             )
 
         # Politeness layer: robots.txt check
         if self._robots is not None and not await self._robots.is_allowed(url):
             host = urlparse(url).hostname or ""
-            return DownloadResult(
-                url=url,
-                filepath="",
-                filename="",
-                status=FetchStatus.BLOCKED,
-                error_message=(
-                    f"robots.txt for {host} disallows this URL "
-                    f"for User-Agent {self._robots.user_agent!r}"
-                ),
-                correlation_id=cid,
+            return self._record_download_outcome(
+                DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename="",
+                    status=FetchStatus.BLOCKED,
+                    error_message=(
+                        f"robots.txt for {host} disallows this URL "
+                        f"for User-Agent {self._robots.user_agent!r}"
+                    ),
+                    correlation_id=cid,
+                )
             )
 
         # Politeness layer: per-host rate limit (may sleep)
@@ -215,13 +264,15 @@ class Downloader:
         try:
             filepath = safe_join_path(self._download_dir, filename)
         except ValueError as exc:
-            return DownloadResult(
-                url=url,
-                filepath="",
-                filename=filename,
-                status=FetchStatus.BLOCKED,
-                error_message=f"Invalid filename: {exc}",
-                correlation_id=cid,
+            return self._record_download_outcome(
+                DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename=filename,
+                    status=FetchStatus.BLOCKED,
+                    error_message=f"Invalid filename: {exc}",
+                    correlation_id=cid,
+                )
             )
 
         # v1.6.16 DL-2: validate the extension of the ACTUAL saved filename,
@@ -241,22 +292,24 @@ class Downloader:
                 detail = (
                     f"Extension {saved_ext!r}" if saved_ext else "Missing/extensionless filename"
                 )
-                return DownloadResult(
-                    url=url,
-                    filepath="",
-                    filename=filepath.name,
-                    status=FetchStatus.BLOCKED,
-                    error_message=(
-                        f"{detail} not in allowed_extensions. Allowed: {sorted(allowed_exts)}"
-                    ),
-                    correlation_id=cid,
+                return self._record_download_outcome(
+                    DownloadResult(
+                        url=url,
+                        filepath="",
+                        filename=filepath.name,
+                        status=FetchStatus.BLOCKED,
+                        error_message=(
+                            f"{detail} not in allowed_extensions. Allowed: {sorted(allowed_exts)}"
+                        ),
+                        correlation_id=cid,
+                    )
                 )
 
         # Strategy 1: Try httpx streaming (fastest)
         try:
             result = await self._download_httpx(url, filepath)
             result.correlation_id = cid
-            return result
+            return self._record_download_outcome(result)
         except (NavigationError, DomainNotAllowedError) as e:
             # v1.6.16 DL-1: a security block raised inside _download_httpx --
             # a redirect to a denied/private host, a post-connect private
@@ -274,13 +327,15 @@ class Downloader:
             )
             if self._debug.enabled:
                 self._debug.capture_no_page(e, "httpx_download", context={"url": url})
-            return DownloadResult(
-                url=url,
-                filepath="",
-                filename=filepath.name,
-                status=FetchStatus.BLOCKED,
-                error_message=str(e),
-                correlation_id=cid,
+            return self._record_download_outcome(
+                DownloadResult(
+                    url=url,
+                    filepath="",
+                    filename=filepath.name,
+                    status=FetchStatus.BLOCKED,
+                    error_message=str(e),
+                    correlation_id=cid,
+                )
             )
         except httpx.HTTPStatusError as e:
             logger.info(
@@ -309,7 +364,7 @@ class Downloader:
             if result.status != FetchStatus.SUCCESS:
                 result = await self._save_page_with_playwright(url, filepath, session_id)
         result.correlation_id = cid
-        return result
+        return self._record_download_outcome(result)
 
     async def _download_httpx(self, url: str, filepath: Path) -> DownloadResult:
         """Strategy 1: Stream download using httpx (no browser needed).
@@ -350,6 +405,7 @@ class Downloader:
             follow_redirects=True,
             timeout=60.0,
             event_hooks={"response": [_check_redirect]},
+            **self._httpx_proxy_kwargs(),
         ) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 response.raise_for_status()

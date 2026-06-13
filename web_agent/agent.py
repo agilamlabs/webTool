@@ -348,6 +348,7 @@ class Agent:
             rate_limiter=self._rate_limiter,
             robots=self._robots,
             network_collector=self._network_collector,
+            metrics=self._metrics,
         )
         self._actions = BrowserActions(
             self._bm,
@@ -926,13 +927,23 @@ class Agent:
 
     async def interact(
         self,
-        url: str,
-        actions: list[Action],
+        url: str = "",
+        actions: list[Action] | None = None,
         stop_on_error: bool | None = None,
         *,
         session_id: Optional[str] = None,
     ) -> ActionSequenceResult:
-        """Execute a scripted sequence of browser actions on a URL."""
+        """Execute a scripted sequence of browser actions.
+
+        v1.7.0: ``url`` is optional. Pass a URL to navigate first, OR pass an
+        empty ``url`` with a ``session_id`` to act on that session's CURRENT
+        tab IN PLACE (no navigation) -- this is how the set-of-marks loop
+        works: ``observe`` stamps element refs on the live DOM, then
+        ``interact(actions=[...], session_id=...)`` acts on them without a
+        navigation that would wipe the refs.
+        """
+        if actions is None:
+            actions = []
         async with self._call_scope("interact", {"url": url, "n_actions": len(actions)}):
             self._debug.reset()
             logger.info(

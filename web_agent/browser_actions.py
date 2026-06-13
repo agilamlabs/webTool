@@ -618,6 +618,10 @@ class BrowserActions:
         net_events: list = []
         api_cands: list[str] = []
         dl_intents: list[str] = []
+        # v1.7.0 (gap-fix B1): early-bind so the no-url in-place branch and the
+        # ephemeral path both see a defined value (it's only set True inside the
+        # session-tab-reuse branch below).
+        reused = False
 
         try:
             if session_id and self._sessions is not None:
@@ -659,10 +663,25 @@ class BrowserActions:
             # All branches above set ``page``; mypy can't follow the
             # cross-branch reassignment so we narrow here.
             assert page is not None
-            await page.goto(url, wait_until="domcontentloaded")
+            # v1.7.0 (gap-fix B1): an empty ``url`` means "act on the session's
+            # CURRENT tab in place" -- do NOT navigate. This is what makes the
+            # set-of-marks loop work: web_observe stamps data-webtool-ref on the
+            # live DOM, then interact(url="", session_id=...) acts on it without
+            # a goto that would wipe the stamps. Requires a reused session tab;
+            # acting "in place" on a fresh blank page is a misuse.
+            if url:
+                await page.goto(url, wait_until="domcontentloaded")
+            elif not reused:
+                return _block_all(
+                    "interact called with no url and no existing session tab to act on. "
+                    "Provide a url to navigate, or a session_id whose current tab is already "
+                    "open (e.g. after web_observe / a prior interact)."
+                )
 
             # Post-navigation re-check: the initial goto may have followed a
-            # redirect to a denied / private-IP host. Defense-in-depth.
+            # redirect to a denied / private-IP host. Defense-in-depth. Also
+            # runs on the no-navigation path so an in-place action on a tab that
+            # drifted to a disallowed domain is still blocked.
             if not check_domain_allowed(page.url, safety):
                 host = urlparse(page.url).hostname or ""
                 return _block_all(f"Initial navigation redirected to disallowed domain: {host}")
@@ -1894,6 +1913,17 @@ class BrowserActions:
             logger.debug("scroll_until_text initial body read failed: {e}", e=exc)
 
         for i in range(max_scrolls):
+            # R1 (concurrency): keep the idle clock warm for the WHOLE scroll.
+            # The entry touch() above only stamps last_used once; a long walk
+            # (up to 1000 rounds, each waiting ~2s) otherwise freezes the idle
+            # clock for the entire duration, so a concurrent create()/list()
+            # whose _reap_idle fires (busy-blind: SessionManager._idle_expired
+            # selects purely on now - last_used > session_idle_ttl_s) can
+            # close() this live tab out from under the active scroll. Re-touch
+            # once per round -- a cheap dict write -- so an actively-scrolling
+            # session is never seen as idle. self._sessions is non-None here
+            # (guarded at entry); touch() no-ops on an unknown id.
+            self._sessions.touch(session_id)
             # BR-8: a closed page can never yield more text -- surface it as a
             # genuine error instead of silently spinning to a misleading
             # "text not found after N scrolls".
@@ -2044,6 +2074,17 @@ class BrowserActions:
         stable = 0
         reached_bottom = False
         for _ in range(max_scrolls):
+            # R1 (concurrency): keep the idle clock warm for the WHOLE scroll.
+            # The entry touch() above only stamps last_used once; a long walk
+            # (up to 1000 rounds, each waiting settle_ms) otherwise freezes the
+            # idle clock for the entire duration, so a concurrent create()/list()
+            # whose _reap_idle fires (busy-blind: SessionManager._idle_expired
+            # selects purely on now - last_used > session_idle_ttl_s) can
+            # close() this live tab out from under the active scroll. Re-touch
+            # once per round -- a cheap dict write -- so an actively-scrolling
+            # session is never seen as idle. self._sessions is non-None here
+            # (guarded at entry); touch() no-ops on an unknown id.
+            self._sessions.touch(session_id)
             if page.is_closed():
                 raise ActionError("scroll_to_bottom: page was closed mid-scroll", action="scroll")
             try:

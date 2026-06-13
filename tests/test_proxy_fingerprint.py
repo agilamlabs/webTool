@@ -245,8 +245,12 @@ def _fake_pw(chromium: MagicMock) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_launch_no_proxy_when_unset(tmp_path: Path) -> None:
-    """Default (no proxy): chromium.launch must NOT receive a proxy kwarg."""
-    config = AppConfig(base_dir=str(tmp_path))
+    """Default (no proxy): chromium.launch must NOT receive a proxy kwarg.
+
+    v1.7.0: isolation defaults ON (-> launch_persistent_context); this test
+    targets the raw chromium.launch path, so isolation is opted out (the
+    persistent-context proxy path has its own tests)."""
+    config = AppConfig(base_dir=str(tmp_path), browser=BrowserConfig(isolation_mode=False))
     assert config.proxy.is_active() is False
 
     bm = BrowserManager(config)
@@ -264,9 +268,12 @@ async def test_launch_no_proxy_when_unset(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_launch_proxy_passed_when_set(tmp_path: Path) -> None:
-    """Proxy set -> chromium.launch receives proxy={server,username,password,bypass}."""
+    """Proxy set -> chromium.launch receives proxy={server,username,password,bypass}.
+
+    v1.7.0: isolation opted out so this exercises the raw chromium.launch path."""
     config = AppConfig(
         base_dir=str(tmp_path),
+        browser=BrowserConfig(isolation_mode=False),
         proxy=ProxyConfig(
             server="http://127.0.0.1:8080",
             username="u",
