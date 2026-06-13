@@ -2197,3 +2197,296 @@ class StructuredExtractionResult(BaseModel):
         ),
     )
     correlation_id: Optional[str] = Field(default=None)
+
+
+# ----------------------------------------------------------------------
+# v1.7.0 Wave 8: snapshot / diff change-monitoring
+# ----------------------------------------------------------------------
+
+
+class PageSnapshot(BaseModel):
+    """A point-in-time capture of a page's salient content, for change monitoring.
+
+    Produced by :meth:`Agent.snapshot_page`: the page is fetched + extracted
+    through the normal pipeline (challenge / injection-sanitize / robots /
+    rate-limit / SSRF all apply), then its main content is NORMALIZED (line
+    endings unified, trailing whitespace stripped, blank-line runs collapsed)
+    and hashed. Persisting a snapshot and diffing a later capture against it is
+    how a caller watches a page for changes (a price, a policy, a status board)
+    without re-reading the whole page each time. All fields additive / defaulted.
+    """
+
+    url: str = Field(description="URL that was fetched and captured.")
+    label: Optional[str] = Field(
+        default=None,
+        description=(
+            "Caller-supplied key this snapshot is stored under (the stable "
+            "identity used for later diffing). Defaults to a hash of the URL "
+            "when persisted without one; None for an un-persisted capture."
+        ),
+    )
+    captured_at: Optional[str] = Field(
+        default=None,
+        description="UTC ISO-8601 timestamp of when the snapshot was captured.",
+    )
+    title: Optional[str] = Field(
+        default=None, description="Page title, if the extractor found one."
+    )
+    content: str = Field(
+        default="",
+        description=(
+            "NORMALIZED main content used as the diff basis. Bounded by "
+            "``MonitoringConfig.max_snapshot_chars``."
+        ),
+    )
+    content_hash: str = Field(
+        default="",
+        description="SHA-256 hex of ``content`` -- a cheap equality check before diffing.",
+    )
+    content_length: int = Field(default=0, description="Character count of ``content``.")
+    extraction_method: str = Field(
+        default="none",
+        description="Which extractor produced ``content`` (trafilatura|bs4|raw|pdf|...|none).",
+    )
+    fetch_status: Optional[str] = Field(
+        default=None,
+        description=(
+            "FetchStatus value of the capture fetch as a string; populated when "
+            "the fetch did not succeed (the snapshot is then empty)."
+        ),
+    )
+    error_message: Optional[str] = Field(
+        default=None, description="Why the capture failed, when it did. None on success."
+    )
+    correlation_id: Optional[str] = Field(default=None)
+
+
+class SnapshotDiff(BaseModel):
+    """The difference between an earlier :class:`PageSnapshot` and a new capture.
+
+    Produced by :meth:`Agent.diff_page` (fetch now, load the stored baseline,
+    compare) or :func:`web_agent.monitoring.diff_snapshots`. ``changed`` is the
+    headline signal; ``similarity`` (0..1) quantifies how much; the bounded
+    ``added_lines`` / ``removed_lines`` show what, for a quick scan.
+    """
+
+    url: str = Field(description="URL the diff is for.")
+    changed: bool = Field(
+        description="True when the normalized content hash differs from the baseline."
+    )
+    is_first_snapshot: bool = Field(
+        default=False,
+        description=(
+            "True when there was NO baseline to compare against (first capture "
+            "for this label). ``changed`` is then True by convention."
+        ),
+    )
+    similarity: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "difflib SequenceMatcher ratio of old vs new normalized content in "
+            "[0,1] (1.0 == identical). 1.0 when unchanged; lower as more differs."
+        ),
+    )
+    old_hash: Optional[str] = Field(
+        default=None, description="Baseline content hash (None on first snapshot)."
+    )
+    new_hash: str = Field(default="", description="New capture content hash.")
+    old_captured_at: Optional[str] = Field(
+        default=None, description="Baseline capture timestamp."
+    )
+    new_captured_at: Optional[str] = Field(
+        default=None, description="New capture timestamp."
+    )
+    added_lines: list[str] = Field(
+        default_factory=list,
+        description="Lines in the new content but not the baseline (bounded by diff_max_lines).",
+    )
+    removed_lines: list[str] = Field(
+        default_factory=list,
+        description="Lines in the baseline but not the new content (bounded by diff_max_lines).",
+    )
+    added_count: int = Field(
+        default=0, description="Total added lines (may exceed len(added_lines) when capped)."
+    )
+    removed_count: int = Field(
+        default=0, description="Total removed lines (may exceed len(removed_lines) when capped)."
+    )
+    truncated: bool = Field(
+        default=False,
+        description="True when added_lines / removed_lines were capped at diff_max_lines.",
+    )
+    summary: str = Field(default="", description="One-line human summary of the diff.")
+    correlation_id: Optional[str] = Field(default=None)
+
+
+# ----------------------------------------------------------------------
+# v1.7.0 Wave 8: bounded same-site crawl + sitemap seeding
+# ----------------------------------------------------------------------
+
+
+class CrawledPage(BaseModel):
+    """One page visited by :meth:`Recipes.crawl_site`.
+
+    Like :class:`CollectedPage` but for a tree walk: it also records the
+    ``depth`` at which the page was discovered and how many in-scope links it
+    contributed. Fetched + extracted through the injected ``WebFetcher`` +
+    ``ContentExtractor`` so challenge detection, injection sanitize, robots,
+    rate limiting, and SSRF re-gating all apply.
+    """
+
+    url: str = Field(description="URL that was fetched and extracted.")
+    final_url: Optional[str] = Field(
+        default=None, description="URL after redirects (None if it never changed)."
+    )
+    depth: int = Field(
+        default=0, description="Link depth from the start URL (the start URL is depth 0)."
+    )
+    status: str = Field(
+        default="success",
+        description="FetchStatus value as a string ('success' | 'blocked' | 'timeout' | ...).",
+    )
+    title: Optional[str] = Field(
+        default=None, description="Page title, if the extractor found one."
+    )
+    content: str = Field(default="", description="Extracted text content for this page.")
+    content_length: int = Field(default=0, description="Character count of ``content``.")
+    extraction_method: str = Field(
+        default="none", description="Which extractor produced ``content``."
+    )
+    links_found: int = Field(
+        default=0,
+        description="In-scope, not-yet-seen links this page contributed to the frontier.",
+    )
+    injection: Optional[InjectionReport] = Field(
+        default=None,
+        description="Per-page advisory injection report (None when detection is disabled).",
+    )
+    error_message: Optional[str] = Field(
+        default=None, description="Why this page failed / was blocked, when it did."
+    )
+
+
+class CrawlResult(BaseModel):
+    """Result of :meth:`Recipes.crawl_site` -- a bounded same-site crawl.
+
+    Breadth-first within a single site (same host, or same registrable domain),
+    optionally SEEDED from ``sitemap.xml``, bounded by ``max_pages`` /
+    ``max_depth`` and the per-call budget. Every page is fetched through the
+    injected ``WebFetcher`` so all v1.7.0 safety gates apply; URLs are
+    deduplicated so a link graph with cycles never double-fetches.
+    """
+
+    start_url: str = Field(description="The URL the crawl started from.")
+    pages: list[CrawledPage] = Field(
+        default_factory=list, description="Per-page records, in visit order."
+    )
+    pages_crawled: int = Field(
+        default=0, description="Pages successfully fetched (== len(pages))."
+    )
+    urls_discovered: int = Field(
+        default=0, description="Total distinct in-scope URLs discovered (visited + frontier)."
+    )
+    max_depth_reached: int = Field(default=0, description="Deepest link depth actually fetched.")
+    total_content_length: int = Field(
+        default=0, description="Sum of content_length across crawled pages."
+    )
+    sitemap_used: bool = Field(
+        default=False, description="True when sitemap.xml was fetched and parsed for seeds."
+    )
+    sitemap_urls_seeded: int = Field(
+        default=0, description="Number of in-scope URLs seeded from sitemap.xml."
+    )
+    skipped_offsite: int = Field(
+        default=0, description="Links dropped for being outside the crawl scope."
+    )
+    skipped_disallowed: int = Field(
+        default=0,
+        description="In-scope URLs skipped because a fetch was BLOCKED (robots/domain/bot-wall).",
+    )
+    max_injection_risk: Optional[str] = Field(
+        default=None,
+        description=(
+            "Highest per-page advisory injection risk across crawled pages "
+            "(none<low<medium<high); None when detection was disabled."
+        ),
+    )
+    pages_with_injection: int = Field(
+        default=0,
+        description="Crawled pages whose advisory injection report scored above 'none'.",
+    )
+    stopped_reason: str = Field(
+        default="",
+        description=(
+            "Why the crawl stopped: 'max_pages' | 'max_depth' | 'frontier_empty' "
+            "| 'budget' | 'blocked' | 'error'."
+        ),
+    )
+    errors: list[str] = Field(
+        default_factory=list, description="Fatal issues that prevent the crawl from being usable."
+    )
+    warnings: list[str] = Field(
+        default_factory=list, description="Non-fatal issues (a blocked/failed page, a skip)."
+    )
+    diagnostics: list[FetchDiagnostic] = Field(
+        default_factory=list, description="Per-URL fetch outcomes for every page attempted."
+    )
+    correlation_id: Optional[str] = Field(default=None)
+    total_time_ms: float = Field(default=0.0)
+
+
+# ----------------------------------------------------------------------
+# v1.7.0 Wave 8: first-class headed login-handoff
+# ----------------------------------------------------------------------
+
+
+class LoginHandoffResult(BaseModel):
+    """Outcome of :meth:`Agent.login_handoff` -- "log in by hand, automate after".
+
+    Opens a HEADED browser session on a login URL, waits for a human to
+    complete authentication (2FA / CAPTCHA / SSO), then exports the session's
+    Playwright ``storage_state`` so a later headless run can rehydrate the login
+    via :meth:`Agent.import_session_state`. The wait ends when a success
+    condition is met (a URL substring appears, or a post-login selector
+    resolves) or the timeout elapses; ``storage_state`` is exported either way.
+    """
+
+    session_id: str = Field(
+        description="The headed session used for the handoff (created if not supplied)."
+    )
+    login_url: str = Field(description="The login URL the human was sent to.")
+    success_detected: bool = Field(
+        default=False,
+        description="True when a success condition was observed before the timeout.",
+    )
+    success_signal: Optional[str] = Field(
+        default=None,
+        description=(
+            "How the wait ended: 'url_match' | 'selector' (success observed) | "
+            "'timeout' (a condition was set but never met) | 'elapsed' (no "
+            "condition set -- waited the full window for the human)."
+        ),
+    )
+    storage_state_path: Optional[str] = Field(
+        default=None,
+        description="Absolute path of the exported storage_state file (confined to the download dir).",
+    )
+    saved: bool = Field(
+        default=False, description="True when the storage_state export succeeded."
+    )
+    cookie_count: int = Field(
+        default=0, description="Cookies captured in the exported state."
+    )
+    origin_count: int = Field(
+        default=0, description="Origins (localStorage buckets) captured in the exported state."
+    )
+    elapsed_s: float = Field(default=0.0, description="Seconds spent waiting for the human.")
+    message: str = Field(
+        default="", description="Human-readable outcome summary / next-step guidance."
+    )
+    error: Optional[str] = Field(
+        default=None, description="Populated when the handoff could not complete."
+    )
+    correlation_id: Optional[str] = Field(default=None)

@@ -20,7 +20,9 @@ It is built as a backend/tool for AI agents that must use the **real** web relia
 - **Prompt-injection containment** — hidden-from-humans content (invisible Unicode + `display:none`/off-screen DOM) is stripped before extraction; visible injection is flagged with an advisory risk rating.
 - **Token-efficient responses** — content-returning surfaces emit a single representation (markdown by default) with `offset` / `next_offset` paging instead of duplicated megabyte dumps.
 - **19 browser actions + set-of-marks targeting** — click / type / scroll / upload / drag / iframe / shadow-DOM and more; `observe()` returns numbered interactive elements you can act on by `ref` instead of guessing selectors.
-- **Persistent sessions + auth** — export/import a logged-in `storage_state`: a human logs in once (password / 2FA / CAPTCHA), the agent automates afterwards.
+- **Persistent sessions + auth** — export/import a logged-in `storage_state`, or use the one-call `login_handoff` helper: a human logs in once (password / 2FA / CAPTCHA / SSO) in a headed window, the agent automates afterwards.
+- **Change monitoring** — `snapshot_page` captures a page's normalized content; `diff_page` reports what changed since the last check (`changed` / `similarity` / added & removed lines), rolling the baseline forward only on a successful capture.
+- **Bounded same-site crawl** — `crawl_site` walks one site breadth-first within scope (optionally sitemap-seeded), every page through the full safety stack, with hard `max_pages` / `max_depth` ceilings so it can never run away.
 - **Pagination + infinite-scroll collection** — `collect_across_pages` walks `next_link` / `page_param` / `scroll` listings, re-gating safety on every page.
 - **PDF / XLSX / DOCX extraction** — `pdfplumber` tables + per-page markers, XLSX, and DOCX, all surfaced as markdown.
 - **Proxy + fingerprint coherence** — operator-controlled proxy (http/https/socks5) threaded through every Chromium and httpx path, with UA/OS/locale coherence.

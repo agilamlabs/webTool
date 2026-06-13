@@ -61,11 +61,15 @@ web_agent/             # The package. One module = one responsibility.
   web_fetcher.py       # WebFetcher.fetch / fetch_many / fetch_binary + challenge settle-recheck (v1.7.0)
   content_extractor.py # trafilatura -> bs4 -> raw, plus PDF (pdfplumber -> pypdf) + tables / XLSX; max_chars/offset slicing (v1.7.0)
   structured.py        # schema-guided field resolver: JSON-LD>OG>meta>microdata>DOM (v1.7.0)
+  monitoring.py        # snapshot/diff change-monitoring: normalize/hash/SnapshotStore/diff (v1.7.0)
+  crawl.py             # bounded same-site BFS crawler: extract_links + SiteCrawler (v1.7.0)
+  sitemap.py           # regex-only sitemap.xml parser (no XML-entity DoS) for crawl seeding (v1.7.0)
   downloader.py        # 3-strategy file download with safety gates
   browser_actions.py   # 19 action types incl. coord-click + iframe + shadow-DOM + upload + drag + scroll_to_bottom (v1.6.6 + v1.6.7 + v1.7.0)
-  recipes.py           # search_and_open_best_result, find_and_download_file,
-                       # web_research, fill_form_and_extract, collect_across_pages (v1.7.0)
-  session_manager.py   # Persistent browser sessions (cookies, storage) + storage_state export/import + idle reaper (v1.7.0)
+  recipes.py           # search_and_open_best_result, find_and_download_file, web_research,
+                       # fill_form_and_extract, collect_across_pages, extract_fields,
+                       # snapshot_page, diff_page, crawl_site (v1.7.0)
+  session_manager.py   # Persistent browser sessions + storage_state export/import + login_handoff + idle reaper (v1.7.0)
   tab_manager.py       # Per-session tab lifecycle (v1.6.6)
   doctor.py            # Self-diagnostic capability probes (v1.6.6)
   domain_skills.py     # Domain skill registry + dispatcher (v1.6.7)
@@ -92,7 +96,7 @@ tests/                 # All tests; mirrors the package layout 1:1
 
 ## Public API surface
 
-Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **135 names** as of v1.7.0):
+Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **142 names** as of v1.7.0):
 
 ```python
 from web_agent import (
@@ -467,21 +471,27 @@ path is injection-proof via `_REF_PATTERN.fullmatch`.
 gap-analysis pass adds 1 more — `redact_injection` (so the injection
 helpers are now five). Schema extraction adds `StructuredExtractionResult`;
 the CAPTCHA resolver hook adds 4 — `CaptchaContext`, `CaptchaResolution`,
-`CaptchaResolver`, `normalize_resolution` — so the root goes 118 → **135**.
+`CaptchaResolver`, `normalize_resolution`. Wave 8 adds 7 — models
+`PageSnapshot`, `SnapshotDiff`, `CrawledPage`, `CrawlResult`,
+`LoginHandoffResult` and sub-configs `MonitoringConfig`, `CrawlConfig` —
+so the root goes 118 → **142**.
 MCP tools: the waves added 9 (`web_search_links` + 5 session tools +
 `web_scroll_to_bottom` + `web_collect_pages` + `web_metrics`), the
 gap-fix pass removed 3 duplicate session tools (`create_browser_session`
-/ `close_browser_session` / `list_browser_sessions`), and schema
-extraction adds `web_extract_fields`; MCP server count ~39 → **45** (the
-CAPTCHA resolver hook adds NO tool — it is a Python-only hook, never over
-the wire). New sub-config `MetricsConfig` (Wave 4A) — `config.py` now has
-**15** `BaseSettings` sub-configs (was 14); `FetchConfig` also gains the
+/ `close_browser_session` / `list_browser_sessions`), schema
+extraction adds `web_extract_fields`, and Wave 8 adds 4 (`web_snapshot_page`
+/ `web_diff_page` / `web_crawl_site` / `web_login_handoff`); MCP server
+count ~39 → **49** (the CAPTCHA resolver hook adds NO tool — it is a
+Python-only hook, never over the wire). New sub-configs `MetricsConfig`
+(Wave 4A) + Wave 8's `MonitoringConfig` / `CrawlConfig` — `config.py` now
+has **17** `BaseSettings` sub-configs (was 14); `FetchConfig` also gains the
 `captcha_*` knobs. New modules `web_agent/metrics.py`,
-`web_agent/structured.py` (schema-guided field extraction:
-`Agent.extract_fields` / MCP `web_extract_fields` /
-`StructuredExtractionResult`), and `web_agent/captcha.py` (the resolver
-hook contract: `Agent(captcha_resolver=...)`). New optional dep:
-`pdfplumber` in the `[binary]` extra.
+`web_agent/structured.py`, `web_agent/captcha.py`, and the Wave-8 trio
+`web_agent/monitoring.py` (snapshot/diff change-monitoring:
+`Agent.snapshot_page` / `diff_page`), `web_agent/crawl.py` +
+`web_agent/sitemap.py` (bounded same-site crawl: `Agent.crawl_site`).
+`SessionManager.login_handoff` is the first-class headed-login front door.
+New optional dep: `pdfplumber` in the `[binary]` extra.
 
 **Tests.** ~1133 → **1579 passing** (28 `integration` deselected,
 opt-in). Earlier-wave files: `test_challenge_detection`,

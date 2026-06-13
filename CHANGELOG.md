@@ -380,6 +380,49 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
 - Like `llm_extractor`, the hook is a Python callable and is NEVER accepted over
   the MCP wire — it is configured in-process by whoever constructs the Agent.
 
+**Snapshot / diff change-monitoring** (new `web_agent/monitoring.py`)
+- Watch a page for changes without re-reading the whole thing each time.
+  `Agent.snapshot_page(url, label=...)` fetches + extracts through the normal
+  pipeline, NORMALIZES the main content (line endings / trailing whitespace /
+  blank-run churn removed so cosmetic changes don't register), hashes it, and
+  persists a `PageSnapshot` under a label (default: a hash of the URL).
+  `Agent.diff_page(url, label=...)` captures now, compares against the stored
+  baseline, and returns a `SnapshotDiff` (`changed` / `similarity` 0..1 / bounded
+  `added_lines` & `removed_lines` with full counts). With `update=True` (default)
+  the baseline rolls forward ONLY on a successful capture, so a transient fetch
+  failure never clobbers a good baseline, and repeated calls report change SINCE
+  THE PREVIOUS CHECK. MCP `web_snapshot_page` / `web_diff_page`. The
+  `SnapshotStore` is an atomic, path-confined JSON store (reuses `safe_join_path`;
+  a crafted label can't escape the dir). New `MonitoringConfig`
+  (`WEB_AGENT_MONITORING__`: `snapshot_dir` / `max_snapshot_chars` / `diff_max_lines`).
+
+**Bounded same-site crawl + sitemap seeding** (new `web_agent/crawl.py`, `sitemap.py`)
+- `Agent.crawl_site(start_url, ...)` walks a SINGLE site breadth-first within
+  scope (exact host by default; `same_registrable_domain=True` widens to
+  subdomains), optionally SEEDED from `/sitemap.xml`. Every page is fetched
+  through `WebFetcher.fetch` so robots / rate-limit / bot-wall / injection-
+  sanitize / SSRF re-gating all apply, and URLs are deduplicated so a cyclic
+  link graph never double-fetches. `max_pages` / `max_depth` are CLAMPED to the
+  `CrawlConfig` ceilings (a caller value can't make the crawl unbounded) and the
+  crawl also stops at `SafetyConfig.max_time_per_call_seconds`. `parse_sitemap`
+  is regex-only (no XML entity-expansion DoS), bounded by `sitemap_max_urls`,
+  with bounded sitemap-index fan-out. Returns a `CrawlResult` (per-page
+  `CrawledPage` records with depth, the injection rollup, sitemap stats, a
+  `stopped_reason`). MCP `web_crawl_site`. New `CrawlConfig` (`WEB_AGENT_CRAWL__`:
+  `max_pages` / `max_depth` / `same_registrable_domain` / `use_sitemap` /
+  `sitemap_max_urls` / `per_page_link_cap`).
+
+**First-class headed login-handoff** (`SessionManager.login_handoff`)
+- The single-call front door to the export/import auth primitives:
+  `Agent.login_handoff(login_url, storage_state_path, ...)` opens a HEADED session
+  on the login URL, waits for a human to finish authenticating (password / 2FA /
+  CAPTCHA / SSO) — detected by a `success_url_substring`, a `success_selector`, or
+  the full `timeout_s` window — then exports the session's `storage_state` so a
+  later headless run rehydrates the login via `import_session_state`. Requires
+  `browser.headless=False` to be useful (flagged in the result otherwise);
+  never raises (errors land in `LoginHandoffResult.error`). MCP
+  `web_login_handoff`.
+
 **New public surface (all additive)**
 - Waves 0–2F added 5 names — `ChallengeInfo`, `StorageStateResult`, `ProxyConfig`,
   `SearchEngine`, `SearchOutcome`. Wave 3 adds 7 more — `InjectionReport`,
@@ -389,21 +432,26 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   `MetricsConfig`, `InteractiveElement`. The gap-analysis pass adds 1 more —
   `redact_injection` (a fifth injection helper); schema extraction adds
   `StructuredExtractionResult`; the CAPTCHA resolver hook adds 4 more —
-  `CaptchaContext`, `CaptchaResolution`, `CaptchaResolver`, `normalize_resolution`
-  — bringing the package root from 118 to **135 exports**.
+  `CaptchaContext`, `CaptchaResolution`, `CaptchaResolver`, `normalize_resolution`.
+  Wave 8 adds 7 more — models `PageSnapshot`, `SnapshotDiff`, `CrawledPage`,
+  `CrawlResult`, `LoginHandoffResult` and sub-configs `MonitoringConfig`,
+  `CrawlConfig` — bringing the package root from 118 to **142 exports**.
 - Waves 0–2F added 6 MCP tools (`web_search_links` + the five session tools);
   Wave 3 adds 2 more (`web_scroll_to_bottom`, `web_collect_pages`); Wave 4 adds
   `web_metrics`. The gap-analysis pass then **removed 3 duplicate** session tools
   (`create_browser_session` / `close_browser_session` / `list_browser_sessions`);
-  schema extraction adds `web_extract_fields`; the MCP server tool count nets to
-  **45**.
-- New sub-config: `MetricsConfig` (Wave 4A) — `config.py` now has **15**
-  `BaseSettings` sub-configs (was 14). New modules `web_agent/metrics.py`,
-  `web_agent/structured.py`, and `web_agent/captcha.py`.
+  schema extraction adds `web_extract_fields`; Wave 8 adds 4 more
+  (`web_snapshot_page`, `web_diff_page`, `web_crawl_site`, `web_login_handoff`);
+  the MCP server tool count nets to **49**.
+- New sub-configs: `MetricsConfig` (Wave 4A) plus Wave 8's `MonitoringConfig` +
+  `CrawlConfig` — `config.py` now has **17** `BaseSettings` sub-configs (was 14).
+  New modules `web_agent/metrics.py`, `web_agent/structured.py`,
+  `web_agent/captcha.py`, `web_agent/monitoring.py`, `web_agent/crawl.py`, and
+  `web_agent/sitemap.py`.
 - New optional dependency: `pdfplumber` in the `[binary]` extra (Wave 3C).
 
 **Tests**
-- Suite went from ~1133 to **1627 passing** (28 `integration` deselected,
+- Suite went from ~1133 to **1740 passing** (28 `integration` deselected,
   opt-in). Earlier-wave files: `test_challenge_detection`,
   `test_failure_transparency`, `test_token_efficiency`, `test_lifecycle`,
   `test_auth_persistence`, `test_search_resilience`, `test_proxy_fingerprint`,
@@ -419,7 +467,11 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   `test_captcha_resolver` (33 tests — normalize coercion, the bounded
   attempt loop with authoritative re-detection, exception / timeout / recapture
   isolation, early concede, sync-hook event-loop-block warning, Agent wiring,
-  config bounds).
+  config bounds). Wave 8 adds `test_monitoring` (36), `test_crawl` (34),
+  `test_sitemap` (17), `test_login_handoff` (12), and `test_v8_wiring` (13 —
+  the snapshot/diff/crawl recipe glue + Agent delegations + the review-fix
+  regressions: off-scope child-sitemap skip, `max_depth` stop reason,
+  diff-on-failed-capture, poll-interval floor).
 
 ## [1.6.16] - 2026-06-02
 

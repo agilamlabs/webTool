@@ -75,15 +75,19 @@ from .models import (
     ActionStatus,
     AgentResult,
     CollectionResult,
+    CrawlResult,
     DownloadResult,
     ExtractionResult,
     FetchStatus,
     FormFilterSpec,
+    LoginHandoffResult,
     MetricsSnapshot,
+    PageSnapshot,
     ResearchResult,
     ScreenshotFormat,
     ScreenshotResult,
     SearchResponse,
+    SnapshotDiff,
     StructuredExtractionResult,
 )
 from .utils import safe_join_path
@@ -880,6 +884,64 @@ async def web_extract_fields(
 
 
 @mcp.tool()
+async def web_snapshot_page(
+    ctx: Context,
+    url: str,
+    label: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> PageSnapshot:
+    """Capture a page's normalized content as a stored SNAPSHOT for change monitoring.
+
+    Fetches + extracts ``url`` through the normal pipeline (SSRF / robots /
+    rate-limit / bot-wall / injection-sanitize all apply), normalizes the main
+    content (line endings / trailing whitespace / blank-run churn removed),
+    hashes it, and PERSISTS it under ``label`` (default: a hash of the URL) so a
+    later ``web_diff_page`` can detect what changed. Use this to start watching
+    a page (a price, a policy, a status board). A failed fetch is transparent
+    (``fetch_status`` / ``error_message``) and is not persisted.
+
+    Args:
+        url: Page to snapshot.
+        label: Stable key to store under (reuse the SAME label in web_diff_page).
+            Defaults to a hash of the URL.
+        session_id: Optional persistent browser session.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    return await agent.snapshot_page(url, label=label, session_id=session_id)
+
+
+@mcp.tool()
+async def web_diff_page(
+    ctx: Context,
+    url: str,
+    label: Optional[str] = None,
+    session_id: Optional[str] = None,
+    update: bool = True,
+) -> SnapshotDiff:
+    """Detect what CHANGED on a page since the last snapshot, then re-baseline.
+
+    Captures ``url`` now and diffs it against the snapshot stored by a prior
+    ``web_snapshot_page`` / ``web_diff_page`` under the same ``label`` (default:
+    a hash of the URL). Returns ``changed`` (hash differs), ``similarity``
+    (0..1), and bounded ``added_lines`` / ``removed_lines`` (with full
+    ``added_count`` / ``removed_count``). ``is_first_snapshot`` is true when
+    there is no baseline yet (nothing to compare -- it just records one). With
+    ``update`` true (default), a successful capture becomes the new baseline, so
+    repeated calls report change SINCE THE PREVIOUS CHECK -- ideal for polling a
+    page on a schedule.
+
+    Args:
+        url: Page to check for changes.
+        label: The key the baseline was stored under (must match the snapshot).
+        session_id: Optional persistent browser session.
+        update: Roll the baseline forward to this capture (default True). Pass
+            false to keep diffing against the SAME fixed baseline each call.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    return await agent.diff_page(url, label=label, session_id=session_id, update=update)
+
+
+@mcp.tool()
 async def web_fill_form_and_extract(
     ctx: Context,
     url: str,
@@ -1031,6 +1093,54 @@ async def web_import_session(ctx: Context, path: str, name: Optional[str] = None
     agent: Agent = ctx.request_context.lifespan_context["agent"]
     session_id = await agent.import_session_state(path, name=name)
     return {"session_id": session_id}
+
+
+@mcp.tool()
+async def web_login_handoff(
+    ctx: Context,
+    login_url: str,
+    storage_state_path: str,
+    session_id: Optional[str] = None,
+    success_url_substring: Optional[str] = None,
+    success_selector: Optional[str] = None,
+    timeout_s: float = 300.0,
+) -> LoginHandoffResult:
+    """One-call "log in by hand, automate afterwards" handoff (REQUIRES headed).
+
+    Opens ``login_url`` in a VISIBLE browser, waits for a human to finish
+    authenticating (password / 2FA / CAPTCHA / SSO), then exports the session's
+    storage_state to ``storage_state_path`` so a later run can reuse the login
+    via ``web_import_session``. The single front door to web_export_session.
+
+    REQUIRES the server to run with ``browser.headless=false`` and a human at
+    the machine -- there is no point calling this on a headless/remote server
+    (the returned ``message`` flags that case). The wait ends when a success
+    condition is met or ``timeout_s`` elapses; the state is exported either way.
+
+    Args:
+        login_url: The login page to open for the human.
+        storage_state_path: Filename (relative to the download dir) to save the
+            authenticated state to; traversal / absolute paths are rejected.
+        session_id: Reuse an existing session, or None to create one.
+        success_url_substring: Stop waiting once the page URL contains this
+            (e.g. "/dashboard").
+        success_selector: Stop waiting once this selector resolves (a
+            logged-in-only element).
+        timeout_s: Max seconds to wait for the human (default 300).
+
+    Returns:
+        A LoginHandoffResult with the session id, whether/how success was
+        detected, and the exported-state path + cookie/origin counts.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    return await agent.login_handoff(
+        login_url,
+        storage_state_path,
+        session_id=session_id,
+        success_url_substring=success_url_substring,
+        success_selector=success_selector,
+        timeout_s=timeout_s,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1571,6 +1681,61 @@ async def web_collect_pages(
         max_pages=max_pages,
         session_id=session_id,
         next_texts=next_texts,
+    )
+
+
+@mcp.tool()
+async def web_crawl_site(
+    ctx: Context,
+    start_url: str,
+    max_pages: Optional[int] = None,
+    max_depth: Optional[int] = None,
+    same_registrable_domain: Optional[bool] = None,
+    use_sitemap: Optional[bool] = None,
+    include: Optional[list[str]] = None,
+    exclude: Optional[list[str]] = None,
+    session_id: Optional[str] = None,
+) -> CrawlResult:
+    """Crawl a SINGLE SITE breadth-first within bounds (optionally sitemap-seeded).
+
+    Use this to gather many pages of one site (a docs set, a small section, a
+    product category) by following in-scope links from ``start_url`` -- not for
+    a single listing (use ``web_collect_pages``) or the whole web. Every page is
+    fetched through the normal pipeline (robots, rate limiting, bot-wall
+    detection, injection-sanitize, SSRF gating all apply) and URLs are
+    deduplicated so cycles never double-fetch.
+
+    SCOPE + BOUNDS: by default the crawl stays on the EXACT host of ``start_url``
+    (set ``same_registrable_domain=true`` to include subdomains of the same
+    registrable domain). ``max_pages`` / ``max_depth`` are CLAMPED to the
+    server's CrawlConfig ceilings so the crawl is always bounded; it also stops
+    at ``SafetyConfig.max_time_per_call_seconds``. With ``use_sitemap`` (default
+    on), the frontier is seeded from ``/sitemap.xml`` when reachable.
+
+    Args:
+        start_url: Seed URL; its host (or registrable domain) defines scope.
+        max_pages: Page cap (default + ceiling from CrawlConfig.max_pages).
+        max_depth: Link-depth cap from the start URL (default + ceiling from config).
+        same_registrable_domain: Include same-domain subdomains in scope.
+        use_sitemap: Seed from sitemap.xml (default per config).
+        include / exclude: Optional regex lists; a URL must match an include
+            (if any) and not match any exclude.
+        session_id: Optional persistent browser session.
+
+    Returns:
+        CrawlResult with pages[] (per-page url/depth/title/content/status),
+        counts, sitemap stats, the injection rollup, and a stopped_reason.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    return await agent.crawl_site(
+        start_url,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        same_registrable_domain=same_registrable_domain,
+        use_sitemap=use_sitemap,
+        include=include,
+        exclude=exclude,
+        session_id=session_id,
     )
 
 
