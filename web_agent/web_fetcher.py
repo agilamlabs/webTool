@@ -1,11 +1,18 @@
 """URL navigation, page rendering, and retry logic for fetching web pages.
 
-Handles four common failure modes intelligently:
+Handles five common failure modes intelligently:
 
 - **Download URLs** (.pdf, .doc, etc.) -- detected immediately without retrying.
 - **networkidle timeouts** -- automatically fall back to ``load`` wait state.
 - **HTTP 4xx** -- fail fast (non-retryable).
 - **Domain not allowed** -- short-circuit with ``BLOCKED`` status.
+- **Bot-challenge walls (v1.7.0)** -- Cloudflare / DataDome / Akamai /
+  PerimeterX / CAPTCHA interstitials are detected structurally (even when
+  served with HTTP 200), given a bounded auto-settle chance when they are
+  managed JS challenges, and otherwise surfaced honestly as
+  ``FetchStatus.BLOCKED`` with ``FetchResult.challenge`` + actionable
+  guidance -- never returned as SUCCESS-with-garbage-HTML and never
+  retried into the same wall.
 
 Optional features:
 - ``session_id`` reuses a persistent browser session for cookie continuity.
@@ -16,7 +23,7 @@ Optional features:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -28,10 +35,11 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from .browser_manager import BrowserManager
 from .cache import Cache
+from .challenge import CHALLENGE_CONFIDENCE_ACTION_THRESHOLD, detect_challenge
 from .config import AppConfig
 from .correlation import get_correlation_id
 from .debug import DebugCapture
-from .models import FetchResult, FetchStatus
+from .models import ChallengeInfo, FetchResult, FetchStatus, HtmlCaptureSource
 from .rate_limiter import RateLimiter
 from .robots import RobotsChecker
 from .session_manager import SessionManager
@@ -175,6 +183,38 @@ def _disposition_is_attachment(disposition: str | None) -> bool:
     if not disposition:
         return False
     return "attachment" in disposition.lower()
+
+
+# v1.7.0: HTTP statuses whose fast-fail path is worth sniffing for a bot
+# challenge before giving up. 403 + 503 are the canonical Cloudflare /
+# vendor challenge statuses; 429 is deliberately excluded -- it already
+# has dedicated Retry-After / rate-limiter handling in the fetch path.
+_CHALLENGE_SNIFF_STATUS_CODES: frozenset[int] = frozenset({403, 503})
+
+
+def _response_headers(response: Any) -> dict[str, str]:
+    """Best-effort lowercase-keyed header dict from a Playwright Response.
+
+    ``Response.headers`` is a sync property in the async API (header names
+    already lowercased by Playwright). Defensive against mocks / odd
+    transports: anything that isn't a real mapping yields ``{}`` -- header
+    evidence is an enrichment for challenge detection, never load-bearing.
+    """
+    if response is None:
+        return {}
+    try:
+        raw = response.headers
+    except Exception:  # pragma: no cover -- defensive
+        return {}
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        try:
+            out[str(key).lower()] = str(value)
+        except Exception:  # pragma: no cover -- defensive
+            continue
+    return out
 
 
 # Common HTML page extensions. URLs with these extensions are clearly
@@ -711,22 +751,52 @@ class WebFetcher:
                     status_code=status_code,
                 )
 
-            if status_code and status_code in cfg.non_retryable_status_codes:
-                raise NonRetryableHTTPError(status_code, url)
-            if status_code == 429:
-                # v1.6.12: signal the rate limiter (extends next_allowed
-                # so the next ``acquire(host)`` waits Retry-After or
-                # fallback) then raise a retryable Exception so
-                # ``async_retry`` retries with the new wait honoured.
-                # Helper shared with ``fetch_binary``.
-                host = urlparse(url).hostname or ""
-                retry_after = self._signal_429(response, url, host)
-                raise Exception(
-                    f"HTTP 429 Too Many Requests for {url}"
-                    + (f" (Retry-After: {retry_after}s)" if retry_after is not None else "")
+            # v1.7.0: bot-wall sniff on the HTTP-error fast-fail path. A
+            # 403/503 whose body is a managed JS challenge (Cloudflare et
+            # al.) is auto-passable by a real browser in a few seconds --
+            # give it a bounded settle-recheck chance BEFORE fast-failing.
+            # Outcomes:
+            #   - FetchResult   -> still challenged after the settle budget:
+            #     return BLOCKED. A determination, NOT an exception --
+            #     raising would send async_retry re-navigating into the
+            #     same wall.
+            #   - ChallengeInfo -> the challenge auto-settled: skip the
+            #     error raises below; the page now shows real content and
+            #     the normal success tail captures it.
+            #   - None          -> no actionable challenge: the original
+            #     fast-fail semantics apply unchanged.
+            settled_challenge: Optional[ChallengeInfo] = None
+            if (
+                cfg.challenge_detection_enabled
+                and status_code is not None
+                and status_code in _CHALLENGE_SNIFF_STATUS_CODES
+            ):
+                outcome = await self._challenge_outcome_for_error_status(
+                    page, url, response, status_code
                 )
-            if status_code and status_code >= 500:
-                raise Exception(f"Server error HTTP {status_code}")
+                if isinstance(outcome, FetchResult):
+                    return outcome
+                settled_challenge = outcome
+                if settled_challenge is not None:
+                    final_url = self._recheck_url_after_settle(page, url, status_code)
+
+            if settled_challenge is None:
+                if status_code and status_code in cfg.non_retryable_status_codes:
+                    raise NonRetryableHTTPError(status_code, url)
+                if status_code == 429:
+                    # v1.6.12: signal the rate limiter (extends next_allowed
+                    # so the next ``acquire(host)`` waits Retry-After or
+                    # fallback) then raise a retryable Exception so
+                    # ``async_retry`` retries with the new wait honoured.
+                    # Helper shared with ``fetch_binary``.
+                    host = urlparse(url).hostname or ""
+                    retry_after = self._signal_429(response, url, host)
+                    raise Exception(
+                        f"HTTP 429 Too Many Requests for {url}"
+                        + (f" (Retry-After: {retry_after}s)" if retry_after is not None else "")
+                    )
+                if status_code and status_code >= 500:
+                    raise Exception(f"Server error HTTP {status_code}")
 
             if cfg.wait_for_selector:
                 await page.wait_for_selector(cfg.wait_for_selector, timeout=10000)
@@ -748,6 +818,42 @@ class WebFetcher:
                     "FetchResult.html will be empty",
                     url=url,
                 )
+
+            # v1.7.0: bot-wall honesty on the nominal-success path. Vendors
+            # routinely serve challenge interstitials WITH HTTP 200; before
+            # v1.7.0 that garbage HTML came back as SUCCESS and got
+            # extracted as if it were content. Detect structurally, give
+            # auto-settle-likely challenges the bounded settle-recheck, and
+            # return an honest BLOCKED when the wall persists. Detections
+            # below the action threshold (e.g. an embedded CAPTCHA widget
+            # on a normal page) ride along as an advisory on the SUCCESS
+            # result. Skipped when the 403/503 sniff above already settled
+            # a challenge this navigation (its budget is spent).
+            challenge_note: Optional[ChallengeInfo] = settled_challenge
+            if cfg.challenge_detection_enabled and settled_challenge is None:
+                detected = detect_challenge(
+                    html, status_code, _response_headers(response), final_url
+                )
+                if detected is not None:
+                    if detected.confidence >= CHALLENGE_CONFIDENCE_ACTION_THRESHOLD:
+                        still: Optional[ChallengeInfo] = detected
+                        if detected.auto_settle_likely and cfg.challenge_max_rechecks > 0:
+                            still, html, html_capture_source = await self._settle_challenge(
+                                page, url, detected, html, html_capture_source
+                            )
+                        if still is not None:
+                            return self._blocked_challenge_result(
+                                url=url,
+                                final_url=page.url or final_url,
+                                status_code=status_code,
+                                html=html,
+                                info=still,
+                            )
+                        # Cleared: the page re-navigated to real content.
+                        challenge_note = detected
+                        final_url = self._recheck_url_after_settle(page, url, status_code)
+                    else:
+                        challenge_note = detected
 
             # v1.6.12: true DOM parse time = ``domInteractive -
             # responseEnd`` (time from "response fully received" to
@@ -832,6 +938,7 @@ class WebFetcher:
                 dom_parse_ms=dom_parse_ms,
                 total_bytes_downloaded=total_bytes_downloaded,
                 html_capture_source=html_capture_source,
+                challenge=challenge_note,
             )
         except Exception as exc:
             # Capture debug artifacts on any failure path before re-raising
@@ -839,6 +946,193 @@ class WebFetcher:
                 artifacts = await self._debug.capture_page(page, exc, "fetch", context={"url": url})
                 debug_artifacts.extend(artifacts)
             raise
+
+    # ------------------------------------------------------------------
+    # v1.7.0: bot-challenge detection + bounded auto-settle
+    # ------------------------------------------------------------------
+
+    def _recheck_url_after_settle(
+        self, page: Page, url: str, status_code: Optional[int]
+    ) -> str:
+        """Re-validate ``page.url`` after a challenge cleared.
+
+        Passing a challenge usually re-navigates the page; the redirect
+        safety gate earlier in ``_navigate_and_extract`` only saw the
+        interstitial URL, so re-check the post-settle URL against the
+        domain policy (defense-in-depth, mirrors the existing redirect
+        gate -- including its retryable :class:`NavigationError`).
+        """
+        final_url: str = page.url
+        if final_url != url and not check_domain_allowed(final_url, self._config.safety):
+            from .exceptions import NavigationError
+
+            raise NavigationError(
+                f"Page redirected to disallowed URL after challenge settle: {final_url}",
+                url=final_url,
+                status_code=status_code,
+            )
+        return final_url
+
+    async def _settle_challenge(
+        self,
+        page: Page,
+        url: str,
+        info: ChallengeInfo,
+        html: str,
+        capture_source: HtmlCaptureSource,
+    ) -> tuple[Optional[ChallengeInfo], str, HtmlCaptureSource]:
+        """Bounded settle-and-recheck loop for an auto-settle-likely wall.
+
+        Sleeps :attr:`FetchConfig.challenge_settle_ms` then re-captures the
+        live page via :func:`safe_page_content` and re-runs detection, up
+        to :attr:`FetchConfig.challenge_max_rechecks` rounds. Re-detection
+        passes ``status_code=None`` on purpose: the original HTTP status
+        belonged to the interstitial, and letting a stale 403 inflate the
+        confidence of residual weak markers (e.g. a Turnstile widget on
+        the real page) would mis-block a successful recovery.
+
+        Returns:
+            ``(None, html, source)`` once the challenge cleared (``html``
+            is the post-settle capture), or
+            ``(still_challenged_info, last_html, last_source)`` when the
+            recheck budget is exhausted or the page became uncapturable
+            mid-settle. Never raises.
+        """
+        cfg = self._config.fetch
+        current = info
+        for recheck in range(1, cfg.challenge_max_rechecks + 1):
+            await asyncio.sleep(cfg.challenge_settle_ms / 1000)
+            try:
+                html, capture_source = await safe_page_content(page)
+            except Exception as exc:
+                logger.debug(
+                    "Challenge settle recheck {n}/{total} could not capture "
+                    "content for {url}: {e}",
+                    n=recheck,
+                    total=cfg.challenge_max_rechecks,
+                    url=url,
+                    e=exc,
+                )
+                return current, html, capture_source
+            redetected = detect_challenge(html, None, None, page.url)
+            if (
+                redetected is None
+                or redetected.confidence < CHALLENGE_CONFIDENCE_ACTION_THRESHOLD
+            ):
+                logger.info(
+                    "Bot challenge ({vendor}/{kind}) auto-settled for {url} "
+                    "after {n} recheck(s) (~{ms}ms waited)",
+                    vendor=current.vendor,
+                    kind=current.kind,
+                    url=url,
+                    n=recheck,
+                    ms=recheck * cfg.challenge_settle_ms,
+                )
+                return None, html, capture_source
+            current = redetected
+        logger.debug(
+            "Bot challenge for {url} did not settle after {n} recheck(s)",
+            url=url,
+            n=cfg.challenge_max_rechecks,
+        )
+        return current, html, capture_source
+
+    async def _challenge_outcome_for_error_status(
+        self,
+        page: Page,
+        url: str,
+        response: Any,
+        status_code: int,
+    ) -> FetchResult | ChallengeInfo | None:
+        """Sniff a 403/503 body for a bot wall before fast-failing.
+
+        Pre-v1.7.0 these statuses fast-failed without ever looking at the
+        rendered body -- even when it was a managed JS challenge that a
+        real browser auto-passes in ~3-5s.
+
+        Returns:
+            - ``None``: no actionable challenge (capture failed, nothing
+              detected, or confidence below the action threshold) -- the
+              caller proceeds with the original fast-fail raise.
+            - :class:`ChallengeInfo`: challenge detected AND it settled
+              within the recheck budget -- the caller skips the error
+              raises and proceeds to the normal success tail.
+            - :class:`FetchResult`: challenge detected and still standing
+              -- an honest BLOCKED result the caller returns as-is.
+        """
+        try:
+            html, capture_source = await safe_page_content(page)
+        except Exception as exc:
+            logger.debug(
+                "Challenge sniff could not capture HTTP {code} body for {url}: {e}",
+                code=status_code,
+                url=url,
+                e=exc,
+            )
+            return None
+        info = detect_challenge(html, status_code, _response_headers(response), page.url)
+        if info is None or info.confidence < CHALLENGE_CONFIDENCE_ACTION_THRESHOLD:
+            return None
+        if info.auto_settle_likely and self._config.fetch.challenge_max_rechecks > 0:
+            still, html, capture_source = await self._settle_challenge(
+                page, url, info, html, capture_source
+            )
+            if still is None:
+                return info
+            info = still
+        return self._blocked_challenge_result(
+            url=url,
+            final_url=page.url or url,
+            status_code=status_code,
+            html=html,
+            info=info,
+        )
+
+    def _blocked_challenge_result(
+        self,
+        *,
+        url: str,
+        final_url: str,
+        status_code: Optional[int],
+        html: str,
+        info: ChallengeInfo,
+    ) -> FetchResult:
+        """Build the honest BLOCKED result for a standing bot wall.
+
+        The interstitial HTML rides along for diagnostics (it is NOT page
+        content). ``error_message`` carries actionable guidance for the
+        calling LLM. Callers RETURN this result -- never raise it into
+        ``async_retry`` -- so a blocked fetch doesn't burn re-navigations
+        into the same wall; and ``fetch()`` only caches SUCCESS, so a
+        BLOCKED determination can never poison the cache.
+        """
+        guidance = (
+            f"Blocked by {info.vendor} {info.kind} "
+            f"(confidence {info.confidence:.2f}). Do not retry immediately. "
+            "Options: (1) retry after 60s or more, (2) reuse an "
+            "authenticated/named browser profile session that has passed "
+            "this site's checks before, (3) escalate to a human via a "
+            "headed login handoff, (4) try an alternative source for the "
+            "same information."
+        )
+        logger.warning(
+            "Bot challenge blocked fetch of {url}: vendor={vendor} kind={kind} "
+            "confidence={conf} evidence={evidence}",
+            url=url,
+            vendor=info.vendor,
+            kind=info.kind,
+            conf=info.confidence,
+            evidence=info.evidence,
+        )
+        return FetchResult(
+            url=url,
+            final_url=final_url or url,
+            status_code=status_code,
+            status=FetchStatus.BLOCKED,
+            html=html or None,
+            challenge=info,
+            error_message=guidance,
+        )
 
     async def fetch_many(
         self,

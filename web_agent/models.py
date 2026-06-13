@@ -164,6 +164,79 @@ class NetworkEvent(BaseModel):
     correlation_id: Optional[str] = Field(default=None)
 
 
+# v1.7.0: single source of truth for the bot-challenge vendor / kind
+# literal values shared between :class:`ChallengeInfo` and the detector in
+# ``web_agent.challenge`` (mirrors the ``HtmlCaptureSource`` pattern above:
+# models.py is the leaf module, so the natural import direction holds).
+ChallengeVendor = Literal[
+    "cloudflare", "datadome", "akamai", "perimeterx", "generic_captcha", "unknown"
+]
+ChallengeKind = Literal["js_challenge", "captcha", "block_page", "rate_limit"]
+
+
+class ChallengeInfo(BaseModel):
+    """v1.7.0: structural fingerprint of a bot-challenge / CAPTCHA interstitial.
+
+    Produced by :func:`web_agent.challenge.detect_challenge` from
+    high-precision STRUCTURAL markers (challenge-platform script URLs,
+    vendor tokens, interstitial titles) -- never from prose, so an
+    article that merely mentions "Cloudflare" cannot trigger it.
+    Surfaced on :attr:`FetchResult.challenge`:
+
+    - ``status=BLOCKED`` + ``challenge`` set: the wall did not clear
+      within the bounded settle budget; ``FetchResult.html``, when
+      present, is the interstitial markup (diagnostics only -- NOT page
+      content).
+    - ``status=SUCCESS`` + ``challenge`` set: either the challenge
+      auto-settled (content was captured after recovery) or the
+      detection was a sub-threshold advisory (e.g. an embedded CAPTCHA
+      widget on an otherwise normal page).
+    """
+
+    vendor: ChallengeVendor = Field(
+        description=(
+            "Bot-mitigation vendor identified from structural markers: "
+            "'cloudflare' | 'datadome' | 'akamai' | 'perimeterx' | "
+            "'generic_captcha' (hCaptcha/reCAPTCHA gate without a known "
+            "vendor wrapper) | 'unknown' (denial interstitial with no "
+            "vendor fingerprint)."
+        ),
+    )
+    kind: ChallengeKind = Field(
+        description=(
+            "Challenge mechanics: 'js_challenge' (managed JS check a real "
+            "browser typically auto-passes in a few seconds) | 'captcha' "
+            "(interactive -- requires a human) | 'block_page' (hard deny, "
+            "nothing to wait for) | 'rate_limit' (HTTP 429 wearing "
+            "challenge markers)."
+        ),
+    )
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Detection confidence in [0, 1]. Status-weighted: 403/429/503 "
+            "plus any marker or HTTP 200 plus a strong marker score high "
+            "(>= 0.85); HTTP 200 plus a single weak marker scores medium "
+            "(~0.5). The fetcher only ACTS (BLOCKED / settle-recheck) at "
+            ">= 0.7 (web_agent.challenge.CHALLENGE_CONFIDENCE_ACTION_"
+            "THRESHOLD); lower values are advisory."
+        ),
+    )
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="Matched structural markers (capped at 5), for explainability.",
+    )
+    auto_settle_likely: bool = Field(
+        default=False,
+        description=(
+            "True when waiting briefly and re-reading the page is likely "
+            "to clear the wall without human help (Cloudflare managed JS "
+            "challenges). False for CAPTCHAs, block pages, and rate limits."
+        ),
+    )
+
+
 class FetchResult(BaseModel):
     """Result of fetching a URL, before content extraction."""
 
@@ -282,6 +355,21 @@ class FetchResult(BaseModel):
             "(search-derived)."
         ),
     )
+    challenge: Optional[ChallengeInfo] = Field(
+        default=None,
+        description=(
+            "v1.7.0: bot-challenge fingerprint when an anti-bot wall was "
+            "detected during this fetch (see ChallengeInfo). With "
+            "status=BLOCKED the wall did not clear -- ``html``, when "
+            "present, is the interstitial markup kept for diagnostics, "
+            "NOT page content. With status=SUCCESS the challenge "
+            "auto-settled (``status_code`` may still reflect the "
+            "interstitial's original HTTP status, e.g. 403) or the "
+            "detection was sub-threshold advisory (e.g. an embedded "
+            "CAPTCHA widget on a normal page). None when nothing was "
+            "detected or FetchConfig.challenge_detection_enabled=False."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_html_binary_exclusive(self) -> FetchResult:
@@ -352,6 +440,99 @@ class ExtractionResult(BaseModel):
     )
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: Optional[str] = Field(default=None)
+    # ------------------------------------------------------------------
+    # v1.7.0 failure transparency: carried from the source FetchResult /
+    # recipe stage so callers (especially LLMs behind MCP) can distinguish
+    # WHY an extraction is empty (403 bot-wall vs robots-disallowed vs
+    # timeout vs blocked domain vs form-step failure) and self-correct.
+    # All optional/defaulted -- pre-v1.7.0 constructors keep working.
+    # ------------------------------------------------------------------
+    fetch_status: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.7.0: FetchStatus VALUE of the underlying fetch as a plain "
+            "string (e.g. 'success' | 'timeout' | 'http_error' | "
+            "'network_error' | 'blocked' -- the value set may grow). "
+            "Populated when the fetch did not succeed (and on selected "
+            "diagnostic paths); None when extraction ran on a successful "
+            "fetch via the pre-v1.7.0 happy path."
+        ),
+    )
+    status_code: Optional[int] = Field(
+        default=None,
+        description=(
+            "v1.7.0: HTTP status code of the underlying fetch when one was "
+            "received (403, 404, 429, 500, ...). None when the failure "
+            "happened before any HTTP response (DNS error, robots block, "
+            "domain block, timeout)."
+        ),
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.7.0: actionable description of why extraction produced no "
+            "(or degraded) content, with next-step phrasing (e.g. "
+            "'robots.txt forbids fetching this path; do not retry this "
+            "URL'). None on success."
+        ),
+    )
+    failure_stage: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.7.0: pipeline stage that failed: 'navigation' | "
+            "'query_fill' | 'filter_fill' | 'submit' | 'wait_for' | "
+            "'ssrf_redirect' | 'capture' | 'fetch'. The form-interaction "
+            "stages are emitted by fill_form_and_extract; 'fetch' covers "
+            "every plain fetch+extract failure. None on success."
+        ),
+    )
+    # ------------------------------------------------------------------
+    # v1.7.0 token efficiency: content-window (slicing) metadata. Set when
+    # a caller passed max_chars/offset (Python API) or when the MCP
+    # boundary applied ExtractionConfig.default_max_chars.
+    # ------------------------------------------------------------------
+    truncated: bool = Field(
+        default=False,
+        description=(
+            "v1.7.0: True when the returned content is a slice of a larger "
+            "extraction (window cap hit, or the safety char cap fired). "
+            "When next_offset is set, the remainder can be fetched by "
+            "calling again with offset=next_offset."
+        ),
+    )
+    total_content_chars: Optional[int] = Field(
+        default=None,
+        description=(
+            "v1.7.0: total character count of the full extracted text "
+            "BEFORE windowing (the primary representation that was "
+            "sliced). None when no windowing/cap was applied."
+        ),
+    )
+    content_offset: int = Field(
+        default=0,
+        description=(
+            "v1.7.0: character offset (into the full extracted text) at "
+            "which the returned content window starts. 0 unless the "
+            "caller requested a continuation offset."
+        ),
+    )
+    next_offset: Optional[int] = Field(
+        default=None,
+        description=(
+            "v1.7.0: offset to pass on the next call to continue reading. "
+            "None when the returned window reaches the end of the content "
+            "(nothing more to fetch)."
+        ),
+    )
+    truncation_hint: Optional[str] = Field(
+        default=None,
+        description=(
+            "v1.7.0: one-line human/LLM-readable continuation hint set at "
+            "the MCP boundary when the content was truncated, e.g. "
+            "'content truncated at 40000 of 183000 chars; call this tool "
+            "again with offset=40000 to continue'. None when not truncated."
+        ),
+    )
 
 
 class CdpConnectionInfo(BaseModel):
@@ -458,7 +639,9 @@ class FetchDiagnostic(BaseModel):
             "'domain_blocked' | 'robots_disallowed' | 'rate_limited' | "
             "'timeout' | 'http_error' | 'network_error' | "
             "'download_skipped' | 'binary_not_extracted' (v1.6.10) | "
-            "'not_extractable_kind' (v1.6.11) | None"
+            "'not_extractable_kind' (v1.6.11) | 'bot_challenge' (v1.7.0 -- "
+            "the fetch hit a bot-mitigation wall; see "
+            "FetchResult.challenge for the vendor/kind fingerprint) | None"
         ),
     )
     content_length: int = Field(

@@ -35,6 +35,9 @@ def _persistent_pw_mocks() -> tuple[MagicMock, MagicMock, MagicMock]:
             "set_default_navigation_timeout",
             "new_page",
             "cookies",
+            # v1.7.0: crash-recovery wiring registers a "close" listener
+            # on the persistent context via ctx.on(...).
+            "on",
         ],
     )
     fake_ctx.browser = fake_browser
@@ -66,13 +69,14 @@ async def test_named_profile_dispatches_to_launch_persistent_context(
         ),
     )
     bm = BrowserManager(cfg)
+    bm._apply_stealth = AsyncMock()  # v1.7.0: stealth applied per-context; keep off the mock
 
     fake_ctx, fake_chromium, fake_pw = _persistent_pw_mocks()
     fake_cm = MagicMock()
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
 
     fake_chromium.launch_persistent_context.assert_awaited_once()
@@ -87,12 +91,16 @@ async def test_named_profile_dispatches_to_launch_persistent_context(
 
 
 @pytest.mark.asyncio
-async def test_ephemeral_profile_still_uses_launch_not_persistent(
+async def test_ephemeral_profile_uses_launch_persistent_context(
     tmp_path: Path,
 ) -> None:
-    """Sanity check: ephemeral isolation MUST use chromium.launch with
-    --user-data-dir, not launch_persistent_context. We don't want the
-    refactor to regress ephemeral behavior."""
+    """v1.7.0: ephemeral isolation now ALSO dispatches to
+    launch_persistent_context. Playwright >= 1.5x rejects a
+    --user-data-dir CLI arg on chromium.launch (the bug this refactor
+    fixes), so both isolation flavors pass user_data_dir as a kwarg. The
+    ephemeral root context is held as _ephemeral_root_context (NOT the
+    named _persistent_context slot); per-session contexts are still fresh
+    incognito contexts spun from root.browser, preserving isolation."""
     cfg = AppConfig(
         browser=BrowserConfig(
             isolation_mode=True,
@@ -105,10 +113,13 @@ async def test_ephemeral_profile_still_uses_launch_not_persistent(
 
     fake_browser = MagicMock(name="Browser")
     fake_browser.close = AsyncMock()
+    fake_root_ctx = MagicMock(name="EphemeralRootContext")
+    fake_root_ctx.browser = fake_browser
+    fake_root_ctx.close = AsyncMock()
     fake_chromium = MagicMock(name="chromium")
-    fake_chromium.launch = AsyncMock(return_value=fake_browser)
-    fake_chromium.launch_persistent_context = AsyncMock(
-        side_effect=AssertionError("launch_persistent_context must NOT be called for ephemeral")
+    fake_chromium.launch_persistent_context = AsyncMock(return_value=fake_root_ctx)
+    fake_chromium.launch = AsyncMock(
+        side_effect=AssertionError("ephemeral isolation must use launch_persistent_context")
     )
     fake_pw = MagicMock(name="Playwright")
     fake_pw.chromium = fake_chromium
@@ -116,12 +127,13 @@ async def test_ephemeral_profile_still_uses_launch_not_persistent(
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
 
-    fake_chromium.launch.assert_awaited_once()
-    fake_chromium.launch_persistent_context.assert_not_awaited()
+    fake_chromium.launch_persistent_context.assert_awaited_once()
+    fake_chromium.launch.assert_not_awaited()
     assert bm._persistent_context is None
+    assert bm._ephemeral_root_context is fake_root_ctx
 
 
 @pytest.mark.asyncio
@@ -139,13 +151,14 @@ async def test_build_context_returns_no_close_proxy_for_named_profile(
         ),
     )
     bm = BrowserManager(cfg)
+    bm._apply_stealth = AsyncMock()  # v1.7.0: stealth applied per-context; keep off the mock
 
     fake_ctx, _, fake_pw = _persistent_pw_mocks()
     fake_cm = MagicMock()
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
 
     ctx = await bm._build_context()
@@ -167,13 +180,14 @@ async def test_no_close_proxy_close_is_noop(tmp_path: Path) -> None:
         ),
     )
     bm = BrowserManager(cfg)
+    bm._apply_stealth = AsyncMock()  # v1.7.0: stealth applied per-context; keep off the mock
 
     fake_ctx, _, fake_pw = _persistent_pw_mocks()
     fake_cm = MagicMock()
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
 
     proxy = await bm._build_context()
@@ -195,13 +209,14 @@ async def test_stop_closes_persistent_context_first(tmp_path: Path) -> None:
         ),
     )
     bm = BrowserManager(cfg)
+    bm._apply_stealth = AsyncMock()  # v1.7.0: stealth applied per-context; keep off the mock
 
     fake_ctx, _, fake_pw = _persistent_pw_mocks()
     fake_cm = MagicMock()
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
         await bm.stop()
 
@@ -226,13 +241,14 @@ async def test_proxy_supports_async_context_manager_protocol(tmp_path: Path) -> 
         ),
     )
     bm = BrowserManager(cfg)
+    bm._apply_stealth = AsyncMock()  # v1.7.0: stealth applied per-context; keep off the mock
 
     fake_ctx, _, fake_pw = _persistent_pw_mocks()
     fake_cm = MagicMock()
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
 
     proxy = await bm._build_context()
@@ -255,6 +271,7 @@ async def test_proxy_forwards_attribute_access(tmp_path: Path) -> None:
         ),
     )
     bm = BrowserManager(cfg)
+    bm._apply_stealth = AsyncMock()  # v1.7.0: stealth applied per-context; keep off the mock
 
     fake_ctx, _, fake_pw = _persistent_pw_mocks()
     fake_ctx.new_page = AsyncMock(return_value=MagicMock())
@@ -262,7 +279,7 @@ async def test_proxy_forwards_attribute_access(tmp_path: Path) -> None:
     fake_cm.__aenter__ = AsyncMock(return_value=fake_pw)
     fake_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(bm._stealth, "use_async", return_value=fake_cm):
+    with patch("web_agent.browser_manager.async_playwright", return_value=fake_cm):
         await bm.start()
 
     proxy = await bm._build_context()

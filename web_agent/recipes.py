@@ -51,6 +51,26 @@ from .web_fetcher import (
     is_extractable_binary_kind,
 )
 
+
+def _selector_desc(sel: object) -> str:
+    """v1.7.0: short human-readable description of a SelectorLike.
+
+    Used only in ``fill_form_and_extract`` failure messages so the caller
+    learns WHICH locator failed (CSS string verbatim; LocatorSpec as its
+    non-None fields).
+    """
+    if isinstance(sel, str):
+        return repr(sel)
+    dump = getattr(sel, "model_dump", None)
+    if callable(dump):
+        try:
+            fields = {k: v for k, v in dump().items() if v is not None}
+            return repr(fields)
+        except (TypeError, ValueError):  # pragma: no cover -- defensive
+            pass
+    return repr(sel)
+
+
 # Domains that get a small relevance bonus in the default ranker
 _WELL_KNOWN_DOMAINS = (
     "wikipedia.org",
@@ -857,6 +877,11 @@ class Recipes:
         Returns:
             ExtractionResult. On failure (timeout, locator not found, blocked
             domain) returns an ExtractionResult with ``extraction_method="none"``.
+            v1.7.0: every failure exit also populates ``failure_stage``
+            ('navigation' | 'query_fill' | 'filter_fill' | 'submit' |
+            'wait_for' | 'ssrf_redirect' | 'capture') and an actionable
+            ``error_message`` naming the failed selector/stage, so callers
+            can self-correct instead of guessing at opaque emptiness.
         """
         if self._bm is None:
             raise RuntimeError(
@@ -866,7 +891,16 @@ class Recipes:
         if not check_domain_allowed(url, self._config.safety):
             logger.warning("fill_form_and_extract: domain blocked: {url}", url=url)
             return ExtractionResult(
-                url=url, extraction_method="none", correlation_id=get_correlation_id()
+                url=url,
+                extraction_method="none",
+                fetch_status="blocked",
+                failure_stage="navigation",
+                error_message=(
+                    f"domain of {url} is blocked by the SafetyConfig allow/deny "
+                    "rules; do not retry this URL -- choose a source on an "
+                    "allowed domain"
+                ),
+                correlation_id=get_correlation_id(),
             )
 
         # Late import to avoid a circular dep through agent.py.
@@ -883,7 +917,17 @@ class Recipes:
             except PlaywrightTimeout:
                 logger.warning("fill_form_and_extract: navigation timed out for {url}", url=url)
                 return ExtractionResult(
-                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                    url=url,
+                    extraction_method="none",
+                    fetch_status="timeout",
+                    failure_stage="navigation",
+                    error_message=(
+                        f"navigation to {url} timed out after {timeout_ms}ms; "
+                        "the site may be slow or blocking automation -- retry "
+                        "with a larger spec.wait_timeout_ms, or verify the URL "
+                        "loads via web_fetch first"
+                    ),
+                    correlation_id=get_correlation_id(),
                 )
 
             # v1.6.16 REC-1: this recipe drives a raw Playwright page, so the
@@ -915,6 +959,14 @@ class Recipes:
                     return ExtractionResult(
                         url=url,
                         extraction_method="none",
+                        fetch_status="blocked",
+                        failure_stage="ssrf_redirect",
+                        error_message=(
+                            f"navigation redirected to a disallowed URL "
+                            f"({candidate}); the redirect target is outside the "
+                            "allowed domains -- do not retry this URL; choose a "
+                            "different source"
+                        ),
                         correlation_id=get_correlation_id(),
                     )
             if getattr(self._config.safety, "block_private_ips", False) and (
@@ -927,7 +979,15 @@ class Recipes:
                     url=url,
                 )
                 return ExtractionResult(
-                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                    url=url,
+                    extraction_method="none",
+                    fetch_status="blocked",
+                    failure_stage="ssrf_redirect",
+                    error_message=(
+                        "navigation connected to a private/loopback/link-local "
+                        "address (SSRF guard); do not retry this URL"
+                    ),
+                    correlation_id=get_correlation_id(),
                 )
 
             # Step 2: fill query box
@@ -940,6 +1000,13 @@ class Recipes:
                     return ExtractionResult(
                         url=url,
                         extraction_method="none",
+                        failure_stage="query_fill",
+                        error_message=(
+                            f"query selector {_selector_desc(spec.query_selector)} "
+                            f"could not be filled within {timeout_ms}ms "
+                            f"({exc}); inspect the page with web_observe and "
+                            "retry with a corrected selector"
+                        ),
                         correlation_id=get_correlation_id(),
                     )
 
@@ -957,6 +1024,13 @@ class Recipes:
                     return ExtractionResult(
                         url=url,
                         extraction_method="none",
+                        failure_stage="filter_fill",
+                        error_message=(
+                            f"filter selector {_selector_desc(selector)} failed "
+                            f"for value {value!r} ({exc}); verify the control "
+                            "exists and is visible with web_observe, then retry "
+                            "with a corrected selector or value"
+                        ),
                         correlation_id=get_correlation_id(),
                     )
 
@@ -971,8 +1045,24 @@ class Recipes:
                 # else: caller already submitted via filters or expects auto-search
             except Exception as exc:
                 logger.warning("submit failed: {e}", e=exc)
+                submit_desc = (
+                    f"submit selector {_selector_desc(spec.submit_selector)} could not be clicked"
+                    if spec.submit_selector is not None
+                    else (
+                        f"pressing Enter on query selector "
+                        f"{_selector_desc(spec.query_selector)} failed"
+                    )
+                )
                 return ExtractionResult(
-                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                    url=url,
+                    extraction_method="none",
+                    failure_stage="submit",
+                    error_message=(
+                        f"{submit_desc} within {timeout_ms}ms ({exc}); inspect "
+                        "the page with web_observe and retry with a corrected "
+                        "submit_selector"
+                    ),
+                    correlation_id=get_correlation_id(),
                 )
 
             # Step 5: wait for results
@@ -984,8 +1074,25 @@ class Recipes:
                     await page.wait_for_load_state("networkidle", timeout=timeout_ms)
             except PlaywrightTimeout:
                 logger.warning("fill_form_and_extract: wait_for timed out")
+                wait_desc = (
+                    f"wait_for selector {_selector_desc(spec.wait_for)} did not "
+                    f"become visible within {timeout_ms}ms; the form may not "
+                    "have produced results -- verify the selector with "
+                    "web_observe or increase spec.wait_timeout_ms"
+                    if spec.wait_for is not None
+                    else (
+                        f"page did not reach network-idle within {timeout_ms}ms "
+                        "after submit; results may still have loaded -- retry "
+                        "with an explicit spec.wait_for selector for the "
+                        "results container"
+                    )
+                )
                 return ExtractionResult(
-                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                    url=url,
+                    extraction_method="none",
+                    failure_stage="wait_for",
+                    error_message=wait_desc,
+                    correlation_id=get_correlation_id(),
                 )
 
             # v1.6.16 H1: re-gate the POST-SUBMIT URL before extraction.
@@ -1009,7 +1116,17 @@ class Recipes:
                     u=post_submit_url,
                 )
                 return ExtractionResult(
-                    url=url, extraction_method="none", correlation_id=get_correlation_id()
+                    url=url,
+                    extraction_method="none",
+                    fetch_status="blocked",
+                    failure_stage="ssrf_redirect",
+                    error_message=(
+                        f"form submission navigated to a disallowed URL "
+                        f"({post_submit_url}); content was not extracted -- the "
+                        "form posts outside the allowed domains; do not retry "
+                        "this URL"
+                    ),
+                    correlation_id=get_correlation_id(),
                 )
 
             # Step 6: extract
@@ -1043,6 +1160,13 @@ class Recipes:
                     url=url,
                     extraction_method="none",
                     content_length=0,
+                    failure_stage="capture",
+                    error_message=(
+                        "post-submit page content could not be captured (page "
+                        "kept navigating through all capture tiers); the form "
+                        "may have submitted successfully -- retry once, or add "
+                        "a spec.wait_for selector for a stable results element"
+                    ),
                     correlation_id=get_correlation_id(),
                 )
             fr = FetchResult(

@@ -6,6 +6,7 @@ import asyncio
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -159,13 +160,18 @@ class BrowserManager:
         self._config = config
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
+        # v1.7.0: stealth is applied explicitly per-context via
+        # ``Stealth.apply_stealth_async`` (see ``_apply_stealth``) instead
+        # of routing the whole Playwright lifecycle through
+        # ``Stealth.use_async``'s hooked launch wrapper. The hook offered
+        # no control over launch dispatch and its CLI-arg patching is
+        # mirrored by ``_stealth_launch_args``.
         self._stealth = Stealth()
         self._semaphore = asyncio.Semaphore(config.browser.max_contexts)
         self._started = False
-        # Stealth-wrapped async_playwright() context manager. Typed as Any
-        # because Stealth.use_async() returns its own internal CM class
-        # whose protocol mypy doesn't see -- runtime always exposes
-        # __aenter__/__aexit__.
+        # Raw async_playwright() context manager (v1.7.0: no longer the
+        # Stealth.use_async wrapper). Kept as Any to avoid depending on
+        # the private PlaywrightContextManager type.
         self._pw_cm: Any = None
         # Serialize start/stop to prevent the "two concurrent start()" race
         # that would launch two browsers and leak the first.
@@ -199,6 +205,25 @@ class BrowserManager:
         # _PersistentContextRef (no-op close so per-call cleanup leaves
         # it alive across the Agent lifetime).
         self._persistent_context: BrowserContext | None = None
+        # v1.7.0: ephemeral isolation also launches via
+        # launch_persistent_context (Playwright >= 1.5x rejects a
+        # --user-data-dir CLI arg on chromium.launch outright -- see
+        # start()). The root context is held ONLY so Chromium keeps its
+        # state inside the webTool-owned tempdir; callers never see it.
+        # Per-session isolation is preserved: _build_context creates
+        # fresh incognito contexts via root.browser.new_context().
+        self._ephemeral_root_context: BrowserContext | None = None
+        # v1.7.0 crash recovery state. _crashed flips when Playwright
+        # reports the browser/persistent-context gone outside an
+        # intentional stop(); _stopping suppresses the flip during
+        # stop(); _relaunch_lock serializes ensure_running() waiters so
+        # only one of them performs the relaunch; _generation counts
+        # successful start()s so SessionManager can detect sessions
+        # belonging to a previous (dead) browser instance.
+        self._crashed: bool = False
+        self._stopping: bool = False
+        self._relaunch_lock = asyncio.Lock()
+        self._generation: int = 0
 
     def _resolve_profile_dir(self) -> Path:
         """Resolve the effective user-data-dir for isolation_mode.
@@ -278,14 +303,263 @@ class BrowserManager:
         """
         return self._cdp_endpoint
 
+    @property
+    def generation(self) -> int:
+        """v1.7.0: monotonically increasing count of successful ``start()``s.
+
+        :class:`SessionManager` snapshots this at session-create time; a
+        mismatch on later access means the session's BrowserContext
+        belongs to a previous (crashed / relaunched) browser instance.
+        """
+        return self._generation
+
+    def is_alive(self) -> bool:
+        """v1.7.0: True when a started browser connection is believed live.
+
+        False before ``start()``, after ``stop()``, after a detected
+        crash (``disconnected`` / persistent-context ``close`` events),
+        or when Playwright reports the Browser handle disconnected.
+        """
+        if not self._started or self._crashed:
+            return False
+        if self._browser is not None:
+            try:
+                return bool(self._browser.is_connected())
+            except Exception:
+                return False
+        # Named persistent profiles on Playwright versions where
+        # ctx.browser is None: rely on the close-event-driven flag.
+        return self._persistent_context is not None
+
+    def _on_browser_disconnected(self, _browser: Any = None) -> None:
+        """Playwright ``disconnected`` callback: flag an unexpected death."""
+        if self._stopping or not self._started:
+            return
+        self._crashed = True
+        logger.warning(
+            "Chromium disconnected unexpectedly (crash, OOM-kill, or external "
+            "terminate). auto_relaunch={ar}: {hint}",
+            ar=self._config.browser.auto_relaunch,
+            hint=(
+                "next browser acquisition will relaunch"
+                if self._config.browser.auto_relaunch
+                else "subsequent calls will fail until the Agent is restarted"
+            ),
+        )
+
+    def _on_persistent_context_closed(self, _context: Any = None) -> None:
+        """Persistent-context ``close`` callback (named-profile path)."""
+        # Same semantics as a browser disconnect: outside stop(), the
+        # persistent context closing means the browser died under us.
+        self._on_browser_disconnected(None)
+
+    def _wire_crash_handlers(self) -> None:
+        """Attach disconnect/close listeners after a successful start()."""
+        if self._browser is not None:
+            self._browser.on("disconnected", self._on_browser_disconnected)
+        if self._persistent_context is not None:
+            self._persistent_context.on("close", self._on_persistent_context_closed)
+
+    async def ensure_running(self) -> None:
+        """v1.7.0 health gate used by the public context-acquisition paths.
+
+        No-op when the browser was never started (downstream raises the
+        established "not started" error) or when it is alive. When the
+        browser crashed or was closed externally:
+
+        * ``browser.auto_relaunch=False`` -> immediate
+          :class:`~web_agent.exceptions.BrowserError` with operator guidance.
+        * ``auto_relaunch=True`` -> bounded relaunch attempts
+          (``relaunch_max_attempts``) with exponential backoff
+          (``relaunch_backoff_base_s * 2**(attempt-1)``); exhaustion raises
+          ``BrowserError``.
+
+        Safe under concurrency: all waiters funnel through one lock and
+        only the first performs the relaunch. For ``backend='remote_cdp'``
+        a "relaunch" is a re-connect to the same endpoint (webTool does
+        not own the remote process).
+        """
+        from .exceptions import BrowserError
+
+        if not self._started or self.is_alive():
+            return
+
+        bcfg = self._config.browser
+        if not bcfg.auto_relaunch:
+            raise BrowserError(
+                "Browser is no longer running (crashed or closed externally) "
+                "and browser.auto_relaunch=False. Restart the Agent, or set "
+                "browser.auto_relaunch=True to recover automatically."
+            )
+
+        async with self._relaunch_lock:
+            # Another waiter may have completed the relaunch while we
+            # queued on the lock.
+            if self._started and self.is_alive():
+                return
+            attempts = bcfg.relaunch_max_attempts
+            last_exc: Exception | None = None
+            for attempt in range(1, attempts + 1):
+                logger.warning(
+                    "Relaunching crashed browser (attempt {a}/{n})",
+                    a=attempt,
+                    n=attempts,
+                )
+                # stop() tears down dead handles, removes the orphaned
+                # ephemeral profile, and resets _started/_crashed so
+                # start() runs a clean launch.
+                with suppress(Exception):
+                    await self.stop()
+                try:
+                    await self.start()
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "Relaunch attempt {a}/{n} failed: {e}",
+                        a=attempt,
+                        n=attempts,
+                        e=exc,
+                    )
+                    if attempt < attempts:
+                        await asyncio.sleep(bcfg.relaunch_backoff_base_s * (2 ** (attempt - 1)))
+                    continue
+                logger.warning(
+                    "Browser relaunched successfully (attempt {a}/{n}, generation {g})",
+                    a=attempt,
+                    n=attempts,
+                    g=self._generation,
+                )
+                return
+            raise BrowserError(
+                f"Browser crashed and {attempts} relaunch attempt(s) failed "
+                f"(browser.relaunch_max_attempts={attempts}). Last error: {last_exc}. "
+                "Check that Chromium is installed (python -m playwright install "
+                "chromium), that the host has free memory, and the logs above; "
+                "then restart the Agent."
+            ) from last_exc
+
+    def _stealth_launch_args(self, base_args: list[str]) -> list[str]:
+        """v1.7.0: mirror the CLI-arg patches playwright-stealth's hooked
+        launch used to apply (``Stealth._kwargs_with_patched_cli_arg``):
+        ``--disable-blink-features=AutomationControlled`` when the
+        ``navigator_webdriver`` evasion is on, and ``--accept-lang=...``
+        when ``navigator_languages`` is on. Returns a new list; honors
+        ``Stealth(init_scripts_only=True)`` by returning the args as-is.
+        """
+        st = self._stealth
+        if getattr(st, "init_scripts_only", False):
+            return list(base_args)
+        args = list(base_args)
+        if getattr(st, "navigator_webdriver", True) and not any(
+            a.startswith("--disable-blink-features=") for a in args
+        ):
+            args.append("--disable-blink-features=AutomationControlled")
+        if getattr(st, "navigator_languages", True) and not any(
+            a.startswith("--accept-lang=") for a in args
+        ):
+            langs = ",".join(getattr(st, "navigator_languages_override", ("en-US", "en")))
+            args.append(f"--accept-lang={langs}")
+        return args
+
+    async def _apply_stealth(self, ctx: BrowserContext) -> None:
+        """v1.7.0: apply stealth init scripts to a context (best-effort).
+
+        Replaces the implicit per-context application the
+        ``Stealth.use_async`` hook performed on ``browser.new_context``.
+        Gated on ``browser.stealth_enabled``; a failure degrades to a
+        WARNING (the context still works, just without evasions).
+        """
+        if not self._config.browser.stealth_enabled:
+            return
+        try:
+            await self._stealth.apply_stealth_async(ctx)
+        except Exception as exc:
+            logger.warning("Failed to apply stealth init scripts to context: {e}", e=exc)
+
+    async def _sweep_orphan_profiles(self) -> None:
+        """v1.7.0: best-effort removal of orphaned ephemeral profile dirs.
+
+        Crashed runs (or ``cleanup_on_exit=False`` configurations that
+        later flipped) leave ``run-*`` tempdirs under
+        ``<base_dir>/.webtool/browser-profiles`` forever. On start(),
+        remove the ones whose newest content is older than
+        ``browser.profile_sweep_max_age_h`` hours.
+
+        Conservative by design (see ownership.py for the ownership
+        model):
+
+        * only ``run-*`` dirs are candidates -- named profiles and
+          foreign dirs are never touched;
+        * the live profile of THIS process is skipped;
+        * age is the NEWEST mtime among the dir and its immediate
+          children, so a profile being actively written by another live
+          webTool process (Chromium touches its SQLite stores
+          constantly) never looks old;
+        * any doubt (stat/list failure) skips the dir with a DEBUG log.
+        """
+        max_age_h = self._config.browser.profile_sweep_max_age_h
+        if max_age_h <= 0:
+            return
+        base_root = Path(self._config.base_dir).resolve() / ".webtool" / "browser-profiles"
+        try:
+            if not base_root.is_dir():
+                return
+            cutoff = time.time() - max_age_h * 3600.0
+            live = (
+                self._effective_profile_dir.resolve()
+                if self._effective_profile_dir is not None
+                else None
+            )
+            for entry in base_root.iterdir():
+                try:
+                    if not entry.is_dir() or not entry.name.startswith("run-"):
+                        continue
+                    if live is not None and entry.resolve() == live:
+                        continue
+                    newest = entry.stat().st_mtime
+                    for child in entry.iterdir():
+                        with suppress(OSError):
+                            newest = max(newest, child.stat().st_mtime)
+                    if newest > cutoff:
+                        logger.debug(
+                            "Profile sweep: skipping {p} (recent activity, "
+                            "possibly owned by a live process)",
+                            p=entry,
+                        )
+                        continue
+                    logger.info(
+                        "Profile sweep: removing orphaned ephemeral profile {p} "
+                        "(idle > {h}h)",
+                        p=entry,
+                        h=max_age_h,
+                    )
+                    await self._cleanup_profile_dir(entry, retries=2)
+                except OSError as exc:
+                    logger.debug("Profile sweep: skipping {p}: {e}", p=entry, e=exc)
+        except Exception as exc:
+            logger.debug("Profile sweep aborted: {e}", e=exc)
+
     async def start(self) -> None:
         """Launch the Chromium browser. Idempotent under concurrent calls.
 
         v1.6.6: when ``browser.isolation_mode=True`` the launch happens
-        against a webTool-owned ``--user-data-dir`` (ephemeral tempdir or
+        against a webTool-owned user-data-dir (ephemeral tempdir or
         named profile). When ``browser.cdp_enabled=True`` (which requires
         isolation_mode), the launch also passes ``--remote-debugging-port``
         and discovers the resolved endpoint from ``DevToolsActivePort``.
+
+        v1.7.0: ALL isolated launches (ephemeral and named) dispatch to
+        ``chromium.launch_persistent_context(user_data_dir=...)``.
+        Playwright >= 1.5x rejects a ``--user-data-dir`` CLI arg on
+        ``chromium.launch`` pre-spawn ("Pass user_data_dir parameter to
+        'browser_type.launch_persistent_context'..."), which broke
+        ephemeral isolation at runtime. The ephemeral root context is
+        held internally only -- callers still get fresh incognito
+        contexts from ``_build_context`` via ``root.browser``, so
+        per-session isolation is unchanged. The Playwright lifecycle is
+        raw ``async_playwright()``; stealth evasions are applied
+        per-context (``_apply_stealth``) instead of via
+        ``Stealth.use_async``'s hooked launch.
 
         Raises:
             BrowserError: If Playwright fails to launch Chromium.
@@ -317,14 +591,19 @@ class BrowserManager:
                         "to attach without a valid token (v1.6.9)."
                     )
                 try:
-                    self._pw_cm = self._stealth.use_async(async_playwright())
+                    self._pw_cm = async_playwright()
                     self._playwright = await self._pw_cm.__aenter__()
                     assert bcfg.remote_cdp_url is not None  # validator guarantees
                     self._browser = await self._playwright.chromium.connect_over_cdp(
                         bcfg.remote_cdp_url
                     )
                     self._is_remote_cdp = True
+                    self._crashed = False
+                    self._generation += 1
                     self._started = True
+                    # v1.7.0: a remote disconnect is surfaced like a crash;
+                    # ensure_running() then attempts a re-connect.
+                    self._wire_crash_handlers()
                     logger.info(
                         "Connected to remote CDP browser: {u} (ownership verified)",
                         u=bcfg.remote_cdp_url,
@@ -357,32 +636,37 @@ class BrowserManager:
             ]
             if _should_disable_chromium_sandbox(bcfg.disable_chromium_sandbox):
                 args.insert(0, "--no-sandbox")
-            # v1.6.9: launch_persistent_context (named profile path)
-            # takes user_data_dir as an explicit arg, NOT via
-            # --user-data-dir CLI flag. Keep the CLI flag for the
-            # regular chromium.launch path (ephemeral isolation).
-            use_persistent = (
+            # v1.7.0: stealth's CLI-side evasions (previously injected by
+            # the Stealth.use_async hooked launch) are added explicitly.
+            if bcfg.stealth_enabled:
+                args = self._stealth_launch_args(args)
+            # v1.7.0: BOTH isolation flavors dispatch to
+            # launch_persistent_context -- Playwright >= 1.5x rejects the
+            # --user-data-dir CLI arg on chromium.launch pre-spawn, so
+            # the v1.6.6 "CLI flag for ephemeral" approach is dead. The
+            # user_data_dir is always passed as an explicit kwarg.
+            use_persistent_named = (
                 bcfg.isolation_mode
                 and bcfg.profile_mode == "named"
                 and self._effective_profile_dir is not None
             )
-            if (
+            use_persistent_ephemeral = (
                 bcfg.isolation_mode
+                and not use_persistent_named
                 and self._effective_profile_dir is not None
-                and not use_persistent
-            ):
-                args.append(f"--user-data-dir={self._effective_profile_dir}")
+            )
             if bcfg.cdp_enabled:
                 args.append(f"--remote-debugging-port={bcfg.cdp_port}")
                 args.append(f"--remote-debugging-address={bcfg.cdp_host}")
 
             try:
-                # Stealth wraps async_playwright() and auto-injects anti-detection
-                # scripts into every context and page created through it.
-                self._pw_cm = self._stealth.use_async(async_playwright())
+                # v1.7.0: raw Playwright lifecycle. Stealth evasions are
+                # applied per-context in _build_context / on the named
+                # persistent context below.
+                self._pw_cm = async_playwright()
                 self._playwright = await self._pw_cm.__aenter__()
 
-                if use_persistent:
+                if use_persistent_named:
                     # v1.6.9: named profile uses launch_persistent_context
                     # which returns a BrowserContext directly. Cookies /
                     # localStorage persist across runs because Chromium
@@ -410,6 +694,11 @@ class BrowserManager:
                     )
                     self._persistent_context.set_default_timeout(bcfg.default_timeout)
                     self._persistent_context.set_default_navigation_timeout(bcfg.navigation_timeout)
+                    # v1.7.0: the Stealth.use_async hook never covered
+                    # launch_persistent_context (named profiles ran with NO
+                    # evasions pre-v1.7.0). Apply explicitly -- shared by
+                    # every session on this profile.
+                    await self._apply_stealth(self._persistent_context)
                     # Apply resource blocking once on the persistent
                     # context (per-call routing would accumulate).
                     blocked = bcfg.block_resources
@@ -434,13 +723,42 @@ class BrowserManager:
                     # we keep _browser=None and route everything through
                     # _persistent_context.
                     self._browser = self._persistent_context.browser
+                elif use_persistent_ephemeral:
+                    # v1.7.0: ephemeral isolation. The root context exists
+                    # only so Chromium anchors its state (and
+                    # DevToolsActivePort) inside the webTool-owned tempdir;
+                    # webTool never opens pages in it. Callers receive
+                    # fresh incognito contexts from _build_context via
+                    # root.browser.new_context(), preserving the
+                    # per-session isolation contract of ephemeral mode.
+                    assert self._effective_profile_dir is not None
+                    self._ephemeral_root_context = (
+                        await self._playwright.chromium.launch_persistent_context(
+                            user_data_dir=str(self._effective_profile_dir),
+                            headless=bcfg.headless,
+                            slow_mo=bcfg.slow_mo,
+                            args=args,
+                        )
+                    )
+                    self._browser = self._ephemeral_root_context.browser
+                    if self._browser is None:
+                        raise BrowserError(
+                            "launch_persistent_context returned a context with "
+                            "no .browser handle; ephemeral isolation requires "
+                            "it to create per-session contexts. Upgrade "
+                            "Playwright (>=1.55 exposes it) or use "
+                            "profile_mode='named'."
+                        )
                 else:
                     self._browser = await self._playwright.chromium.launch(
                         headless=bcfg.headless,
                         slow_mo=bcfg.slow_mo,
                         args=args,
                     )
+                self._crashed = False
+                self._generation += 1
                 self._started = True
+                self._wire_crash_handlers()
                 logger.info(
                     "Browser launched (headless={h}, isolation={iso}, cdp={cdp})",
                     h=bcfg.headless,
@@ -485,13 +803,21 @@ class BrowserManager:
                     await self._discover_cdp_endpoint(self._effective_profile_dir)
                     if self._cdp_endpoint:
                         logger.info("CDP endpoint: {ep}", ep=self._cdp_endpoint)
+                # v1.7.0: best-effort removal of orphaned ephemeral
+                # profiles left behind by crashed runs. Never raises.
+                await self._sweep_orphan_profiles()
             except Exception as exc:
                 # Roll back partial state and re-raise as BrowserError so callers
                 # can `except BrowserError` reliably.
+                self._started = False
                 if self._persistent_context is not None:
                     with suppress(Exception):
                         await self._persistent_context.close()
                     self._persistent_context = None
+                if self._ephemeral_root_context is not None:
+                    with suppress(Exception):
+                        await self._ephemeral_root_context.close()
+                    self._ephemeral_root_context = None
                 if self._pw_cm is not None:
                     with suppress(Exception):
                         await self._pw_cm.__aexit__(None, None, None)
@@ -561,8 +887,13 @@ class BrowserManager:
         v1.6.9: named persistent profiles close their single
         ``BrowserContext`` (which in turn terminates the underlying
         Chromium) before the regular browser path runs.
+
+        v1.7.0: the ephemeral-isolation root context is closed the same
+        way (it owns the Chromium process), and the ``_stopping`` flag
+        suppresses the crash detector while we tear down intentionally.
         """
         async with self._lifecycle_lock:
+            self._stopping = True
             if self._persistent_context is not None:
                 # v1.6.9: launch_persistent_context owns the chromium
                 # process. Closing the persistent context terminates it
@@ -576,6 +907,15 @@ class BrowserManager:
                 # Underlying browser ref (if any) is owned by the
                 # persistent context we just closed -- do NOT call
                 # close() on it again or we'll race on a dead handle.
+                self._browser = None
+            elif self._ephemeral_root_context is not None:
+                # v1.7.0: same ownership contract as the named path --
+                # closing the root context terminates Chromium.
+                try:
+                    await self._ephemeral_root_context.close()
+                except Exception as exc:
+                    logger.warning("Error closing ephemeral root context: {e}", e=exc)
+                self._ephemeral_root_context = None
                 self._browser = None
             elif self._browser:
                 try:
@@ -614,6 +954,11 @@ class BrowserManager:
             self._issued_token = None
             self._is_remote_cdp = False
             self._started = False
+            # v1.7.0: reset crash-recovery flags so a later start() (or
+            # an ensure_running relaunch) begins from a clean slate.
+            self._crashed = False
+            self._stopping = False
+            self._ephemeral_root_context = None
             logger.info("Browser closed")
 
     def get_remote_cdp_url(self) -> str | None:
@@ -678,8 +1023,21 @@ class BrowserManager:
                 )
             # _NoCloseContextProxy quacks like BrowserContext via __getattr__
             # forwarding. mypy can't see the protocol so cast it down.
+            # Stealth was applied ONCE to the underlying persistent
+            # context at launch (v1.7.0) -- do not re-apply per proxy.
             return cast(BrowserContext, _NoCloseContextProxy(self._persistent_context))
 
+        if self._crashed:
+            # v1.7.0: callers normally pass through ensure_running()
+            # first; this guard catches direct callers and the window
+            # where a crash lands mid-acquisition.
+            from .exceptions import BrowserError
+
+            raise BrowserError(
+                "Browser connection lost (crash detected). Retry the call -- "
+                "auto_relaunch recovers on the next acquisition -- or restart "
+                "the Agent if browser.auto_relaunch=False."
+            )
         if not self._browser:
             raise RuntimeError("BrowserManager not started. Call start() first.")
 
@@ -700,6 +1058,12 @@ class BrowserManager:
             java_script_enabled=True,
             bypass_csp=False,
         )
+        # v1.7.0: stealth evasions applied explicitly per context. This
+        # covers every flavor that reaches this point: ephemeral
+        # isolation, non-isolated launches, and contexts created on a
+        # remote_cdp-attached browser (which the Stealth.use_async hook
+        # also used to cover via its hooked new_context).
+        await self._apply_stealth(ctx)
         ctx.set_default_timeout(self._config.browser.default_timeout)
         ctx.set_default_navigation_timeout(self._config.browser.navigation_timeout)
 
@@ -745,6 +1109,9 @@ class BrowserManager:
         # Default for sessions is to NOT block resources (interactive use)
         if block_resources is None:
             block_resources = False
+        # v1.7.0: crash-recovery gate -- relaunches a dead browser (or
+        # raises BrowserError) before building the session context.
+        await self.ensure_running()
         ctx = await self._build_context(user_agent, block_resources)
         logger.debug("Persistent session context created")
         return ctx
@@ -764,6 +1131,9 @@ class BrowserManager:
                 ``False`` disables blocking (needed for automation/interaction).
         """
         async with self._semaphore:
+            # v1.7.0: crash-recovery gate -- relaunches a dead browser
+            # (or raises BrowserError) before building the context.
+            await self.ensure_running()
             ctx = await self._build_context(user_agent, block_resources)
             try:
                 yield ctx

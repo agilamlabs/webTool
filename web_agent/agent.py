@@ -179,6 +179,13 @@ def _block_reason_for(fr: FetchResult) -> Optional[str]:
     """Map a FetchResult onto a coarse-grained block_reason for diagnostics."""
     if fr.status == FetchStatus.SUCCESS:
         return None
+    # v1.7.0: a fetch stopped by a bot-mitigation wall carries the
+    # ChallengeInfo fingerprint -- surface the specific 'bot_challenge'
+    # reason (instead of the generic per-status mapping) so multi-URL
+    # flows can branch on it. SUCCESS results with an advisory/settled
+    # challenge are excluded by the early return above.
+    if fr.challenge is not None:
+        return "bot_challenge"
     return _BLOCK_REASON_BY_STATUS.get(fr.status)
 
 

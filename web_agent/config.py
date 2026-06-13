@@ -400,6 +400,87 @@ class BrowserConfig(BaseSettings):
         ),
     )
 
+    # --- v1.7.0: production lifecycle hardening --------------------------
+    stealth_enabled: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0: apply playwright-stealth evasions to every browser "
+            "context webTool creates (init scripts via "
+            "``Stealth.apply_stealth_async``) plus the stealth-related "
+            "Chromium launch args (``--disable-blink-features="
+            "AutomationControlled``, ``--accept-lang``). ``False`` skips "
+            "all stealth application -- useful for debugging raw browser "
+            "behaviour or when a target site misbehaves under the evasions."
+        ),
+    )
+    auto_relaunch: bool = Field(
+        default=True,
+        description=(
+            "v1.7.0: when Chromium dies underneath a running Agent "
+            "(renderer crash, OOM-kill, external taskkill), the next "
+            "browser acquisition transparently relaunches it instead of "
+            "failing every subsequent call until restart. ``False`` "
+            "surfaces an immediate BrowserError so the operator restarts "
+            "manually. Existing sessions on the dead browser are not "
+            "resurrected -- they surface the established unknown-session "
+            "path on next use."
+        ),
+    )
+    relaunch_max_attempts: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description=(
+            "v1.7.0: bounded number of relaunch attempts after a crash "
+            "before giving up with a BrowserError. ``0`` disables "
+            "relaunching even when ``auto_relaunch=True``."
+        ),
+    )
+    relaunch_backoff_base_s: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=30,
+        description=(
+            "v1.7.0: base delay between relaunch attempts. Attempt N "
+            "waits ``base * 2**(N-1)`` seconds before retrying (1s / 2s / "
+            "4s with the defaults)."
+        ),
+    )
+    session_max_count: int = Field(
+        default=32,
+        ge=1,
+        le=512,
+        description=(
+            "v1.7.0: hard cap on concurrently live persistent sessions. "
+            "Each session pins a Chromium BrowserContext (memory + "
+            "processes); unbounded growth is the classic long-running "
+            "MCP-daemon leak. Exceeding the cap fails session creation "
+            "with an actionable message."
+        ),
+    )
+    session_idle_ttl_s: float = Field(
+        default=1800.0,
+        ge=0,
+        description=(
+            "v1.7.0: idle time-to-live for persistent sessions, in "
+            "seconds. Sessions untouched for longer than this are closed "
+            "by a lazy reaper sweep that runs on session create/list (no "
+            "background tasks). ``0`` disables idle reaping."
+        ),
+    )
+    profile_sweep_max_age_h: float = Field(
+        default=24.0,
+        ge=0,
+        description=(
+            "v1.7.0: on browser start, ephemeral profile directories "
+            "under ``<base_dir>/.webtool/browser-profiles`` whose newest "
+            "content is older than this many hours are removed "
+            "(orphans from crashed runs). The live profile and anything "
+            "that looks owned by a possibly-live process are skipped. "
+            "``0`` disables the sweep."
+        ),
+    )
+
     @model_validator(mode="after")
     def _validate_user_agent_mode(self) -> BrowserConfig:
         """v1.6.9: ``user_agent_mode='explicit'`` requires ``user_agent``."""
@@ -674,6 +755,45 @@ class FetchConfig(BaseSettings):
     non_retryable_status_codes: list[int] = Field(
         default_factory=lambda: [400, 401, 403, 404, 405, 410, 451]
     )
+    # v1.7.0: bot-challenge honesty. Interstitials (Cloudflare "Just a
+    # moment...", DataDome, Akamai, PerimeterX, CAPTCHA walls) served with
+    # HTTP 200 used to come back as FetchStatus.SUCCESS and get extracted
+    # as if they were content; 403/503-wrapped JS challenges fast-failed
+    # even though a real browser auto-passes them in a few seconds.
+    challenge_detection_enabled: bool = Field(
+        default=True,
+        description=(
+            "Detect bot-challenge / CAPTCHA interstitials in fetched HTML "
+            "(structural markers only -- prose mentions of a vendor never "
+            "trigger). Detected walls surface as FetchStatus.BLOCKED with "
+            "FetchResult.challenge populated and actionable guidance in "
+            "error_message, instead of silently returning interstitial "
+            "HTML as SUCCESS. Set False to restore pre-v1.7.0 behaviour."
+        ),
+    )
+    challenge_settle_ms: int = Field(
+        default=3500,
+        ge=0,
+        le=30000,
+        description=(
+            "Milliseconds to wait before each re-check of an auto-settle-"
+            "likely challenge (Cloudflare managed JS challenges typically "
+            "clear in ~3-5s in a real browser). Applies per recheck round; "
+            "CAPTCHA / block-page / rate-limit walls are never waited on."
+        ),
+    )
+    challenge_max_rechecks: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description=(
+            "Maximum settle-and-recheck rounds for an auto-settle-likely "
+            "challenge before giving up and returning BLOCKED. 0 disables "
+            "the settle wait entirely (immediate BLOCKED on detection). "
+            "Worst-case added latency is challenge_settle_ms * "
+            "challenge_max_rechecks per challenged fetch."
+        ),
+    )
 
     @model_validator(mode="after")
     def _apply_retry_policy(self) -> FetchConfig:
@@ -807,7 +927,17 @@ class DownloadConfig(BaseSettings):
 
 
 class ExtractionConfig(BaseSettings):
-    """Content extraction settings for the trafilatura/BS4/raw fallback chain."""
+    """Content extraction settings for the trafilatura/BS4/raw fallback chain.
+
+    v1.7.0: ``default_max_chars`` caps **MCP-boundary responses only** --
+    it is the per-call content window applied by the MCP server tools
+    (web_fetch / web_search / web_search_best / web_research /
+    web_fill_form_and_extract / web_observe) when the caller does not pass
+    an explicit ``max_chars``. The Python API
+    (:meth:`ContentExtractor.extract`, ``Agent.*``) stays unlimited by
+    default; only an explicit ``max_chars=``/``offset=`` argument windows
+    it there. Env override: ``WEB_AGENT_EXTRACTION__DEFAULT_MAX_CHARS``.
+    """
 
     favor_precision: bool = False
     favor_recall: bool = True
@@ -818,6 +948,21 @@ class ExtractionConfig(BaseSettings):
     # chars. A negative threshold is meaningless (every result passes);
     # ``ge=0`` keeps the "accept any non-empty content" sentinel (0) valid.
     min_content_length: int = Field(default=50, ge=0)
+    # v1.7.0: MCP-boundary default content window (chars). Applied per page
+    # by the MCP server when the tool call carries no explicit max_chars.
+    # Does NOT affect the Python API default (unlimited). 40k chars is
+    # roughly 10k tokens -- large enough for most articles, small enough
+    # that 2-3 tool calls don't blow out an LLM context window.
+    default_max_chars: int = Field(
+        default=40000,
+        ge=1000,
+        le=1_000_000,
+        description=(
+            "Default per-call content cap (chars) applied at the MCP "
+            "boundary only, when the caller omits max_chars. The Python "
+            "API remains unlimited unless max_chars is passed explicitly."
+        ),
+    )
 
     # v1.6.16 (review CO-1): scope env-var lookup to WEB_AGENT_EXTRACTION__
     # so bare ``INCLUDE_TABLES`` / ``FAVOR_RECALL`` env vars can't override

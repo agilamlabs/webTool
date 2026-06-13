@@ -104,40 +104,55 @@ async def _check_playwright_import(_cfg: AppConfig) -> DoctorCheck:
     return DoctorCheck(name="playwright_import", status="ok", message=f"playwright {version}")
 
 
-async def _check_chromium_installed(_cfg: AppConfig) -> DoctorCheck:
-    """Probe Playwright's bundled driver to confirm Chromium is installed.
+async def _resolve_chromium_executable() -> Path:
+    """Resolve the Chromium browser executable Playwright would launch,
+    WITHOUT launching a browser.
 
-    Uses ``playwright._impl._driver.compute_driver_executable`` which is
-    the same path Playwright uses to launch -- if this returns a missing
-    path we know ``chromium.launch()`` will fail.
+    Starts the Playwright driver (the node sidecar, typically a few
+    hundred ms) and reads ``BrowserType.executable_path`` -- the
+    authoritative answer across Playwright versions and
+    ``PLAYWRIGHT_BROWSERS_PATH`` overrides. Module-level so tests can
+    monkeypatch the probe.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        return Path(pw.chromium.executable_path)
+
+
+async def _check_chromium_installed(_cfg: AppConfig) -> DoctorCheck:
+    """Verify the Chromium BROWSER executable exists -- without launching.
+
+    v1.7.0: the previous probe only checked Playwright's bundled node
+    driver, which exists whenever the ``playwright`` wheel is installed
+    -- so ``doctor --quick`` reported healthy on machines where
+    ``playwright install chromium`` was never run. The probe now
+    resolves ``chromium.executable_path`` through the driver (no
+    browser launch) and stats the file. Shared by quick and full modes;
+    full mode additionally performs the real launch probe.
     """
     try:
-        from playwright._impl._driver import compute_driver_executable
+        exe = await _resolve_chromium_executable()
     except Exception as exc:
         return DoctorCheck(
             name="chromium_installed",
             status="fail",
-            message=f"Cannot import driver helper: {exc}",
+            message=(
+                f"Cannot resolve Chromium executable: {exc}. "
+                "Run: python -m playwright install chromium"
+            ),
         )
-    try:
-        driver = compute_driver_executable()
-    except Exception as exc:
+    if str(exe) and exe.exists():
         return DoctorCheck(
-            name="chromium_installed",
-            status="fail",
-            message=f"Driver path resolution failed: {exc}",
-        )
-    # compute_driver_executable may return a tuple (cmd, *args)
-    driver_path = driver[0] if isinstance(driver, tuple) else driver
-    p = Path(str(driver_path))
-    if p.exists():
-        return DoctorCheck(
-            name="chromium_installed", status="ok", message=f"Playwright driver: {p}"
+            name="chromium_installed", status="ok", message=f"Chromium executable: {exe}"
         )
     return DoctorCheck(
         name="chromium_installed",
         status="fail",
-        message=(f"Playwright driver not found at {p}. Run: python -m playwright install chromium"),
+        message=(
+            f"Chromium executable not found at {exe}. "
+            "Run: python -m playwright install chromium"
+        ),
     )
 
 

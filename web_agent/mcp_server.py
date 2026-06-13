@@ -68,6 +68,7 @@ from pydantic import TypeAdapter
 
 from .agent import Agent
 from .config import AppConfig
+from .content_extractor import build_fetch_failure_result, slice_text_window
 from .models import (
     Action,
     ActionSequenceResult,
@@ -75,6 +76,7 @@ from .models import (
     AgentResult,
     DownloadResult,
     ExtractionResult,
+    FetchStatus,
     FormFilterSpec,
     ResearchResult,
     ScreenshotFormat,
@@ -117,6 +119,114 @@ def _load_mcp_config() -> AppConfig:
             return AppConfig.from_yaml(path)
         logger.warning("WEB_AGENT_CONFIG={p} not found; using defaults", p=path)
     return AppConfig()
+
+
+# ---------------------------------------------------------------------------
+# v1.7.0: MCP-boundary response shaping (token efficiency)
+#
+# Two systemic LLM-caller pains addressed here, at the boundary ONLY (the
+# Python API stays unlimited by default):
+#   1. Duplication: ExtractionResult used to ship BOTH ``content`` and
+#      ``markdown`` (~2x tokens for the same text). Every content-bearing
+#      tool now returns exactly ONE representation -- markdown when
+#      available, else plain text; raw HTML only on explicit
+#      ``format='html'`` (web_fetch only).
+#   2. Unbounded size: responses now default to
+#      ``ExtractionConfig.default_max_chars`` per page, with
+#      ``truncated`` / ``total_content_chars`` / ``next_offset`` plus a
+#      one-line continuation hint so the model can page instead of
+#      drowning.
+# ---------------------------------------------------------------------------
+
+_VALID_FORMATS = frozenset({"markdown", "text", "html"})
+
+
+def _validate_format(format: Optional[str], *, allow_html: bool = False) -> Optional[str]:
+    """Normalize/validate a per-call ``format`` param at the MCP boundary.
+
+    Raises ``ValueError`` (surfaced to the MCP client as a tool error the
+    LLM can read and correct) for unknown values, and for ``'html'`` on
+    tools that have no raw HTML to return.
+    """
+    if format is None:
+        return None
+    fmt = format.strip().lower()
+    if not fmt:
+        return None
+    if fmt not in _VALID_FORMATS:
+        raise ValueError(
+            f"invalid format {format!r}: must be one of 'markdown' | 'text' | 'html'"
+        )
+    if fmt == "html" and not allow_html:
+        raise ValueError(
+            "format='html' is only supported by web_fetch; use 'markdown' or 'text'"
+        )
+    return fmt
+
+
+def _resolve_response_cap(config: AppConfig, max_chars: Optional[int]) -> int:
+    """Per-call content cap: explicit ``max_chars`` else config default.
+
+    Clamped to [1, 1_000_000] so an LLM/prompt-injection value can neither
+    zero out progress nor blow past the safety ceiling.
+    """
+    cap = config.extraction.default_max_chars if max_chars is None else max_chars
+    return max(1, min(cap, 1_000_000))
+
+
+def _shape_content_response(
+    result: ExtractionResult,
+    *,
+    cap: int,
+    offset: int = 0,
+    fmt: Optional[str] = None,
+    continuation_tool: str = "this tool",
+) -> ExtractionResult:
+    """Shape one ExtractionResult for the MCP wire: one representation + window.
+
+    Representation choice (``fmt`` is pre-validated):
+      - ``None`` (default) -> markdown when available, else text.
+      - ``'markdown'``     -> markdown; silently falls back to text when the
+        extractor produced no markdown (we cannot conjure it post-hoc).
+      - ``'text'``         -> text (``content``); markdown dropped.
+
+    The surviving text is then sliced to ``cap`` chars starting at
+    ``offset`` (newline-snapped within the last 200 chars of the window)
+    and the truncation metadata + a one-line continuation hint are
+    stamped. Mutates ``result`` in place and returns it.
+    """
+    if fmt == "text":
+        result.markdown = None
+    elif result.markdown is not None:
+        # fmt is None or 'markdown': markdown preferred when available.
+        result.content = None
+    text = result.markdown if result.markdown is not None else result.content
+    start = max(0, offset)
+    if text is None:
+        result.content_offset = start
+        return result
+    window, next_off = slice_text_window(text, offset=start, max_chars=cap)
+    if result.markdown is not None:
+        result.markdown = window
+    else:
+        result.content = window
+    total = len(text)
+    # Preserve a larger pre-existing total (the extractor's safety cap may
+    # already have cut the text once before we ever saw it).
+    if result.total_content_chars is None or result.total_content_chars < total:
+        result.total_content_chars = total
+    result.content_length = len(window)
+    result.truncated = bool(result.truncated or next_off is not None)
+    result.content_offset = start
+    result.next_offset = next_off
+    if next_off is not None:
+        result.truncation_hint = (
+            f"content truncated at {next_off} of {total} chars; "
+            f"call {continuation_tool} with offset={next_off} to continue"
+        )
+    else:
+        result.truncation_hint = None
+    return result
 
 
 @asynccontextmanager
@@ -174,13 +284,25 @@ async def web_search(
     max_results: int = 10,
     session_id: Optional[str] = None,
     extract_files: bool = False,
+    max_chars: Optional[int] = None,
+    format: Optional[str] = None,
 ) -> AgentResult:
     """Search the web and extract content from the top results.
 
     Uses a configurable search provider chain (default: SearXNG ->
     DDGS -> Playwright browser-driven Google + DDG HTML fallback).
-    Each result page is fetched and its main content extracted
-    (title, description, text, markdown).
+    Each result page is fetched and its main content extracted.
+
+    v1.7.0 response shape: each page carries exactly ONE content
+    representation (``markdown`` when available, else ``content`` text)
+    and is capped at ``max_chars`` characters PER PAGE (default: the
+    server's ``extraction.default_max_chars``, normally 40000). A capped
+    page has ``truncated=true``, ``total_content_chars``, ``next_offset``,
+    and a ``truncation_hint`` -- continue reading any single page with
+    ``web_fetch(url=<page.url>, offset=<next_offset>)``. Pages that failed
+    to fetch carry ``fetch_status`` / ``status_code`` / ``error_message``
+    / ``failure_stage`` explaining why (403 bot-wall, robots-disallowed,
+    timeout, blocked domain, ...) so you can pick a different source.
 
     Args:
         query: The search query string. May also be a search-engine SERP
@@ -190,22 +312,39 @@ async def web_search(
         extract_files: If True, route PDF/XLSX/DOCX/CSV results through the
             binary extractor inline instead of surfacing them in
             ``download_candidates``. Requires the ``[binary]`` extra.
+        max_chars: Per-page content cap in characters. None = server
+            default (``extraction.default_max_chars``).
+        format: 'markdown' | 'text'. Default (None) prefers markdown when
+            available, else text. ('html' is only available on web_fetch.)
 
     Returns:
         AgentResult with search metadata, extracted page contents, structured
         warnings/errors, download_candidates, and per-URL diagnostics.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
+    fmt = _validate_format(format)
     # v1.6.14 F-4: clamp the LLM-supplied count to a sane ceiling. An
     # unbounded max_results is a prompt-injection DoS amplifier -- a tool
     # call asking for 100000 results would fan out that many page fetches.
     max_results = min(max(max_results, 1), 50)
-    return await agent.search_and_extract(
+    result = await agent.search_and_extract(
         query,
         max_results=max_results,
         session_id=session_id,
         extract_files=extract_files,
     )
+    # v1.7.0: per-page cap + single representation at the MCP boundary.
+    # The recipe's overall char budget (safety.max_chars_per_call via
+    # BudgetTracker) still applies upstream, unchanged.
+    cap = _resolve_response_cap(agent._config, max_chars)
+    for page in result.pages:
+        _shape_content_response(
+            page,
+            cap=cap,
+            fmt=fmt,
+            continuation_tool=f"web_fetch (url={page.url!r})",
+        )
+    return result
 
 
 @mcp.tool()
@@ -214,6 +353,9 @@ async def web_fetch(
     url: str,
     session_id: Optional[str] = None,
     binary_probe: bool = True,
+    max_chars: Optional[int] = None,
+    offset: int = 0,
+    format: Optional[str] = None,
 ) -> ExtractionResult:
     """Fetch a single URL and extract its main content.
 
@@ -224,19 +366,99 @@ async def web_fetch(
     Otherwise renders JavaScript-heavy pages in a real browser and
     extracts via the three-tier HTML chain.
 
+    v1.7.0 response shape: exactly ONE content representation is
+    returned -- ``markdown`` when available (default; best for LLM
+    consumption), else plain text in ``content``; raw page HTML only via
+    ``format='html'``. Content is capped at ``max_chars`` characters
+    (default: the server's ``extraction.default_max_chars``, normally
+    40000). When capped, the result has ``truncated=true``,
+    ``total_content_chars`` (full size), ``next_offset``, and a
+    ``truncation_hint`` -- call web_fetch again with
+    ``offset=<next_offset>`` to continue reading where you left off.
+    An ``offset`` at/past the end returns empty content with
+    ``next_offset=null``.
+
+    Failure transparency (v1.7.0): when the fetch fails, the result
+    carries ``fetch_status`` ('timeout' | 'http_error' | 'network_error'
+    | 'blocked' | ...), ``status_code`` (when an HTTP response arrived),
+    ``failure_stage`` and an actionable ``error_message`` (e.g. robots
+    disallowed -> do not retry; 403 -> try an authenticated session or
+    another source). Use these to self-correct instead of retrying
+    blindly.
+
     Args:
         url: The URL to fetch.
         session_id: Optional persistent browser session.
         binary_probe: When True, send a HEAD request for extensionless
             URLs to detect binary documents served via headers.
+        max_chars: Content window size in characters. None = server
+            default (``extraction.default_max_chars``).
+        offset: Continuation offset (chars). Pass the previous response's
+            ``next_offset`` to page through a large document. Default 0.
+        format: 'markdown' | 'text' | 'html'. Default (None) prefers
+            markdown when available, else text. 'html' returns the raw
+            page HTML in ``content`` (extraction_method='html') -- costs
+            5-9x more tokens than markdown; request it only when you need
+            markup (forms, selectors, embedded data).
 
     Returns:
-        ExtractionResult with title, content, metadata, and extraction
-        method used (``trafilatura`` | ``bs4`` | ``raw`` | ``pdf`` |
-        ``xlsx`` | ``docx`` | ``csv`` | ``none``).
+        ExtractionResult with title, metadata, ONE content representation,
+        truncation/continuation fields, failure fields when applicable, and
+        the extraction method used (``trafilatura`` | ``bs4`` | ``raw`` |
+        ``pdf`` | ``xlsx`` | ``docx`` | ``csv`` | ``html`` | ``none``).
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.fetch_and_extract(url, session_id=session_id, binary_probe=binary_probe)
+    fmt = _validate_format(format, allow_html=True)
+    cap = _resolve_response_cap(agent._config, max_chars)
+    if fmt == "html":
+        # Raw-HTML passthrough: the extraction pipeline does not retain the
+        # raw page, so route via the fetcher directly (same smart routing
+        # agent.fetch_and_extract uses). Explicit opt-in only -- raw HTML
+        # costs 5-9x markdown in tokens.
+        fr = await agent._fetcher.fetch_smart(
+            url, session_id=session_id, binary_probe=binary_probe
+        )
+        if fr.status != FetchStatus.SUCCESS:
+            return _shape_content_response(
+                build_fetch_failure_result(fr),
+                cap=cap,
+                offset=offset,
+                continuation_tool="web_fetch",
+            )
+        if fr.html is None:
+            return ExtractionResult(
+                url=fr.final_url or fr.url,
+                extraction_method="none",
+                fetch_status=str(getattr(fr.status, "value", fr.status)),
+                status_code=fr.status_code,
+                error_message=(
+                    f"resource is a binary document (content_type="
+                    f"{fr.content_type or 'unknown'}); format='html' has no "
+                    "HTML to return -- call web_fetch without format to "
+                    "extract its text, or web_download to save the file"
+                ),
+                correlation_id=fr.correlation_id,
+            )
+        raw = ExtractionResult(
+            url=fr.final_url or fr.url,
+            content=fr.html,
+            extraction_method="html",
+            content_length=len(fr.html),
+            fetch_status=str(getattr(fr.status, "value", fr.status)),
+            status_code=fr.status_code,
+            correlation_id=fr.correlation_id,
+        )
+        return _shape_content_response(
+            raw,
+            cap=cap,
+            offset=offset,
+            fmt="text",
+            continuation_tool="web_fetch (format='html')",
+        )
+    result = await agent.fetch_and_extract(url, session_id=session_id, binary_probe=binary_probe)
+    return _shape_content_response(
+        result, cap=cap, offset=offset, fmt=fmt, continuation_tool="web_fetch"
+    )
 
 
 @mcp.tool()
@@ -365,12 +587,23 @@ async def web_search_best(
     session_id: Optional[str] = None,
     prefer_domains: Optional[list[str]] = None,
     domain_profile: Optional[str] = None,
+    max_chars: Optional[int] = None,
+    offset: int = 0,
+    format: Optional[str] = None,
 ) -> ExtractionResult:
     """Search the web, rank results, and return the extracted content of the top hit.
 
     Skips the manual "search -> pick result -> fetch" dance: ranks results by
     query overlap + HTTPS bonus + well-known domain bonus + caller-supplied
     domain hints + position tiebreaker, then fetches and extracts the top URL.
+
+    v1.7.0 response shape: ONE content representation (markdown preferred,
+    else text), capped at ``max_chars`` (default: server's
+    ``extraction.default_max_chars``). When ``truncated=true``, continue
+    with ``web_fetch(url=<result.url>, offset=<next_offset>)`` (cheaper
+    than re-running the search) or call this tool again with ``offset``.
+    On fetch failure the result carries ``fetch_status`` / ``status_code``
+    / ``error_message`` / ``failure_stage`` so you can pick another source.
 
     Args:
         query: The search query.
@@ -380,17 +613,29 @@ async def web_search_best(
             ``["ec.europa.eu"]``); matching results get a strong bonus.
         domain_profile: Optional named ranking profile -- one of
             ``"official_sources" | "docs" | "research" | "news" | "files"``.
+        max_chars: Content cap in characters. None = server default.
+        offset: Continuation offset (chars) into the extracted content.
+        format: 'markdown' | 'text'. Default (None) prefers markdown.
+            ('html' is only available on web_fetch.)
 
     Returns:
         ExtractionResult of the top-ranked URL.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.search_and_open_best_result(
+    fmt = _validate_format(format)
+    result = await agent.search_and_open_best_result(
         query,
         ranking=ranking,
         session_id=session_id,
         prefer_domains=prefer_domains,
         domain_profile=domain_profile,
+    )
+    return _shape_content_response(
+        result,
+        cap=_resolve_response_cap(agent._config, max_chars),
+        offset=offset,
+        fmt=fmt,
+        continuation_tool=f"web_fetch (url={result.url!r})",
     )
 
 
@@ -428,12 +673,25 @@ async def web_research(
     prefer_domains: Optional[list[str]] = None,
     domain_profile: Optional[str] = None,
     extract_files: bool = False,
+    max_chars: Optional[int] = None,
+    format: Optional[str] = None,
 ) -> ResearchResult:
     """Multi-page research recipe: search + parallel fetch+extract top N pages, build citations.
 
     Useful for "research X" or "summarize the latest on Y" tasks. Returns
     structured Citation objects (URL, title, snippet, relevance_score) plus
     full ExtractionResult per page for downstream summarization.
+
+    v1.7.0 response shape: each entry in ``summary_pages`` carries exactly
+    ONE content representation (markdown preferred, else text) and is
+    capped at ``max_chars`` chars PER PAGE (default: the server's
+    ``extraction.default_max_chars``). A capped page has
+    ``truncated=true`` + ``next_offset`` + a ``truncation_hint`` --
+    continue any single page with ``web_fetch(url=<page.url>,
+    offset=<next_offset>)``. The recipe's overall character budget
+    (``safety.max_chars_per_call``) still applies on top. Failed pages
+    surface ``fetch_status`` / ``error_message`` in ``diagnostics`` and on
+    any page-level results.
 
     Args:
         query: The research question or topic.
@@ -456,6 +714,10 @@ async def web_research(
             Default False preserves the v1.6.9 read-pages-only behaviour
             (file URLs go straight to ``download_candidates`` with
             ``block_reason="download_skipped"``).
+        max_chars: Per-page content cap in characters. None = server
+            default (``extraction.default_max_chars``).
+        format: 'markdown' | 'text'. Default (None) prefers markdown when
+            available, else text. ('html' is only available on web_fetch.)
 
     Returns:
         ResearchResult with citations, summary_pages, budget telemetry,
@@ -463,12 +725,13 @@ async def web_research(
         per-URL diagnostics.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
+    fmt = _validate_format(format)
     # v1.6.14 F-4: clamp LLM-supplied counts to sane ceilings to bound
     # prompt-injection-driven fan-out (max_pages parallel fetches; depth
     # is reserved but clamped defensively against negative/huge values).
     max_pages = min(max(max_pages, 1), 50)
     depth = min(max(depth, 1), 3)
-    return await agent.web_research(
+    result = await agent.web_research(
         query,
         depth=depth,
         max_pages=max_pages,
@@ -477,6 +740,17 @@ async def web_research(
         domain_profile=domain_profile,
         extract_files=extract_files,
     )
+    # v1.7.0: per-page cap + single representation at the MCP boundary.
+    # The recipe's BudgetTracker char budget already ran upstream.
+    cap = _resolve_response_cap(agent._config, max_chars)
+    for page in result.summary_pages:
+        _shape_content_response(
+            page,
+            cap=cap,
+            fmt=fmt,
+            continuation_tool=f"web_fetch (url={page.url!r})",
+        )
+    return result
 
 
 @mcp.tool()
@@ -485,6 +759,9 @@ async def web_fill_form_and_extract(
     url: str,
     spec: FormFilterSpec,
     session_id: Optional[str] = None,
+    max_chars: Optional[int] = None,
+    offset: int = 0,
+    format: Optional[str] = None,
 ) -> ExtractionResult:
     """Open a URL, fill a search/filter form, then extract post-submit content.
 
@@ -493,17 +770,45 @@ async def web_fill_form_and_extract(
     supplies semantic locators in ``spec`` (query input, filters, submit button,
     wait_for); the recipe runs the actions and returns the extracted content.
 
+    v1.7.0 failure transparency: on failure the result is no longer an
+    opaque empty shell -- ``failure_stage`` tells you WHICH step failed
+    ('navigation' | 'query_fill' | 'filter_fill' | 'submit' | 'wait_for' |
+    'ssrf_redirect' | 'capture') and ``error_message`` names the failing
+    selector and what to try next (typically: inspect the live page with
+    web_observe, correct the selector, retry). ``fetch_status='blocked'``
+    marks safety-policy blocks -- do not retry those.
+
+    v1.7.0 response shape: ONE content representation (markdown preferred,
+    else text), capped at ``max_chars`` (default: server's
+    ``extraction.default_max_chars``). When ``truncated=true``, call this
+    tool again with the same ``spec`` and ``offset=<next_offset>`` to
+    continue (form-gated content is not reachable via web_fetch).
+
     Args:
         url: The page URL hosting the form.
         spec: Declarative FormFilterSpec describing the form interaction.
         session_id: Optional persistent session (e.g. for authenticated dashboards).
+        max_chars: Content cap in characters. None = server default.
+        offset: Continuation offset (chars) into the extracted content.
+            The form is re-driven on each call; prefer a larger max_chars
+            when the form interaction is slow or has side effects.
+        format: 'markdown' | 'text'. Default (None) prefers markdown.
+            ('html' is only available on web_fetch.)
 
     Returns:
         ExtractionResult of the post-submit page. ``extraction_method="none"``
-        when locators don't resolve or the form times out.
+        plus the failure fields above when a step fails.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    return await agent.fill_form_and_extract(url, spec, session_id=session_id)
+    fmt = _validate_format(format)
+    result = await agent.fill_form_and_extract(url, spec, session_id=session_id)
+    return _shape_content_response(
+        result,
+        cap=_resolve_response_cap(agent._config, max_chars),
+        offset=offset,
+        fmt=fmt,
+        continuation_tool="web_fill_form_and_extract (same spec)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +1022,7 @@ async def web_observe(
     tab_id: Optional[str] = None,
     include_text: bool = True,
     include_aria: bool = False,
+    max_chars: Optional[int] = None,
 ) -> dict:
     """Capture a page's visual + structural state for observe-act-verify loops.
 
@@ -725,16 +1031,24 @@ async def web_observe(
     accessibility tree. Use the DPR to map screenshot pixels to the
     CSS pixels that ``web_click_xy`` expects.
 
+    v1.7.0: ``visible_text`` is capped at ``max_chars`` characters
+    (default: the server's ``extraction.default_max_chars``). When cut,
+    the response carries ``visible_text_truncated: true`` and
+    ``visible_text_total_chars``; use ``web_fetch`` with an ``offset``
+    for full-document reading -- observe is for orienting, not reading.
+
     Args:
         url: Open this URL (ephemeral page if no session_id, or
             navigate the session's current tab to it). Optional when
             session_id is given -- omit to observe current state.
         session_id: Live session whose tab to observe.
         tab_id: Specific tab to observe within the session.
-        include_text: Capture document.body.innerText (truncated to
-            safety.max_chars_per_call). Default True.
+        include_text: Capture document.body.innerText (capped as
+            described above). Default True.
         include_aria: Capture page.accessibility.snapshot(). Default
             False (snapshots can be megabytes).
+        max_chars: Cap for ``visible_text`` in characters. None = server
+            default (``extraction.default_max_chars``).
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
     obs = await agent.observe(
@@ -744,7 +1058,16 @@ async def web_observe(
         include_text=include_text,
         include_aria=include_aria,
     )
-    return obs.model_dump(mode="json")
+    payload = obs.model_dump(mode="json")
+    # v1.7.0: MCP-boundary cap on visible_text (the upstream cap is
+    # safety.max_chars_per_call, default 1M -- a token bomb over MCP).
+    cap = _resolve_response_cap(agent._config, max_chars)
+    text = payload.get("visible_text")
+    if isinstance(text, str) and len(text) > cap:
+        payload["visible_text"] = text[:cap]
+        payload["visible_text_truncated"] = True
+        payload["visible_text_total_chars"] = len(text)
+    return payload
 
 
 # ---------------------------------------------------------------------------
