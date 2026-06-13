@@ -332,6 +332,23 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
 - **Reaper race.** `scroll_to_bottom` / `scroll_until_text` touch the session each
   round so a long scroll isn't reaped mid-walk.
 
+**Schema-guided structured extraction** (new `web_agent/structured.py`)
+- The local, no-API answer to Firecrawl/ScrapeGraphAI schema extraction: give a
+  `{field: hint}` schema and get back a typed `fields` map.
+  `Agent.extract_fields(url, schema)` / `Recipes.extract_fields` / MCP
+  `web_extract_fields` resolve each requested field DETERMINISTICALLY (no LLM
+  call) against the strongest available structured page signal, in priority
+  order **JSON-LD → OpenGraph → `<meta>` → microdata → labelled DOM**.
+- New `StructuredExtractionResult`: `fields`, `field_sources` (which signal won
+  each field), `unresolved` (what no signal carried), plus failure-transparency
+  fields. Best on product / article / org / event pages that ship structured
+  data. The fetch goes through the normal pipeline (SSRF / robots / rate-limit /
+  bot-wall / injection-sanitize all apply); a failed fetch is transparent.
+- A Python-API-only `llm_extractor` hook (never exposed over MCP, since it runs
+  caller code) lets a calling agent fill the freeform fields the deterministic
+  resolver can't reach with its own model. `ExtractionConfig` gains
+  `schema_max_fields` / `schema_max_value_chars` / `schema_max_dom_pairs`.
+
 **New public surface (all additive)**
 - Waves 0–2F added 5 names — `ChallengeInfo`, `StorageStateResult`, `ProxyConfig`,
   `SearchEngine`, `SearchOutcome`. Wave 3 adds 7 more — `InjectionReport`,
@@ -339,15 +356,18 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   (`detect_injection`, `strip_hidden_dom`, `strip_invisible_chars`,
   `wrap_untrusted`). Wave 4 adds 4 more — `MetricsRegistry`, `MetricsSnapshot`,
   `MetricsConfig`, `InteractiveElement`. The gap-analysis pass adds 1 more —
-  `redact_injection` (a fifth injection helper) — bringing the package root from
-  118 to **130 exports**.
+  `redact_injection` (a fifth injection helper); schema extraction adds
+  `StructuredExtractionResult` — bringing the package root from 118 to
+  **131 exports**.
 - Waves 0–2F added 6 MCP tools (`web_search_links` + the five session tools);
   Wave 3 adds 2 more (`web_scroll_to_bottom`, `web_collect_pages`); Wave 4 adds
   `web_metrics`. The gap-analysis pass then **removed 3 duplicate** session tools
   (`create_browser_session` / `close_browser_session` / `list_browser_sessions`);
-  the MCP server tool count nets to **44**.
+  schema extraction adds `web_extract_fields`; the MCP server tool count nets to
+  **45**.
 - New sub-config: `MetricsConfig` (Wave 4A) — `config.py` now has **15**
-  `BaseSettings` sub-configs (was 14). New module `web_agent/metrics.py`.
+  `BaseSettings` sub-configs (was 14). New modules `web_agent/metrics.py` and
+  `web_agent/structured.py`.
 - New optional dependency: `pdfplumber` in the `[binary]` extra (Wave 3C).
 
 **Tests**

@@ -2081,3 +2081,99 @@ class CollectionResult(BaseModel):
     )
     correlation_id: Optional[str] = Field(default=None)
     total_time_ms: float = Field(default=0.0)
+
+
+class StructuredExtractionResult(BaseModel):
+    """Result of :meth:`Recipes.extract_fields` -- schema-guided field extraction.
+
+    v1.7.0 Wave 6: the caller supplies a SCHEMA (a list of field names, or a
+    ``dict`` mapping each field name to a human hint) and gets back a typed
+    ``fields`` map. Resolution is DETERMINISTIC and LLM-free: each requested
+    field is matched (exact / alias / contains / token-overlap) against the
+    strongest available STRUCTURED page signal -- JSON-LD, then OpenGraph, then
+    ``<meta>``, then microdata, then labelled DOM (``<dt>/<dd>``, ``<th>/<td>``,
+    ``<label>``). ``field_sources`` records which signal won for each field.
+
+    HONEST SCOPE: this covers the large slice of the real web that ships
+    structured data (e-commerce, articles, orgs, events). Freeform-prose fields
+    a deterministic resolver cannot reach are listed in ``unresolved``; the
+    Python-API ``llm_extractor`` hook on :meth:`Recipes.extract_fields` lets a
+    calling agent fill those with its OWN model (such fields are tagged
+    ``"llm"`` in ``field_sources``). A failed fetch is transparent -- the
+    underlying ``fetch_status`` / ``status_code`` / ``error_message`` are
+    carried so the caller can self-correct instead of seeing an opaque empty
+    result. All fields are additive / defaulted (backward-compatible).
+    """
+
+    url: str = Field(description="URL that was fetched")
+    fields: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Resolved field NAME (verbatim, as the caller wrote it in the "
+            "schema) -> value. Values are returned as the page provides them "
+            "(strings) with a light numeric coercion only when the whole value "
+            "is purely numeric (e.g. a price ``'1,299.00'`` -> ``1299.0``). No "
+            "schema typing is inferred or enforced. Only fields a source could "
+            "fill appear here; the rest are in ``unresolved``."
+        ),
+    )
+    field_sources: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Resolved field NAME -> the signal source that produced its value: "
+            "'json-ld' | 'opengraph' | 'meta' | 'microdata' | 'dom' | 'llm'. "
+            "'llm' marks a field filled by the optional injected "
+            "``llm_extractor`` hook (Python API only -- never over MCP). Lets a "
+            "caller weigh how authoritative each value is (a JSON-LD price is "
+            "stronger than a DOM-scraped label)."
+        ),
+    )
+    unresolved: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Requested field names that NO source could fill. A non-empty list "
+            "is normal for freeform-prose fields the deterministic resolver "
+            "cannot reach -- pass an ``llm_extractor`` (Python API) to have an "
+            "agent's own model attempt them."
+        ),
+    )
+    extraction_method: str = Field(
+        default="none",
+        description=(
+            "'structured-signals' when at least one field resolved from a page "
+            "signal (or the llm hook); 'none' on a failed fetch or when nothing "
+            "resolved. Mirrors the ``ExtractionResult.extraction_method`` "
+            "convention."
+        ),
+    )
+    # ------------------------------------------------------------------
+    # v1.7.0 failure transparency (mirrors ExtractionResult): a failed fetch
+    # carries WHY it failed so a caller / LLM can distinguish a 403 bot-wall
+    # from a robots block from a timeout, instead of an opaque empty result.
+    # All optional/defaulted -- backward-compatible.
+    # ------------------------------------------------------------------
+    fetch_status: Optional[str] = Field(
+        default=None,
+        description=(
+            "FetchStatus VALUE of the underlying fetch as a plain string "
+            "('success' | 'timeout' | 'http_error' | 'network_error' | "
+            "'blocked'). Populated when the fetch did not succeed; None on the "
+            "happy path."
+        ),
+    )
+    status_code: Optional[int] = Field(
+        default=None,
+        description=(
+            "HTTP status code of the underlying fetch when one was received "
+            "(403, 404, 429, ...). None when the failure happened before any "
+            "HTTP response (DNS error, robots block, domain block, timeout)."
+        ),
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description=(
+            "Actionable description of why extraction produced no fields, with "
+            "next-step phrasing. None on success."
+        ),
+    )
+    correlation_id: Optional[str] = Field(default=None)

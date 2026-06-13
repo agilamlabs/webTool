@@ -88,13 +88,14 @@ from .models import (
     SessionInfo,
     SkillApplicationResult,
     StorageStateResult,
+    StructuredExtractionResult,
     TabInfo,
     ToolMessage,
     ToolSeverity,
     TypeTextInput,
 )
 from .rate_limiter import RateLimiter
-from .recipes import Recipes
+from .recipes import LlmExtractor, Recipes
 from .robots import RobotsChecker
 from .search_engine import SearchEngine
 from .session_manager import SessionManager
@@ -1152,6 +1153,43 @@ class Agent:
                 settle_ms=settle_ms,
                 stable_rounds=stable_rounds,
                 max_scrolls=max_scrolls,
+            )
+
+    async def extract_fields(
+        self,
+        url: str,
+        schema: dict[str, str] | list[str],
+        *,
+        session_id: str | None = None,
+        strict: bool = False,
+        llm_extractor: LlmExtractor | None = None,
+    ) -> StructuredExtractionResult:
+        """Schema-guided structured extraction: page -> typed fields.
+
+        v1.7.0: map each requested field name to a value pulled from the
+        strongest available STRUCTURED page signal -- JSON-LD > OpenGraph >
+        meta tags > microdata > labelled DOM -- DETERMINISTICALLY (no LLM
+        call). ``schema`` is a ``{field: hint}`` map (or a list of field
+        names). The result's ``field_sources`` says which signal each field
+        came from and ``unresolved`` lists what no signal carried. Great on
+        product / article / org / event pages that ship structured data.
+
+        ``llm_extractor`` (Python API only -- it runs caller code, so it is
+        never exposed over MCP) is an optional ``(unresolved_schema, content)
+        -> {field: value}`` callable (sync or async) used to fill the
+        freeform fields the deterministic resolver couldn't reach with the
+        caller's own model. The fetch goes through the normal pipeline
+        (SSRF / robots / rate-limit / bot-wall / injection-sanitize all apply);
+        a failed fetch is transparent via ``fetch_status`` / ``error_message``.
+        """
+        async with self._call_scope("extract_fields", {"url": url, "strict": strict}):
+            self._debug.reset()
+            return await self._recipes.extract_fields(
+                url,
+                schema,
+                session_id=session_id,
+                strict=strict,
+                llm_extractor=llm_extractor,
             )
 
     # ------------------------------------------------------------------

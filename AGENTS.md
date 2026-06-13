@@ -31,7 +31,7 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # 1548 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
+python -m pytest -v          # 1579 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
@@ -59,6 +59,7 @@ web_agent/             # The package. One module = one responsibility.
   search_providers.py  # SearXNGProvider / DDGSProvider / PlaywrightProvider
   web_fetcher.py       # WebFetcher.fetch / fetch_many / fetch_binary + challenge settle-recheck (v1.7.0)
   content_extractor.py # trafilatura -> bs4 -> raw, plus PDF (pdfplumber -> pypdf) + tables / XLSX; max_chars/offset slicing (v1.7.0)
+  structured.py        # schema-guided field resolver: JSON-LD>OG>meta>microdata>DOM (v1.7.0)
   downloader.py        # 3-strategy file download with safety gates
   browser_actions.py   # 19 action types incl. coord-click + iframe + shadow-DOM + upload + drag + scroll_to_bottom (v1.6.6 + v1.6.7 + v1.7.0)
   recipes.py           # search_and_open_best_result, find_and_download_file,
@@ -90,7 +91,7 @@ tests/                 # All tests; mirrors the package layout 1:1
 
 ## Public API surface
 
-Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **130 names** as of v1.7.0):
+Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **131 names** as of v1.7.0):
 
 ```python
 from web_agent import (
@@ -107,9 +108,10 @@ from web_agent import (
     ChallengeInfo, StorageStateResult, SearchOutcome,    # v1.7.0 (waves 0-2)
     InjectionReport, CollectedPage, CollectionResult,    # v1.7.0 (wave 3)
     InteractiveElement,                                  # v1.7.0 (wave 4: set-of-marks)
+    StructuredExtractionResult,                          # v1.7.0 (schema-guided extract_fields)
 
-    # Untrusted-content helpers (v1.7.0 wave 3)
-    detect_injection, strip_hidden_dom, strip_invisible_chars, wrap_untrusted,
+    # Untrusted-content helpers (v1.7.0 wave 3; redact_injection added in the gap-fix pass)
+    detect_injection, strip_hidden_dom, strip_invisible_chars, wrap_untrusted, redact_injection,
 
     # Observability / metrics (v1.7.0 wave 4)
     MetricsRegistry, MetricsSnapshot,
@@ -229,7 +231,7 @@ of the ~7,400-line diff, a Wave-3 injection + collection/PDF pass, and
 a Wave-4 observability / Docker / a11y-targeting pass — that found
 **no critical/high issues** and confirmed the SSRF, path-traversal,
 cookie-domain, and session-isolation guarantees survive the refactor.
-Gates: **1548 passed / 28 deselected**, ruff clean, mypy strict clean.
+Gates: **1579 passed / 28 deselected**, ruff clean, mypy strict clean.
 
 **Wave 0 — Hermetic suite + toolchain.** 28 live-network /
 real-browser tests are now quarantined behind the `integration`
@@ -469,10 +471,13 @@ gap-fix pass then removed 3 duplicate session tools
 (`create_browser_session` / `close_browser_session` /
 `list_browser_sessions`); MCP server count ~39 → **44**. New sub-config
 `MetricsConfig` (Wave 4A) — `config.py` now has **15** `BaseSettings`
-sub-configs (was 14). New module `web_agent/metrics.py`. New optional
-dep: `pdfplumber` in the `[binary]` extra.
+sub-configs (was 14). New modules `web_agent/metrics.py` and
+`web_agent/structured.py` (schema-guided field extraction:
+`Agent.extract_fields` / MCP `web_extract_fields` /
+`StructuredExtractionResult`). New optional dep: `pdfplumber` in the
+`[binary]` extra.
 
-**Tests.** ~1133 → **1548 passing** (28 `integration` deselected,
+**Tests.** ~1133 → **1579 passing** (28 `integration` deselected,
 opt-in). Earlier-wave files: `test_challenge_detection`,
 `test_failure_transparency`, `test_token_efficiency`,
 `test_lifecycle`, `test_auth_persistence`, `test_search_resilience`,

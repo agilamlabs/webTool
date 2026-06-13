@@ -84,6 +84,7 @@ from .models import (
     ScreenshotFormat,
     ScreenshotResult,
     SearchResponse,
+    StructuredExtractionResult,
 )
 from .utils import safe_join_path
 
@@ -840,6 +841,42 @@ async def web_research(
             continuation_tool=f"web_fetch (url={page.url!r})",
         )
     return result
+
+
+@mcp.tool()
+async def web_extract_fields(
+    ctx: Context,
+    url: str,
+    schema: dict[str, str],
+    session_id: Optional[str] = None,
+) -> StructuredExtractionResult:
+    """Extract a requested set of FIELDS from a page (schema-guided extraction).
+
+    Give a ``schema`` mapping each field name to a short human hint, e.g.
+    ``{"price": "product price", "sku": "product id", "author": "who wrote it"}``,
+    and get back a typed ``fields`` map. Resolution is DETERMINISTIC -- each
+    field is matched against the strongest available STRUCTURED page signal,
+    and ``field_sources`` tells you which one won per field:
+      - 'json-ld'   : schema.org JSON-LD (strongest -- Product/Article/Event/Org)
+      - 'opengraph' : <meta property="og:..."/"product:..."/"article:...">
+      - 'meta'      : <meta name="..."> (description/keywords/author)
+      - 'microdata' : [itemprop] elements
+      - 'dom'       : labelled DOM (<dt>/<dd>, <th>/<td>, <label>+input)
+    Fields no signal carries come back in ``unresolved`` -- normal for
+    freeform prose a deterministic resolver can't reach; read the page with
+    ``web_fetch`` and pull those yourself. Best on e-commerce, articles,
+    organizations, and events, which ship structured data. The fetch goes
+    through the normal pipeline (SSRF / robots / rate-limit / bot-wall /
+    injection-sanitize all apply); a failed fetch is transparent via
+    ``fetch_status`` / ``status_code`` / ``error_message``.
+
+    Args:
+        url: Page to extract fields from.
+        schema: field name -> short hint describing what to pull.
+        session_id: Optional persistent browser session.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    return await agent.extract_fields(url, schema, session_id=session_id)
 
 
 @mcp.tool()
