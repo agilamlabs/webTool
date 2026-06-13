@@ -54,6 +54,7 @@ web_agent/             # The package. One module = one responsibility.
   exceptions.py        # WebAgentError hierarchy (used in strict=True paths)
   browser_manager.py   # Chromium lifecycle + per-context stealth + UA rotation + crash auto-relaunch (v1.7.0)
   challenge.py         # Bot-wall / CAPTCHA structural detection -> ChallengeInfo (v1.7.0)
+  captcha.py           # Pluggable CAPTCHA resolver hook contract: CaptchaContext/Resolution/Resolver (v1.7.0)
   injection.py         # Untrusted-content containment: hidden-DOM/Unicode strip + detect_injection -> InjectionReport (v1.7.0)
   search_engine.py     # SearchEngine -- chains providers + per-provider circuit breaker (v1.7.0)
   search_providers.py  # SearXNGProvider / DDGSProvider / PlaywrightProvider
@@ -91,7 +92,7 @@ tests/                 # All tests; mirrors the package layout 1:1
 
 ## Public API surface
 
-Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **131 names** as of v1.7.0):
+Everything an agent should import comes from the package root (`web_agent/__init__.py` exports **135 names** as of v1.7.0):
 
 ```python
 from web_agent import (
@@ -464,18 +465,23 @@ path is injection-proof via `_REF_PATTERN.fullmatch`.
 `wrap_untrusted`). Wave 4 adds 4 more — `MetricsRegistry`,
 `MetricsSnapshot`, `MetricsConfig`, `InteractiveElement`. The
 gap-analysis pass adds 1 more — `redact_injection` (so the injection
-helpers are now five) — so the root goes 118 → **130**. MCP tools: the
-waves added 9 (`web_search_links` + 5 session tools +
-`web_scroll_to_bottom` + `web_collect_pages` + `web_metrics`), and the
-gap-fix pass then removed 3 duplicate session tools
-(`create_browser_session` / `close_browser_session` /
-`list_browser_sessions`); MCP server count ~39 → **44**. New sub-config
-`MetricsConfig` (Wave 4A) — `config.py` now has **15** `BaseSettings`
-sub-configs (was 14). New modules `web_agent/metrics.py` and
+helpers are now five). Schema extraction adds `StructuredExtractionResult`;
+the CAPTCHA resolver hook adds 4 — `CaptchaContext`, `CaptchaResolution`,
+`CaptchaResolver`, `normalize_resolution` — so the root goes 118 → **135**.
+MCP tools: the waves added 9 (`web_search_links` + 5 session tools +
+`web_scroll_to_bottom` + `web_collect_pages` + `web_metrics`), the
+gap-fix pass removed 3 duplicate session tools (`create_browser_session`
+/ `close_browser_session` / `list_browser_sessions`), and schema
+extraction adds `web_extract_fields`; MCP server count ~39 → **45** (the
+CAPTCHA resolver hook adds NO tool — it is a Python-only hook, never over
+the wire). New sub-config `MetricsConfig` (Wave 4A) — `config.py` now has
+**15** `BaseSettings` sub-configs (was 14); `FetchConfig` also gains the
+`captcha_*` knobs. New modules `web_agent/metrics.py`,
 `web_agent/structured.py` (schema-guided field extraction:
 `Agent.extract_fields` / MCP `web_extract_fields` /
-`StructuredExtractionResult`). New optional dep: `pdfplumber` in the
-`[binary]` extra.
+`StructuredExtractionResult`), and `web_agent/captcha.py` (the resolver
+hook contract: `Agent(captcha_resolver=...)`). New optional dep:
+`pdfplumber` in the `[binary]` extra.
 
 **Tests.** ~1133 → **1579 passing** (28 `integration` deselected,
 opt-in). Earlier-wave files: `test_challenge_detection`,
