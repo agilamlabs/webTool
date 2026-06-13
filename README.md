@@ -90,14 +90,40 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 >   new `LocatorSpec(ref=...)` mode — so the model picks "element #N from what I
 >   just observed" instead of guessing a CSS selector. Reuses every existing
 >   locator + safety gate; the ref pattern is injection-proof. New
->   `AutomationConfig.observe_max_elements` / `observe_tag_refs`.
+>   `AutomationConfig.observe_max_elements` / `observe_tag_refs`. The set-of-marks
+>   loop now works **end-to-end over MCP**: `web_interact` / `Agent.interact`
+>   accept an **omitted `url`** and act on the session's current tab *in place*
+>   (no navigation), so the `data-webtool-ref` stamps from `web_observe` survive.
+>   Reliable loop: `web_create_session` → `web_observe(session_id)` (reads refs) →
+>   `web_interact(session_id, actions=[{"action":"click","selector":{"ref":"e3"}}])`
+>   with `url` omitted. (Previously `web_interact` always navigated and wiped the
+>   refs.)
+> * **Isolation + CDP on by default** — `BrowserConfig.isolation_mode` and
+>   `cdp_enabled` now default **`True`**: every `Agent` launches an isolated,
+>   ephemeral-profile browser with a loopback CDP debug port out of the box (both
+>   still toggleable off; the validator reconciles `isolation_mode=False` /
+>   `backend="remote_cdp"` automatically). Security note: the loopback CDP port is
+>   **unauthenticated** — set `browser.cdp_enabled=False` on shared / multi-tenant
+>   hosts or with sensitive authenticated sessions (see [SECURITY.md](SECURITY.md)).
+> * **Gap-analysis fixes** — `web_interact` acts in place over MCP (above);
+>   removed 3 duplicate session tools (`create_browser_session` /
+>   `close_browser_session` / `list_browser_sessions`) that shadowed the canonical
+>   `web_*` set (server now **44** tools); the downloader threads the configured
+>   proxy on its httpx path (+ `download_total` / `download_outcome` /
+>   `download_bytes` metrics); `collect_across_pages` surfaces per-page
+>   `CollectedPage.injection` + a `max_injection_risk` / `pages_with_injection`
+>   rollup and skips a `block`-flagged page mid-walk; injection precision tightened
+>   (HTML `<s>` no longer escalates to HIGH) with a new exported `redact_injection`
+>   that makes `injection_action=redact` actually mask the override; and the idle
+>   reaper no longer races a long scroll.
 >
-> Adds **9 new MCP tools** (server now exposes **~48**), **16 new public exports**
-> (`ChallengeInfo`, `StorageStateResult`, `ProxyConfig`, `SearchEngine`,
-> `SearchOutcome`, `InjectionReport`, `CollectedPage`, `CollectionResult`, the
-> four injection helpers, plus `MetricsRegistry`, `MetricsSnapshot`,
-> `MetricsConfig`, `InteractiveElement` → **129** total), and grows the suite to
-> **1506 passing** (28 `integration` deselected, opt-in). Adversarial close-out
+> Adds new MCP tools and removes 3 duplicate session tools — the server now
+> exposes **44** — and **17 new public exports** (`ChallengeInfo`,
+> `StorageStateResult`, `ProxyConfig`, `SearchEngine`, `SearchOutcome`,
+> `InjectionReport`, `CollectedPage`, `CollectionResult`, the injection helpers
+> incl. the new `redact_injection`, plus `MetricsRegistry`, `MetricsSnapshot`,
+> `MetricsConfig`, `InteractiveElement` → **130** total), and grows the suite to
+> **1548 passing** (28 `integration` deselected, opt-in). Adversarial close-out
 > reviews (a 4-dimension review of the ~7,400-line diff, a Wave 3 injection +
 > collection/PDF pass, and a Wave 4 observability / Docker / a11y-targeting pass)
 > found **no critical/high issues**. **Behaviour changes:** bot-challenge pages
@@ -383,7 +409,7 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 > tab management (`agent.list_tabs / new_tab / switch_tab / close_tab`),
 > coordinate-level click fallbacks (`click_xy / type_text / press_key`),
 > observe mode (`Agent.observe()` returns screenshot + viewport + DPR +
-> ARIA snapshot), and `Agent.doctor()` self-diagnostic with 14 capability
+> ARIA snapshot), and `Agent.doctor()` self-diagnostic with 19 capability
 > probes (CLI: `web-agent doctor`).
 >
 > **Earlier versions** (1.6.5 cookie isolation / SSRF hardening; 1.6.4
@@ -428,7 +454,7 @@ Slots in as a **local, no-API web backend** under autonomous agents like [OpenCl
 - **Download Event Diagnostics** — separate `page.on('download')` notification (auto-deletes Chromium tmpfile) surfaces as `download_candidates_runtime`.
 - **Post-Action Screenshot Verification** — best-effort `verify-<cid>-<index>.png` per successful action.
 - **Session Replay** — per-session JSONL trace at `<base_dir>/.webtool-audit/traces/<sid>.jsonl`. Replay via `Agent.replay_trace(file)` or CLI `web-agent replay <file>`.
-- **Doctor** (v1.6.6) — `Agent.doctor()` runs 14 capability probes; CLI `web-agent doctor [--json]` exits 2 on `unusable` so CI can gate on it.
+- **Doctor** (v1.6.6) — `Agent.doctor()` runs 19 capability probes; CLI `web-agent doctor [--json]` exits 2 on `unusable` so CI can gate on it.
 
 ### Safety + observability
 - **Safety Controls** — Domain allow/deny lists, granular `allow_*` flags, SSRF protection (RFC1918 + loopback + link-local), per-call budgets.
@@ -621,12 +647,12 @@ See [config.example.yaml](config.example.yaml) for all available options.
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
-| `browser` | `isolation_mode` | `false` | Launch with `--user-data-dir` so cookies/cache/downloads are isolated from real Chrome |
+| `browser` | `isolation_mode` | `true` | Launch with `--user-data-dir` so cookies/cache/downloads are isolated from real Chrome. Default-on since v1.7.0; set `false` for a plain non-isolated browser (also auto-disables `cdp_enabled`) |
 | `browser` | `profile_mode` | `"ephemeral"` | `"ephemeral"` (auto tempdir) or `"named"` (persistent at `profile_dir`) |
 | `browser` | `profile_dir` | `None` | Required when `profile_mode="named"`. Resolved against `base_dir` if relative |
 | `browser` | `cleanup_on_exit` | `true` | Remove the ephemeral profile dir on Agent exit |
 | `browser` | `backend` | `"playwright"` | `"playwright"` / `"cdp_owned"` / `"remote_cdp"` (v1.6.8) |
-| `browser` | `cdp_enabled` | `false` | Launch with `--remote-debugging-port` so external tools can attach via CDP. Requires `isolation_mode=true` |
+| `browser` | `cdp_enabled` | `true` | Launch with `--remote-debugging-port` so external tools can attach via CDP. Requires `isolation_mode=true`. Default-on since v1.7.0. **Security:** the port is loopback-bound but the CDP endpoint is **unauthenticated** — any local process can drive the browser; set `false` on shared/multi-tenant hosts or with sensitive sessions (see [SECURITY.md](SECURITY.md)) |
 | `browser` | `cdp_host` | `"127.0.0.1"` | Loopback only -- non-loopback rejected at validation |
 | `browser` | `cdp_port` | `0` | `0` = OS-assigned, discovered via `DevToolsActivePort` |
 | `browser` | `remote_cdp_url` | `None` | Required when `backend="remote_cdp"`. Must be a loopback `ws://` / `wss://` URL (v1.6.8) |
@@ -1376,7 +1402,7 @@ python -m web_agent serve-mcp
 
 The server uses stdio transport -- it's invoked by the MCP client, not run standalone.
 
-### Exposed Tools (~48 total)
+### Exposed Tools (44 total)
 
 **Single-shot pipeline tools** — one URL or query, one result:
 
@@ -1435,9 +1461,10 @@ Content-returning tools (`web_fetch`, `web_search`, `web_search_best`, `web_rese
 | Tool | Description |
 |------|-------------|
 | `web_observe` | Screenshot + viewport + page-size + DPR + optional ARIA snapshot; also returns a numbered list of interactive `elements` for the act-by-ref loop (`{"ref":"e3"}` as a selector, v1.7.0) |
-| `web_doctor` | Run 14 capability probes; returns `DoctorReport` |
+| `web_doctor` | Run 19 capability probes; returns `DoctorReport` |
 | `web_metrics` | Snapshot in-process counters + distributions (`MetricsSnapshot`, v1.7.0) |
 | `web_get_cdp_endpoint` | Return CDP ws:// URL when `cdp_enabled=True` |
+| `web_get_owned_cdp_connection_info` | Full attach bundle (`cdp_url` + `profile_dir` + `ownership_token`) for a sibling `remote_cdp` Agent |
 | `web_get_remote_cdp_url` | Return ws:// URL when `backend="remote_cdp"` |
 | `web_list_traces` | Session-ids of replay traces under `diagnostics.trace_dir` |
 | `web_replay_trace` | Re-execute the action list in a trace JSONL |
@@ -1486,7 +1513,7 @@ Add:
 }
 ```
 
-Restart Claude Desktop. All ~48 tools should appear in the tool picker.
+Restart Claude Desktop. All 44 tools should appear in the tool picker.
 
 ### Claude Code Setup
 
@@ -1608,7 +1635,7 @@ WEB_AGENT_CACHE__ENABLED = "true"
 WEB_AGENT_CACHE__CACHE_DIR = "/var/cache/openclaw/web_agent"
 ```
 
-OpenClaw will auto-discover all ~48 tools (`web_search` / `web_search_links`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the recipes including `web_fill_form_and_extract` and `web_collect_pages`, the 5 session-management tools, `web_metrics`, plus the tab / coordinate / scroll / observe / domain-skill / interaction-library surfaces).
+OpenClaw will auto-discover all 44 tools (`web_search` / `web_search_links`, `web_fetch`, `web_download`, `web_screenshot`, `web_interact`, the recipes including `web_fill_form_and_extract` and `web_collect_pages`, the 5 session-management tools, `web_metrics`, plus the tab / coordinate / scroll / observe / domain-skill / interaction-library surfaces).
 
 **Path B: As a Python library** (for OpenClaw skills / custom hooks where you need fine control):
 
@@ -1771,7 +1798,7 @@ CI runs `ruff check`, `ruff format --check`, `mypy`, and the unit-test job on Py
 
 ```
 web_agent/                       # 33 modules, mypy strict-clean
-  __init__.py                    # v1.7.0 -- 129 public exports
+  __init__.py                    # v1.7.0 -- 130 public exports
   py.typed                       # PEP 561 marker
   exceptions.py                  # WebAgentError hierarchy
   config.py                      # AppConfig + 15 sub-configs incl. ProxyConfig + MetricsConfig (programmatic / env / YAML)
@@ -1791,7 +1818,7 @@ web_agent/                       # 33 modules, mypy strict-clean
   browser_actions.py             # 19 action handlers + per-action verify screenshot + trace recording + scroll_to_bottom (v1.7.0)
   session_manager.py             # Persistent named BrowserContext sessions + storage_state export/import + idle reaper (v1.7.0)
   tab_manager.py                 # Per-session tab lifecycle + popup auto-register (v1.6.6)
-  doctor.py                      # 14 capability probes + DoctorReport (v1.6.6)
+  doctor.py                      # 19 capability probes + DoctorReport (v1.6.6)
   domain_skills.py               # Skill registry + dispatcher (v1.6.7)
   workspace.py                   # Agent-editable workspace with 4 safety modes (v1.6.7)
   builtin_skills/                # 3 bundled skills: sec.gov / github.com / ec.europa.eu (v1.6.7)
@@ -1803,7 +1830,7 @@ web_agent/                       # 33 modules, mypy strict-clean
   content_extractor.py           # trafilatura -> BS4 -> raw; PDF (pdfplumber -> pypdf) + tables / XLSX / DOCX / CSV via [binary] (v1.7.0)
   downloader.py                  # Three-strategy file/page download with safety + sessions
   recipes.py                     # search_and_open_best, find_and_download, web_research, fill_form_and_extract, collect_across_pages (v1.7.0)
-  mcp_server.py                  # FastMCP server -- ~48 tools (honours log_level + correlation id, v1.7.0)
+  mcp_server.py                  # FastMCP server -- 44 tools (honours log_level + correlation id, v1.7.0)
   main.py                        # CLI: search / fetch / download / interact / screenshot / observe / skills / doctor / replay
 docker/                          # Non-root Playwright-based image: Dockerfile + docker-compose.yml + README.md + .dockerignore (v1.7.0)
 docker/searxng/                  # Self-hosted SearXNG quickstart (compose + tuned settings)
