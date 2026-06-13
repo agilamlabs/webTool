@@ -79,6 +79,7 @@ from .models import (
     ExtractionResult,
     FetchStatus,
     FormFilterSpec,
+    MetricsSnapshot,
     ResearchResult,
     ScreenshotFormat,
     ScreenshotResult,
@@ -239,12 +240,26 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
     # loguru's built-in default sink (id 0) if still present, add our own
     # stderr sink, and on shutdown remove ONLY the handler we added so the
     # host's logging is left intact.
+    # v1.7.0 (Wave 4A): load config FIRST so the sink honours
+    # ``config.log_level`` (the server previously hard-coded INFO), and use a
+    # format that surfaces the correlation id (``{extra[cid]}`` is populated by
+    # ``correlation.patch_loguru``, auto-installed on import) so MCP logs are
+    # traceable.
+    config = _load_mcp_config()
     with suppress(ValueError):
         logger.remove(0)
-    handler_id = logger.add(sys.stderr, level="INFO")
+    handler_id = logger.add(
+        sys.stderr,
+        level=config.log_level,
+        format=(
+            "<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | "
+            "<magenta>{extra[cid]}</magenta> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        ),
+    )
 
     logger.info("Starting web_agent MCP server...")
-    config = _load_mcp_config()
     try:
         async with Agent(config) as agent:
             logger.info("web_agent MCP server ready")
@@ -603,6 +618,9 @@ async def web_interact(
 
         # Semantic locator (label):
         {"action": "fill", "selector": {"label": "Email"}, "value": "me@example.com"}
+
+        # Set-of-marks ref from web_observe (most reliable; v1.7.0):
+        {"action": "click", "selector": {"ref": "e3"}}
 
     Example sequence::
 
@@ -1173,6 +1191,7 @@ async def web_observe(
     tab_id: Optional[str] = None,
     include_text: bool = True,
     include_aria: bool = False,
+    include_elements: bool = True,
     max_chars: Optional[int] = None,
 ) -> dict:
     """Capture a page's visual + structural state for observe-act-verify loops.
@@ -1181,6 +1200,16 @@ async def web_observe(
     position, device pixel ratio, plus optional visible text and ARIA
     accessibility tree. Use the DPR to map screenshot pixels to the
     CSS pixels that ``web_click_xy`` expects.
+
+    SET-OF-MARKS act-by-ref (v1.7.0): ``elements`` is a bounded, numbered
+    list of the page's interactive elements -- each has a ``ref`` ("e1",
+    "e2", ...), ``role``, accessible ``name``, ``tag``, ``enabled``,
+    ``visible`` and ``bbox`` [x,y,w,h] in CSS px. To act on one, pass its
+    ref back to ``web_interact`` as a LocatorSpec selector ``{"ref": "e3"}``
+    -- the most reliable way to click/fill an element you just observed,
+    no CSS-selector guessing. ``elements_truncated: true`` means the page
+    had more than ``automation.observe_max_elements``. A ref is valid only
+    until the DOM changes; a stale ref fails cleanly -- just re-observe.
 
     v1.7.0: ``visible_text`` is capped at ``max_chars`` characters
     (default: the server's ``extraction.default_max_chars``). When cut,
@@ -1208,6 +1237,7 @@ async def web_observe(
         tab_id=tab_id,
         include_text=include_text,
         include_aria=include_aria,
+        include_elements=include_elements,
     )
     payload = obs.model_dump(mode="json")
     # v1.7.0: MCP-boundary cap on visible_text (the upstream cap is
@@ -1245,6 +1275,23 @@ async def web_doctor(ctx: Context, quick: bool = False) -> dict:
     agent: Agent = ctx.request_context.lifespan_context["agent"]
     report = await agent.doctor(quick=quick)
     return report.model_dump(mode="json")
+
+
+@mcp.tool()
+async def web_metrics(ctx: Context) -> MetricsSnapshot:
+    """In-process observability counters for this MCP daemon (v1.7.0).
+
+    Answers "how is this server doing" without grepping logs. Counters:
+    fetch_total, fetch_outcome{status}, challenge_detected{vendor},
+    search_total, search_provider_outcome{provider,outcome},
+    search_circuit_trip{provider}, browser_launch / browser_crash /
+    browser_relaunch{result}. Distributions (count/sum/min/max/avg):
+    bytes_downloaded, ttfb_ms. Use it to spot a rising bot-wall rate, a
+    blocked search provider, or browser instability on a long-running server.
+    Cheap to call; reflects everything since the server started.
+    """
+    agent: Agent = ctx.request_context.lifespan_context["agent"]
+    return agent.metrics()
 
 
 # ---------------------------------------------------------------------------

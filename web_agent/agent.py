@@ -46,7 +46,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
@@ -57,7 +57,7 @@ from .browser_manager import BrowserManager
 from .cache import Cache, DiskCache
 from .config import AppConfig
 from .content_extractor import ContentExtractor
-from .correlation import correlation_scope
+from .correlation import correlation_scope, get_correlation_id
 from .debug import DebugCapture
 from .downloader import Downloader
 from .models import (
@@ -76,6 +76,7 @@ from .models import (
     FetchResult,
     FetchStatus,
     FormFilterSpec,
+    MetricsSnapshot,
     MouseButton,
     ObserveResult,
     PressKeyInput,
@@ -254,6 +255,15 @@ class Agent:
 
     def __init__(self, config: AppConfig | None = None) -> None:
         self._config = config or AppConfig()
+        # v1.7.0 (Wave 4A): the Agent owns its own metrics registry so two
+        # Agents in one process don't share counters. When disabled, every
+        # increment is a no-op enforced inside the registry.
+        from .metrics import MetricsRegistry
+
+        self._metrics = MetricsRegistry(
+            enabled=self._config.metrics.enabled,
+            max_label_cardinality=self._config.metrics.max_label_cardinality,
+        )
         # v1.6.8: NetworkCollector is created first so every subsystem
         # below can pass it down to its Page handlers. The collector is
         # a pure data sink -- when both capture switches are False (the
@@ -266,7 +276,9 @@ class Agent:
         from .trace_recorder import SessionTraceRecorder
 
         self._trace_recorder = SessionTraceRecorder(self._config.diagnostics, self._config.base_dir)
-        self._bm = BrowserManager(self._config, network_collector=self._network_collector)
+        self._bm = BrowserManager(
+            self._config, network_collector=self._network_collector, metrics=self._metrics
+        )
         self._sessions = SessionManager(
             self._bm, self._config, network_collector=self._network_collector
         )
@@ -314,6 +326,7 @@ class Agent:
             rate_limiter=self._rate_limiter,
             cache=self._cache,
             circuit_cooldown_s=self._config.search.circuit_cooldown_s,
+            metrics=self._metrics,
         )
         self._fetcher = WebFetcher(
             self._bm,
@@ -324,6 +337,7 @@ class Agent:
             robots=self._robots,
             cache=self._cache,
             network_collector=self._network_collector,
+            metrics=self._metrics,
         )
         self._extractor = ContentExtractor(self._config)
         self._downloader = Downloader(
@@ -968,6 +982,24 @@ class Agent:
         """Return SessionInfo snapshots for all live sessions."""
         return self._sessions.list()
 
+    def metrics(self) -> MetricsSnapshot:
+        """Return a point-in-time snapshot of this Agent's in-process metrics.
+
+        v1.7.0 (Wave 4A): cheap to call. Reflects counters accumulated since
+        start -- fetch totals + outcomes, bot-wall detections, search provider
+        results + circuit trips, and browser launch/crash/relaunch -- plus
+        ``bytes_downloaded`` / ``ttfb_ms`` distributions. Returns an empty
+        snapshot when ``metrics.enabled`` is False.
+        """
+        raw = self._metrics.snapshot()
+        return MetricsSnapshot(
+            enabled=bool(raw.get("enabled", False)),
+            counters=cast("dict[str, int]", raw.get("counters", {})),
+            distributions=cast("dict[str, dict[str, float]]", raw.get("distributions", {})),
+            uptime_s=cast("float", raw.get("uptime_s", 0.0)),
+            correlation_id=get_correlation_id(),
+        )
+
     async def export_session_state(
         self, session_id: str, path: str | Path
     ) -> StorageStateResult:
@@ -1306,6 +1338,7 @@ class Agent:
         tab_id: Optional[str] = None,
         include_text: bool = True,
         include_aria: bool = False,
+        include_elements: bool = True,
     ) -> ObserveResult:
         """Capture a page's visual + structural state.
 
@@ -1328,6 +1361,11 @@ class Agent:
                 to safety.max_chars_per_call). Default True.
             include_aria: Capture ``page.accessibility.snapshot()``.
                 Default False (snapshots can be megabytes).
+            include_elements: Enumerate a bounded, numbered "set of marks"
+                list of interactive elements (ref/role/name/bbox) in
+                ``ObserveResult.elements``. Pass an element's ``ref`` back as
+                a ``LocatorSpec(ref=...)`` to act on it without guessing a
+                selector. Default True.
         """
         async with self._call_scope(
             "observe", {"url": url, "session_id": session_id, "tab_id": tab_id}
@@ -1338,6 +1376,7 @@ class Agent:
                 tab_id=tab_id,
                 include_text=include_text,
                 include_aria=include_aria,
+                include_elements=include_elements,
             )
 
     # ------------------------------------------------------------------
