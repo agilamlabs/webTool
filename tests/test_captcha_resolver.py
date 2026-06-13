@@ -299,6 +299,54 @@ class TestAttemptResolution:
         assert c["captcha_resolution_outcome{result=timeout}"] == 1
 
     @pytest.mark.asyncio
+    async def test_builtin_timeout_error_classified_as_timeout(self, monkeypatch) -> None:
+        # A resolver that self-raises the BUILTIN TimeoutError (distinct from
+        # asyncio.TimeoutError on Python 3.10) is classified as timeout, not error.
+        detect_mock, _ = _patch(monkeypatch, detect=None)
+        metrics = MetricsRegistry(enabled=True)
+        resolver = AsyncMock(side_effect=TimeoutError("solver too slow"))
+        f = _fetcher(resolver=resolver, metrics=metrics)
+        standing, _h, _s = await f._attempt_captcha_resolution(
+            _page(), "u", _wall(), "h", "content"
+        )
+        assert standing is not None
+        assert standing.resolution_succeeded is False
+        detect_mock.assert_not_called()
+        c = _counters(metrics)
+        assert c["captcha_resolution_outcome{result=timeout}"] == 1
+
+    @pytest.mark.asyncio
+    async def test_slow_sync_resolver_warns(self, monkeypatch) -> None:
+        # A synchronous hook that overruns the budget can't be interrupted,
+        # but it is measured and a warning is emitted after the fact.
+        import time as _time
+
+        _patch(monkeypatch, detect=None)
+        warn = MagicMock()
+        monkeypatch.setattr(wf.logger, "warning", warn)
+
+        def slow(ctx: CaptchaContext) -> bool:
+            _time.sleep(0.02)
+            return True
+
+        f = _fetcher(resolver=slow, captcha_attempt_timeout_s=0.01)
+        standing, _h, _s = await f._attempt_captcha_resolution(
+            _page(), "u", _wall(), "h", "content"
+        )
+        assert standing is None  # detect=None -> cleared
+        assert warn.called
+        assert "blocked the event loop" in warn.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_fast_sync_resolver_does_not_warn(self, monkeypatch) -> None:
+        _patch(monkeypatch, detect=None)
+        warn = MagicMock()
+        monkeypatch.setattr(wf.logger, "warning", warn)
+        f = _fetcher(resolver=lambda ctx: True, captcha_attempt_timeout_s=60.0)
+        await f._attempt_captcha_resolution(_page(), "u", _wall(), "h", "content")
+        warn.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_recapture_failure_is_isolated(self, monkeypatch) -> None:
         detect_mock = MagicMock(return_value=None)
         content_mock = AsyncMock(side_effect=RuntimeError("page gone"))

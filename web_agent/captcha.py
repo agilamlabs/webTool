@@ -116,8 +116,14 @@ class CaptchaResolution:
 
 
 # A resolver hook: given a CaptchaContext, attempt to clear the wall and
-# report the outcome. May be sync or async; may return a CaptchaResolution,
-# a bare bool (True == "I cleared it"), or None (treated as not-resolved).
+# report the outcome. May return a CaptchaResolution, a bare bool
+# (True == "I cleared it"), or None (treated as not-resolved).
+#
+# PREFER ``async def``. An async hook is bounded by
+# ``FetchConfig.captcha_attempt_timeout_s`` and yields the event loop while it
+# waits. A SYNCHRONOUS hook BLOCKS the entire event loop for its whole
+# duration and cannot be timed out -- so any hook that waits on I/O, a human,
+# or a remote solver MUST be async, or it will stall all other concurrent work.
 CaptchaResolver = Callable[
     [CaptchaContext],
     Union[bool, CaptchaResolution, None, Awaitable[Union[bool, CaptchaResolution, None]]],

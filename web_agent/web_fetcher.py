@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
@@ -1328,19 +1329,39 @@ class WebFetcher:
         """Call the hook (sync or async), bounding an async hook by timeout.
 
         A synchronous hook is not timed -- it blocks the event loop, so the
-        contract is "keep it fast". An async hook is wrapped in
-        :func:`asyncio.wait_for` with ``FetchConfig.captcha_attempt_timeout_s``
-        (0 disables the bound). The return value is normalized to a
-        :class:`CaptchaResolution`. Exceptions (incl. timeout) propagate to
-        the caller, which isolates them.
+        contract is "keep it fast" (use ``async def`` for anything that
+        waits). An async hook is wrapped in :func:`asyncio.wait_for` with
+        ``FetchConfig.captcha_attempt_timeout_s`` (0 disables the bound).
+        The return value is normalized to a :class:`CaptchaResolution`.
+        Exceptions (incl. timeout) propagate to the caller, which isolates
+        them.
+
+        A sync hook that overruns the budget can't be interrupted (it has
+        already blocked the loop by the time it returns), but we measure it
+        and warn after the fact so the operator knows to switch to ``async``.
         """
         timeout = self._config.fetch.captcha_attempt_timeout_s
+        started = time.monotonic()
         outcome = resolver(ctx)
         if inspect.isawaitable(outcome):
             if timeout and timeout > 0:
                 outcome = await asyncio.wait_for(outcome, timeout=timeout)
             else:
                 outcome = await outcome
+        else:
+            # Sync hook: it already ran to completion on this thread, blocking
+            # the event loop. Can't bound it retroactively -- but if it
+            # overran the budget, surface that so it can be made async.
+            elapsed = time.monotonic() - started
+            if timeout and timeout > 0 and elapsed > timeout:
+                logger.warning(
+                    "Synchronous CAPTCHA resolver blocked the event loop for "
+                    "{e:.1f}s (over the {t:.1f}s budget). Make the hook "
+                    "'async def' so it is bounded by captcha_attempt_timeout_s "
+                    "and does not stall other concurrent work.",
+                    e=elapsed,
+                    t=timeout,
+                )
         return normalize_resolution(outcome)
 
     async def _attempt_captcha_resolution(
@@ -1389,7 +1410,11 @@ class WebFetcher:
             self._metrics.incr("captcha_resolution_attempt", vendor=current.vendor)
             try:
                 resolution = await self._invoke_captcha_resolver(resolver, ctx)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, TimeoutError):
+                # asyncio.wait_for raises asyncio.TimeoutError; on Python 3.10
+                # that is a DISTINCT class from the builtin TimeoutError, so we
+                # catch both -- this also classifies a resolver that self-raises
+                # a builtin TimeoutError as a timeout, not a generic error.
                 logger.warning(
                     "CAPTCHA resolver timed out (>{s}s) for {url} on attempt {n}/{m}",
                     s=cfg.captcha_attempt_timeout_s,

@@ -403,7 +403,7 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
 - New optional dependency: `pdfplumber` in the `[binary]` extra (Wave 3C).
 
 **Tests**
-- Suite went from ~1133 to **1624 passing** (28 `integration` deselected,
+- Suite went from ~1133 to **1627 passing** (28 `integration` deselected,
   opt-in). Earlier-wave files: `test_challenge_detection`,
   `test_failure_transparency`, `test_token_efficiency`, `test_lifecycle`,
   `test_auth_persistence`, `test_search_resilience`, `test_proxy_fingerprint`,
@@ -416,9 +416,10 @@ cannot crash logging, and the set-of-marks ref path is injection-proof via
   act-by-ref-over-MCP, duplicate-tool-removal, and `redact_injection` coverage in
   `test_v170_wiring` / `test_injection_containment` / `test_collection`. Schema
   extraction adds `test_structured_extraction`; the CAPTCHA resolver hook adds
-  `test_captcha_resolver` (30 tests — normalize coercion, the bounded
+  `test_captcha_resolver` (33 tests — normalize coercion, the bounded
   attempt loop with authoritative re-detection, exception / timeout / recapture
-  isolation, early concede, Agent wiring, config bounds).
+  isolation, early concede, sync-hook event-loop-block warning, Agent wiring,
+  config bounds).
 
 ## [1.6.16] - 2026-06-02
 

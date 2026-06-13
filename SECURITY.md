@@ -232,6 +232,21 @@ an **explicit** conflicting `True` still errors.
   agent from treating the wall's HTML as the real page content. (This
   is detection-and-honest-reporting, not a bypass -- defeating
   bot-management remains out of scope, see below.)
+- **CAPTCHA resolver hook trust boundary.** The optional
+  `Agent(captcha_resolver=...)` hook is **in-process caller code** and is
+  invoked with a **live Playwright `Page`** handle -- it can drive the
+  browser arbitrarily. It is therefore trusted at the same level as the
+  rest of the host process and, like the `llm_extractor` hook, is **never
+  accepted over the MCP wire** (an MCP client cannot inject a resolver;
+  only the operator who constructs the `Agent` can). An async hook is
+  bounded by `fetch.captcha_attempt_timeout_s` and the attempt count by
+  `fetch.captcha_max_attempts`; a hook that raises, times out, or leaves
+  the page uncapturable is isolated and the wall simply stands. The hook's
+  own "resolved" verdict is **never trusted to clear a wall** -- webTool
+  re-runs structural detection against the live page and only proceeds when
+  detection itself comes back clean, so a buggy or over-optimistic hook
+  cannot turn a `BLOCKED` into a `SUCCESS`. (Providing a solver remains the
+  operator's responsibility; webTool ships none.)
 - **Prompt-injection containment.** Fetched/observed content is run
   through an injection pass that strips hidden content (off-screen /
   zero-size / `display:none` text used to smuggle instructions) and
