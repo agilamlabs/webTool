@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Pinned GitHub Actions to immutable Node 24 SHAs, added weekly Dependabot updates, and corrected the agent guide's license metadata.
 - Fixed `Agent.interact()` to validate documented dict-shaped actions before execution.
 
 ### Industrial hardening

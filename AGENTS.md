@@ -4,7 +4,7 @@ Project-level guide for AI coding agents (OpenAI Codex, Claude Code, Cursor, Ope
 
 ## Project: web-agent-toolkit
 
-A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, MIT-licensed, async-first.
+A professional Playwright-based agentic web search / fetch / extraction / download / browser-automation toolkit. Single Python package at `web_agent/`, Apache-2.0-licensed, async-first.
 
 - Latest version: **1.7.0**
 - Python: **3.10+**
