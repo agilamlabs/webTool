@@ -129,7 +129,9 @@ class _RobotsStream:
     that is only readable as ``.text`` after ``aread()`` -- matching real httpx.
     """
 
-    def __init__(self, *, status_code: int = 200, peer_ip: str | None = None, body: str = "") -> None:
+    def __init__(
+        self, *, status_code: int = 200, peer_ip: str | None = None, body: str = ""
+    ) -> None:
         self.status_code = status_code
         self._body = body
         self.extensions: dict[str, Any] = {}

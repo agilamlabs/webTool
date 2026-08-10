@@ -453,9 +453,7 @@ class TestSettleRecheck:
         assert calls["n"] == 3, "initial capture + challenge_max_rechecks rechecks"
 
     @pytest.mark.asyncio
-    async def test_zero_rechecks_blocks_immediately(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_zero_rechecks_blocks_immediately(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = _fast_config(challenge_max_rechecks=0)
         fetcher = WebFetcher(browser_manager=MagicMock(), config=config)
         calls = _patch_capture(monkeypatch, [CF_CHALLENGE_HTML])
@@ -668,9 +666,7 @@ class TestCacheAndRetrySanity:
         cache.set.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_blocked_does_not_burn_retries(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_blocked_does_not_burn_retries(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A BLOCKED determination RETURNS through async_retry -- it must
         navigate exactly once, never re-running goto into the same wall."""
         config = _fast_config(challenge_max_rechecks=0, max_retries=3)

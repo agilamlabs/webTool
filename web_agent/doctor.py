@@ -151,8 +151,7 @@ async def _check_chromium_installed(_cfg: AppConfig) -> DoctorCheck:
         name="chromium_installed",
         status="fail",
         message=(
-            f"Chromium executable not found at {exe}. "
-            "Run: python -m playwright install chromium"
+            f"Chromium executable not found at {exe}. Run: python -m playwright install chromium"
         ),
     )
 

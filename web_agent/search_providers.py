@@ -483,9 +483,7 @@ class PlaywrightProvider(SearchProvider):
     # DuckDuckGo HTML (no JS, scraping-friendly)
     # ------------------------------------------------------------------
 
-    async def _search_duckduckgo(
-        self, query: str, max_results: int
-    ) -> tuple[SearchResponse, bool]:
+    async def _search_duckduckgo(self, query: str, max_results: int) -> tuple[SearchResponse, bool]:
         """Scrape DuckDuckGo's JS-free HTML endpoint.
 
         Returns ``(response, blocked)`` where ``blocked`` is True when DDG

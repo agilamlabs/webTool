@@ -215,7 +215,10 @@ async def test_import_state_roundtrip_applies_cookies(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_import_state_touches_last_used(tmp_path: Path) -> None:
     """import_state marks the freshly-created session as actively used."""
-    state = {"cookies": [{"name": "a", "value": "1", "domain": "x.com", "path": "/"}], "origins": []}
+    state = {
+        "cookies": [{"name": "a", "value": "1", "domain": "x.com", "path": "/"}],
+        "origins": [],
+    }
     ctx = _make_ctx(state)
     mgr, cfg = _make_manager(tmp_path, ctx)
 

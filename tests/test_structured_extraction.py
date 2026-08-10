@@ -187,7 +187,9 @@ def test_resolve_price_matches_nested_offers_price() -> None:
 
 def test_resolve_alias_cost_matches_price() -> None:
     """Alias table: 'cost' matches a 'price' signal key."""
-    fields, _, _ = resolve_fields(["cost"], json_ld=[{"@type": "Product", "price": "9.99"}], html="")
+    fields, _, _ = resolve_fields(
+        ["cost"], json_ld=[{"@type": "Product", "price": "9.99"}], html=""
+    )
     assert fields["cost"] == 9.99
 
 
@@ -364,9 +366,7 @@ def test_resolve_never_raises_on_malformed_html() -> None:
 def test_resolve_schema_list_and_dict_equivalent() -> None:
     """A list schema and a dict schema with empty hints resolve identically."""
     f_list, _, _ = resolve_fields(["name", "sku"], json_ld=_PRODUCT_JSON_LD, html="")
-    f_dict, _, _ = resolve_fields(
-        {"name": "", "sku": ""}, json_ld=_PRODUCT_JSON_LD, html=""
-    )
+    f_dict, _, _ = resolve_fields({"name": "", "sku": ""}, json_ld=_PRODUCT_JSON_LD, html="")
     assert f_list == f_dict
 
 
@@ -452,9 +452,7 @@ async def test_extract_fields_strict_raises_on_failure() -> None:
     """strict=True raises NavigationError on a failed fetch."""
 
     async def _fetch(url: str, **_kw: object) -> FetchResult:
-        return FetchResult(
-            url=url, final_url=url, status=FetchStatus.TIMEOUT, html=""
-        )
+        return FetchResult(url=url, final_url=url, status=FetchStatus.TIMEOUT, html="")
 
     recipes = _make_recipes(fetch_side=_fetch)
     with pytest.raises(NavigationError):

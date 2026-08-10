@@ -1,16 +1,16 @@
 """Deep-review (post-v1.6.16) miscellaneous low-severity regression tests.
 
-  * ``redact_sensitive_mapping`` recurses into nested dicts/lists so a secret
-    nested under a non-sensitive key (skill inputs accept nested dicts) is
-    masked, closing the AG-2 channel for nested shapes.
-  * The action-parameter enums ScrollDirection / NavigateDirection / WaitTarget
-    / ScreenshotFormat are re-exported from the package root.
-  * ``Agent.save_results`` creates a subdirectory in a caller-supplied
-    output_path instead of crashing with FileNotFoundError.
-  * A timed-out infinite-scroll evaluate is classified as TIMEOUT (execute_action
-    now catches the builtin TimeoutError asyncio.wait_for raises), not FAILED.
-  * Importing ``web_agent.__main__`` does NOT dispatch the CLI (it is guarded by
-    ``if __name__ == "__main__"``).
+* ``redact_sensitive_mapping`` recurses into nested dicts/lists so a secret
+  nested under a non-sensitive key (skill inputs accept nested dicts) is
+  masked, closing the AG-2 channel for nested shapes.
+* The action-parameter enums ScrollDirection / NavigateDirection / WaitTarget
+  / ScreenshotFormat are re-exported from the package root.
+* ``Agent.save_results`` creates a subdirectory in a caller-supplied
+  output_path instead of crashing with FileNotFoundError.
+* A timed-out infinite-scroll evaluate is classified as TIMEOUT (execute_action
+  now catches the builtin TimeoutError asyncio.wait_for raises), not FAILED.
+* Importing ``web_agent.__main__`` does NOT dispatch the CLI (it is guarded by
+  ``if __name__ == "__main__"``).
 """
 
 from __future__ import annotations

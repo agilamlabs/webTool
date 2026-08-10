@@ -2240,9 +2240,7 @@ class AppConfig(BaseSettings):
     # v1.6.16 deep-review fix: a Literal of loguru's level names so an unknown
     # value is rejected at config time instead of failing when logging is wired
     # (loguru's level lookup is case-sensitive / uppercase).
-    log_level: Literal[
-        "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-    ] = "INFO"
+    log_level: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     output_dir: str = "./output"
     base_dir: str = Field(default=".", description="Base directory for resolving relative paths")
     ranking_profiles: dict[str, list[str]] = Field(

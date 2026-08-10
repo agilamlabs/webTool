@@ -80,7 +80,9 @@ UA_PLATFORM: dict[str, str] = {
 # (``random.choice(USER_AGENTS)`` semantics via ``get_random_user_agent``)
 # keep seeing the same cross-OS spread. Built from the families so the two
 # never drift.
-USER_AGENTS: list[str] = [ua for _family in ("windows", "macos", "linux") for ua in UA_FAMILIES[_family]]
+USER_AGENTS: list[str] = [
+    ua for _family in ("windows", "macos", "linux") for ua in UA_FAMILIES[_family]
+]
 
 
 def ua_os_family(user_agent: str) -> str | None:

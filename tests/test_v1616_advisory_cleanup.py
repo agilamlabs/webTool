@@ -350,9 +350,7 @@ class TestBR2DialogSlotDoesNotBrickSequence:
         _PAGE_DIALOG_STATES[page] = _DialogState()
         actions = [WaitInput(target=WaitTarget.FUNCTION, value="() => true")]
         try:
-            res = await ba.execute_sequence(
-                "https://good.example/app", actions, session_id="sid"
-            )
+            res = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
         finally:
             _PAGE_DIALOG_STATES.pop(page, None)
             _PAGE_ACTIVE_SEQUENCES.discard(page)
@@ -375,9 +373,7 @@ class TestBR2DialogSlotDoesNotBrickSequence:
         _PAGE_ACTIVE_SEQUENCES.add(page)
         actions = [WaitInput(target=WaitTarget.FUNCTION, value="() => true")]
         try:
-            res = await ba.execute_sequence(
-                "https://good.example/app", actions, session_id="sid"
-            )
+            res = await ba.execute_sequence("https://good.example/app", actions, session_id="sid")
             # Refused: aborted with the concurrency error, no action executed.
             assert res.actions_succeeded == 0
             assert any("already running" in (r.error_message or "") for r in res.results)

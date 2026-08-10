@@ -555,8 +555,7 @@ class BrowserManager:
                         )
                         continue
                     logger.info(
-                        "Profile sweep: removing orphaned ephemeral profile {p} "
-                        "(idle > {h}h)",
+                        "Profile sweep: removing orphaned ephemeral profile {p} (idle > {h}h)",
                         p=entry,
                         h=max_age_h,
                     )

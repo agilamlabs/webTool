@@ -426,9 +426,7 @@ class TestFetchManyExceptionIsolation:
             assert session_id == "sid-X"
             if url == bad:
                 raise ValueError("boom-session")
-            return FetchResult(
-                url=url, final_url=url, status=FetchStatus.SUCCESS, html="<html/>"
-            )
+            return FetchResult(url=url, final_url=url, status=FetchStatus.SUCCESS, html="<html/>")
 
         fetcher.fetch = AsyncMock(side_effect=_fake_fetch)  # type: ignore[method-assign]
 
@@ -457,9 +455,7 @@ class TestFetchManyExceptionIsolation:
         async def _fake_fetch(url: str, session_id: str | None = None) -> FetchResult:
             if url.endswith("cancel"):
                 raise asyncio.CancelledError()
-            return FetchResult(
-                url=url, final_url=url, status=FetchStatus.SUCCESS, html="<html/>"
-            )
+            return FetchResult(url=url, final_url=url, status=FetchStatus.SUCCESS, html="<html/>")
 
         fetcher.fetch = AsyncMock(side_effect=_fake_fetch)  # type: ignore[method-assign]
 

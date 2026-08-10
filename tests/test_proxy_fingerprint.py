@@ -323,7 +323,9 @@ async def test_launch_persistent_context_proxy_passed_named(tmp_path: Path) -> N
     fake_ctx.set_default_navigation_timeout = MagicMock()
     fake_chromium = MagicMock()
     fake_chromium.launch_persistent_context = AsyncMock(return_value=fake_ctx)
-    fake_chromium.launch = AsyncMock(side_effect=AssertionError("named must use persistent context"))
+    fake_chromium.launch = AsyncMock(
+        side_effect=AssertionError("named must use persistent context")
+    )
     with patch("web_agent.browser_manager.async_playwright", return_value=_fake_pw(fake_chromium)):
         await bm.start()
 
@@ -376,7 +378,9 @@ async def test_launch_persistent_context_proxy_passed_ephemeral(tmp_path: Path) 
     fake_root_ctx.close = AsyncMock()
     fake_chromium = MagicMock()
     fake_chromium.launch_persistent_context = AsyncMock(return_value=fake_root_ctx)
-    fake_chromium.launch = AsyncMock(side_effect=AssertionError("ephemeral uses persistent context"))
+    fake_chromium.launch = AsyncMock(
+        side_effect=AssertionError("ephemeral uses persistent context")
+    )
     with patch("web_agent.browser_manager.async_playwright", return_value=_fake_pw(fake_chromium)):
         await bm.start()
 

@@ -495,9 +495,7 @@ class SiteCrawler:
         # crawls. ``discovered`` must exist for ``_build`` even on this path.
         discovered: set[str] = {start_url}
         if not scope_host or not check_domain_allowed(start_url, self._config.safety):
-            errors.append(
-                f"Start URL is not crawlable (no host or domain blocked): {start_url}"
-            )
+            errors.append(f"Start URL is not crawlable (no host or domain blocked): {start_url}")
             diagnostics.append(
                 FetchDiagnostic(
                     url=start_url, status=FetchStatus.BLOCKED, block_reason="domain_blocked"
@@ -547,9 +545,10 @@ class SiteCrawler:
         try:
             while frontier and len(pages) < max_pages:
                 # Wall-clock budget check (before popping the next page).
-                if time_budget_s is not None and (
-                    time.perf_counter() - start_time
-                ) >= time_budget_s:
+                if (
+                    time_budget_s is not None
+                    and (time.perf_counter() - start_time) >= time_budget_s
+                ):
                     stopped_reason = "budget"
                     break
 
@@ -624,9 +623,7 @@ class SiteCrawler:
                             frontier.append((link, depth + 1))
                             links_found += 1
 
-                pages.append(
-                    self._success_page(url, depth, fr, extracted, links_found)
-                )
+                pages.append(self._success_page(url, depth, fr, extracted, links_found))
                 diagnostics.append(
                     self._diagnostic(url, fr, content_length=extracted.content_length)
                 )

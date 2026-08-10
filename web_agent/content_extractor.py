@@ -962,8 +962,7 @@ class ContentExtractor:
         surface why and what to do next.
         """
         logger.info(
-            "PDF appears image-only / scanned (no text layer) for {url} "
-            "({n} pages)",
+            "PDF appears image-only / scanned (no text layer) for {url} ({n} pages)",
             url=url,
             n=page_count,
         )
@@ -1046,9 +1045,7 @@ class ContentExtractor:
                         # numbers stay aligned for citation.
                         page_parts.append(segments[0])
         except Exception as exc:
-            logger.warning(
-                "pdfplumber extraction failed for {url}: {e}", url=url, e=exc
-            )
+            logger.warning("pdfplumber extraction failed for {url}: {e}", url=url, e=exc)
             return ExtractionResult(url=url, extraction_method="none", content=None)
 
         if page_count == 0:
@@ -1105,9 +1102,7 @@ class ContentExtractor:
         renderable = [
             md
             for md in (
-                _render_markdown_table(
-                    t, page_index=page_index, url=url, max_cells=max_cells
-                )
+                _render_markdown_table(t, page_index=page_index, url=url, max_cells=max_cells)
                 for t in raw_tables
             )
             if md
@@ -1116,8 +1111,7 @@ class ContentExtractor:
         if len(renderable) > budget:
             dropped = len(renderable) - budget
             logger.warning(
-                "PDF table cap reached for {url}; dropping {dropped} table(s) "
-                "(page {n})",
+                "PDF table cap reached for {url}; dropping {dropped} table(s) (page {n})",
                 url=url,
                 dropped=dropped,
                 n=page_index,

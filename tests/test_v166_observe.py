@@ -182,9 +182,7 @@ async def test_observe_session_path_gates_input_url_before_goto(tmp_path: Path) 
         automation=AutomationConfig(screenshot_dir=str(tmp_path / "shots")),
     )
     page = _make_page()
-    ba = BrowserActions(
-        _make_browser_manager(page), config, sessions=_make_sessions(page)
-    )
+    ba = BrowserActions(_make_browser_manager(page), config, sessions=_make_sessions(page))
 
     with pytest.raises(ValueError, match="Domain not allowed"):
         await ba.observe(

@@ -144,9 +144,7 @@ class TestKeyHintSanitization:
         assert hint == "fetch:sess:https://host/path"
 
     def test_strips_both_userinfo_and_query(self) -> None:
-        hint = _sanitize_key_hint(
-            "fetch:sess:https://alice:hunter2@host/p?api_key=ABC123"
-        )
+        hint = _sanitize_key_hint("fetch:sess:https://alice:hunter2@host/p?api_key=ABC123")
         assert "hunter2" not in hint
         assert "ABC123" not in hint
         assert "alice:hunter2" not in hint

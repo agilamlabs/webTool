@@ -72,7 +72,9 @@ class _FakeAsyncClient:
     async def __aexit__(self, *a: Any) -> None:
         return None
 
-    def stream(self, method: str, url: str, headers: dict[str, str] | None = None) -> _FakeStreamResp:
+    def stream(
+        self, method: str, url: str, headers: dict[str, str] | None = None
+    ) -> _FakeStreamResp:
         return _FakeStreamResp(url=url, headers=type(self).stream_headers)
 
 

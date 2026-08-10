@@ -219,8 +219,12 @@ class TestCrawlSiteRecipe:
                 return CrawlResult(start_url=start_url)
 
         monkeypatch.setattr(recipes_mod, "SiteCrawler", _FakeCrawler)
-        r = Recipes(MagicMock(), MagicMock(), MagicMock(), MagicMock(), AppConfig(base_dir=str(tmp_path)))
-        await r.crawl_site("https://example.com", max_pages=5, max_depth=1, same_registrable_domain=True)
+        r = Recipes(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(), AppConfig(base_dir=str(tmp_path))
+        )
+        await r.crawl_site(
+            "https://example.com", max_pages=5, max_depth=1, same_registrable_domain=True
+        )
         assert captured["max_pages"] == 5
         assert captured["max_depth"] == 1
         assert captured["same_registrable_domain"] is True

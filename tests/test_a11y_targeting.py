@@ -79,10 +79,14 @@ def _make_page(
     enumeration evaluate. ``page.evaluate`` dispatches on the script text:
     dims object, innerText string, or the interactive-element walk.
     """
-    payload = enum_payload if enum_payload is not None else {
-        "elements": _SAMPLE_ELEMENTS,
-        "truncated": False,
-    }
+    payload = (
+        enum_payload
+        if enum_payload is not None
+        else {
+            "elements": _SAMPLE_ELEMENTS,
+            "truncated": False,
+        }
+    )
 
     def _evaluate(expr, *args):
         # The enumeration JS also references window.innerWidth, so match its
@@ -172,7 +176,8 @@ async def test_observe_passes_max_and_tag_flag_to_evaluate(tmp_path: Path) -> No
     await ba.observe(url="https://example.com/page", include_text=False)
 
     enum_calls = [
-        c for c in page.evaluate.await_args_list
+        c
+        for c in page.evaluate.await_args_list
         if "data-webtool-ref" in c.args[0] or "querySelectorAll" in c.args[0]
     ]
     assert enum_calls, "enumeration evaluate was never called"
@@ -224,7 +229,8 @@ async def test_observe_include_elements_false_skips_enumeration(tmp_path: Path) 
 
     assert obs.elements == []
     enum_calls = [
-        c for c in page.evaluate.await_args_list
+        c
+        for c in page.evaluate.await_args_list
         if "data-webtool-ref" in c.args[0] or "querySelectorAll" in c.args[0]
     ]
     assert not enum_calls, "enumeration must not run when include_elements=False"
@@ -269,9 +275,7 @@ def test_resolve_locator_ref_takes_priority_over_other_fields() -> None:
     page = MagicMock()
     page.locator = MagicMock(return_value="LOCATOR")
     # ref wins over selector / role / text -- it is the most specific signal.
-    _resolve_locator(
-        page, LocatorSpec(ref="e7", selector="button.x", role="button", text="Buy")
-    )
+    _resolve_locator(page, LocatorSpec(ref="e7", selector="button.x", role="button", text="Buy"))
     page.locator.assert_called_once_with('[data-webtool-ref="e7"]')
 
 
@@ -318,9 +322,7 @@ async def test_stale_ref_click_fails_cleanly_no_crash(tmp_path: Path) -> None:
     ba, _ = _ba(tmp_path)
 
     stale_locator = MagicMock()
-    stale_locator.click = AsyncMock(
-        side_effect=PlaywrightTimeout("locator resolved to 0 elements")
-    )
+    stale_locator.click = AsyncMock(side_effect=PlaywrightTimeout("locator resolved to 0 elements"))
     page = MagicMock()
     page.locator = MagicMock(return_value=stale_locator)
 
@@ -340,9 +342,7 @@ async def test_malformed_ref_click_fails_cleanly_no_crash(tmp_path: Path) -> Non
     page = MagicMock()
     page.locator = MagicMock()
 
-    result = await ba.execute_action(
-        page, ClickInput(selector=LocatorSpec(ref='e1"] *'))
-    )
+    result = await ba.execute_action(page, ClickInput(selector=LocatorSpec(ref='e1"] *')))
 
     assert result.status == ActionStatus.FAILED
     page.locator.assert_not_called()

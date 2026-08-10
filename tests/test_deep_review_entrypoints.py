@@ -1,16 +1,16 @@
 """Deep-review (post-v1.6.16) entrypoint / MCP / CLI regression tests.
 
-  * ``BrowserActions.scroll_until_text`` clamps ``max_scrolls`` to <= 1000 so an
-    LLM/prompt-injection value can't pin the session tab for months (this path
-    bypasses the ScrollInput pydantic bound).
-  * The MCP ``web_interact`` tool's ``stop_on_error`` defaults to None and the
-    CLI passes None when ``--no-stop-on-error`` is absent, so the operator's
-    ``automation.stop_on_error`` config is actually consulted.
-  * ``mcp_server._load_mcp_config`` FAILS CLOSED when WEB_AGENT_CONFIG exists
-    but is unparseable (a missing file still falls back to defaults).
-  * The CLI ``run_interact`` surfaces a non-UTF-8 actions file
-    (UnicodeDecodeError) and an invalid action shape (ValidationError) as a
-    clean SystemExit, not an opaque traceback (MAIN-1).
+* ``BrowserActions.scroll_until_text`` clamps ``max_scrolls`` to <= 1000 so an
+  LLM/prompt-injection value can't pin the session tab for months (this path
+  bypasses the ScrollInput pydantic bound).
+* The MCP ``web_interact`` tool's ``stop_on_error`` defaults to None and the
+  CLI passes None when ``--no-stop-on-error`` is absent, so the operator's
+  ``automation.stop_on_error`` config is actually consulted.
+* ``mcp_server._load_mcp_config`` FAILS CLOSED when WEB_AGENT_CONFIG exists
+  but is unparseable (a missing file still falls back to defaults).
+* The CLI ``run_interact`` surfaces a non-UTF-8 actions file
+  (UnicodeDecodeError) and an invalid action shape (ValidationError) as a
+  clean SystemExit, not an opaque traceback (MAIN-1).
 """
 
 from __future__ import annotations
@@ -177,8 +177,9 @@ class TestRunInteractErrorMessages:
         # primary platform. read_text(encoding="utf-8") raises UnicodeDecodeError.
         f = tmp_path / "utf16.json"
         f.write_bytes('[{"action": "wait"}]'.encode("utf-16"))
-        args = argparse.Namespace(url="https://x.example", actions=str(f), config=None,
-                                  no_stop_on_error=False)
+        args = argparse.Namespace(
+            url="https://x.example", actions=str(f), config=None, no_stop_on_error=False
+        )
         with pytest.raises(SystemExit) as exc:
             await main_mod.run_interact(args)
         assert "read/parse" in str(exc.value)
@@ -187,8 +188,9 @@ class TestRunInteractErrorMessages:
     async def test_invalid_action_shape_is_systemexit(self, tmp_path) -> None:
         f = tmp_path / "bad.json"
         f.write_text('[{"action": "definitely-not-a-real-action"}]', encoding="utf-8")
-        args = argparse.Namespace(url="https://x.example", actions=str(f), config=None,
-                                  no_stop_on_error=False)
+        args = argparse.Namespace(
+            url="https://x.example", actions=str(f), config=None, no_stop_on_error=False
+        )
         with pytest.raises(SystemExit) as exc:
             await main_mod.run_interact(args)
         assert "Invalid actions" in str(exc.value)

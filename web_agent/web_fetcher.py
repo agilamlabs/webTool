@@ -997,10 +997,12 @@ class WebFetcher:
                             # auto-settle-likely -- a CAPTCHA / block page):
                             # give a configured resolver hook a bounded,
                             # re-verified chance before returning BLOCKED.
-                            still, html, html_capture_source = (
-                                await self._attempt_captcha_resolution(
-                                    page, url, still, html, html_capture_source
-                                )
+                            (
+                                still,
+                                html,
+                                html_capture_source,
+                            ) = await self._attempt_captcha_resolution(
+                                page, url, still, html, html_capture_source
                             )
                             resolved_via_hook = still is None
                         if still is not None:
@@ -1119,9 +1121,7 @@ class WebFetcher:
     # v1.7.0: bot-challenge detection + bounded auto-settle
     # ------------------------------------------------------------------
 
-    def _recheck_url_after_settle(
-        self, page: Page, url: str, status_code: Optional[int]
-    ) -> str:
+    def _recheck_url_after_settle(self, page: Page, url: str, status_code: Optional[int]) -> str:
         """Re-validate ``page.url`` after a challenge cleared.
 
         Passing a challenge usually re-navigates the page; the redirect
@@ -1174,8 +1174,7 @@ class WebFetcher:
                 html, capture_source = await safe_page_content(page)
             except Exception as exc:
                 logger.debug(
-                    "Challenge settle recheck {n}/{total} could not capture "
-                    "content for {url}: {e}",
+                    "Challenge settle recheck {n}/{total} could not capture content for {url}: {e}",
                     n=recheck,
                     total=cfg.challenge_max_rechecks,
                     url=url,
@@ -1183,10 +1182,7 @@ class WebFetcher:
                 )
                 return current, html, capture_source
             redetected = detect_challenge(html, None, None, page.url)
-            if (
-                redetected is None
-                or redetected.confidence < CHALLENGE_CONFIDENCE_ACTION_THRESHOLD
-            ):
+            if redetected is None or redetected.confidence < CHALLENGE_CONFIDENCE_ACTION_THRESHOLD:
                 logger.info(
                     "Bot challenge ({vendor}/{kind}) auto-settled for {url} "
                     "after {n} recheck(s) (~{ms}ms waited)",

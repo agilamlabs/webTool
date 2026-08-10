@@ -522,7 +522,15 @@ class TestMetricsSnapshotSchema:
         snap = MetricsSnapshot(
             enabled=True,
             counters={"fetch_total": 7},
-            distributions={"bytes_downloaded": {"count": 1.0, "sum": 10.0, "min": 10.0, "max": 10.0, "avg": 10.0}},
+            distributions={
+                "bytes_downloaded": {
+                    "count": 1.0,
+                    "sum": 10.0,
+                    "min": 10.0,
+                    "max": 10.0,
+                    "avg": 10.0,
+                }
+            },
             uptime_s=3.5,
             correlation_id="cid-123",
         )

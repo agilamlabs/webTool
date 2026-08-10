@@ -18,6 +18,8 @@
 - Constrained the optional MCP dependency to the compatible 1.x API; an
   unbounded `mcp>=1` install could resolve to MCP 2.x and fail during server
   import before any test or tool could run.
+- Pinned the CI formatter and type checker, and normalized the existing tree
+  with that Ruff version so the merge-blocking quality gate is reproducible.
 
 ## [1.7.0] - 2026-06-13
 

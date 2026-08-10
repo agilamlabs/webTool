@@ -23,10 +23,7 @@ class TestParseUrlset:
 
     def test_unescapes_entities(self) -> None:
         # &amp; in the XML must come back as a literal & in the URL.
-        xml = (
-            "<urlset><url><loc>https://example.com/search?q=a&amp;b=c</loc>"
-            "</url></urlset>"
-        )
+        xml = "<urlset><url><loc>https://example.com/search?q=a&amp;b=c</loc></url></urlset>"
         result = parse_sitemap(xml)
         assert result.urls == ["https://example.com/search?q=a&b=c"]
 

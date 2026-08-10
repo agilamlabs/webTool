@@ -287,10 +287,7 @@ def test_table_cap_truncates_with_flag(monkeypatch):
     one_table = [["a", "b"], ["1", "2"]]
     # 3 pages, each with 2 tables -> 6 tables total; cap to 2.
     pdf = _FakePlumberPDF(
-        pages=[
-            _FakePlumberPage(f"page {i}", tables=[one_table, one_table])
-            for i in range(1, 4)
-        ]
+        pages=[_FakePlumberPage(f"page {i}", tables=[one_table, one_table]) for i in range(1, 4)]
     )
     _install_fake_pdfplumber(monkeypatch, pdf)
     cfg = AppConfig()
@@ -355,9 +352,7 @@ def test_pdf_max_tables_zero_skips_tables(monkeypatch):
 
 
 def test_pdf_page_markers_false_omits_markers(monkeypatch):
-    pdf = _FakePlumberPDF(
-        pages=[_FakePlumberPage("alpha"), _FakePlumberPage("beta")]
-    )
+    pdf = _FakePlumberPDF(pages=[_FakePlumberPage("alpha"), _FakePlumberPage("beta")])
     _install_fake_pdfplumber(monkeypatch, pdf)
     cfg = AppConfig()
     cfg.extraction.pdf_page_markers = False

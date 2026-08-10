@@ -365,9 +365,7 @@ def diff_snapshots(
         )
 
     changed = old.content_hash != new.content_hash
-    similarity = round(
-        difflib.SequenceMatcher(None, old.content, new.content).ratio(), 4
-    )
+    similarity = round(difflib.SequenceMatcher(None, old.content, new.content).ratio(), 4)
 
     old_lines = _split_lines(old.content)
     new_lines = _split_lines(new.content)
@@ -393,8 +391,7 @@ def diff_snapshots(
 
     if changed:
         summary = (
-            f"changed: +{added_count} / -{removed_count} lines, "
-            f"{similarity * 100:.1f}% similar"
+            f"changed: +{added_count} / -{removed_count} lines, {similarity * 100:.1f}% similar"
         )
     else:
         summary = "no change"

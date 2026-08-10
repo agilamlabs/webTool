@@ -533,8 +533,10 @@ class Downloader:
         # redirect-race gap the other two egress paths already close.
         response_url = response.url if response is not None else None
         for candidate in (page.url, response_url):
-            if isinstance(candidate, str) and candidate and (
-                not check_domain_allowed(candidate, self._config.safety)
+            if (
+                isinstance(candidate, str)
+                and candidate
+                and (not check_domain_allowed(candidate, self._config.safety))
             ):
                 host = urlparse(candidate).hostname or ""
                 return DownloadResult(

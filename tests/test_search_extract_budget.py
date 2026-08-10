@@ -88,14 +88,9 @@ async def test_fetch_many_sliced_to_page_budget() -> None:
     agent = _agent_with_mocks(cfg)
 
     # 5 extensionless (HTML-routed) results.
-    results = [
-        _search_item(i + 1, f"https://site{i}.example.com/article")
-        for i in range(5)
-    ]
+    results = [_search_item(i + 1, f"https://site{i}.example.com/article") for i in range(5)]
     agent._search.search = AsyncMock(  # type: ignore[attr-defined]
-        return_value=SearchResponse(
-            query="q", total_results=len(results), results=results
-        )
+        return_value=SearchResponse(query="q", total_results=len(results), results=results)
     )
 
     # fetch_many records its call args; return empty so the result loop is
@@ -125,19 +120,12 @@ async def test_fetch_many_not_sliced_when_budget_exceeds_results() -> None:
     search-result count, the slice is a no-op -- all items are fetched
     and NO truncation warning is emitted.
     """
-    cfg = AppConfig(
-        safety=SafetyConfig(probe_binary_urls=False, block_private_ips=False)
-    )
+    cfg = AppConfig(safety=SafetyConfig(probe_binary_urls=False, block_private_ips=False))
     agent = _agent_with_mocks(cfg)
 
-    results = [
-        _search_item(i + 1, f"https://site{i}.example.com/article")
-        for i in range(3)
-    ]
+    results = [_search_item(i + 1, f"https://site{i}.example.com/article") for i in range(3)]
     agent._search.search = AsyncMock(  # type: ignore[attr-defined]
-        return_value=SearchResponse(
-            query="q", total_results=len(results), results=results
-        )
+        return_value=SearchResponse(query="q", total_results=len(results), results=results)
     )
     fetch_many = AsyncMock(return_value=[])
     agent._fetcher.fetch_many = fetch_many  # type: ignore[attr-defined]
@@ -178,9 +166,7 @@ async def test_binary_extraction_charges_char_budget() -> None:
         _search_item(2, "https://site1.example.com/next.pdf"),
     ]
     agent._search.search = AsyncMock(  # type: ignore[attr-defined]
-        return_value=SearchResponse(
-            query="q", total_results=len(results), results=results
-        )
+        return_value=SearchResponse(query="q", total_results=len(results), results=results)
     )
 
     fetch_binary = AsyncMock(
@@ -206,9 +192,7 @@ async def test_binary_extraction_charges_char_budget() -> None:
         )
     )
 
-    result = await agent.search_and_extract(
-        "q", max_results=2, extract_files=True
-    )
+    result = await agent.search_and_extract("q", max_results=2, extract_files=True)
 
     err_codes = {e.code for e in result.structured_errors}
     assert "budget_exceeded" in err_codes, (
@@ -273,6 +257,5 @@ async def test_char_exhaustion_skips_html_page_fanout() -> None:
     assert fetch_many.await_count == 1
     fanned_out = fetch_many.await_args.args[0]
     assert fanned_out == [], (
-        "char-exhausted call must not fan out HTML pages over the network; "
-        f"got {fanned_out}"
+        f"char-exhausted call must not fan out HTML pages over the network; got {fanned_out}"
     )

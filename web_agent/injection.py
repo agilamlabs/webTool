@@ -252,7 +252,7 @@ def strip_hidden_dom(html: str) -> tuple[str, int]:
         for el in list(soup.find_all(True)):
             # ``el`` may already have been decomposed as a descendant of an
             # earlier removal; ``el.name`` is None once decomposed.
-            if el.name is None:
+            if not getattr(el, "name", None):
                 continue
             if el.has_attr("hidden"):
                 el.decompose()

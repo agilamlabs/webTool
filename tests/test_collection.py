@@ -44,7 +44,9 @@ from web_agent.recipes import Recipes
 # ----------------------------------------------------------------------
 
 
-def _fetch_result(url: str, html: str = "<html></html>", *, status: FetchStatus = FetchStatus.SUCCESS) -> FetchResult:
+def _fetch_result(
+    url: str, html: str = "<html></html>", *, status: FetchStatus = FetchStatus.SUCCESS
+) -> FetchResult:
     return FetchResult(url=url, final_url=url, status=status, html=html)
 
 
@@ -369,7 +371,9 @@ async def test_next_link_blocked_page_midwalk_recorded_and_stops() -> None:
     assert result.pages[0].content == "ONE"
     assert result.stopped_reason == "blocked"
     # The blocked page-2 fetch attempt is captured in diagnostics.
-    assert any(d.url == "https://site/2" and d.status == FetchStatus.BLOCKED for d in result.diagnostics)
+    assert any(
+        d.url == "https://site/2" and d.status == FetchStatus.BLOCKED for d in result.diagnostics
+    )
     assert any("Failed to fetch" in w for w in result.warnings)
 
 
@@ -379,10 +383,7 @@ async def test_next_link_text_match_and_relative_href() -> None:
     RELATIVE href. The recipe must match via the vocabulary and resolve
     the relative href against the page URL.
     """
-    page1 = (
-        "<html><body><main>FIRST</main>"
-        '<a href="/list?page=2">Older posts</a></body></html>'
-    )
+    page1 = '<html><body><main>FIRST</main><a href="/list?page=2">Older posts</a></body></html>'
     page2 = "<html><body><main>SECOND</main></body></html>"  # no next
 
     async def _fetch(url: str, **_kw: object) -> FetchResult:
@@ -482,9 +483,7 @@ async def test_dedup_identical_content_not_collected_twice() -> None:
         return _extraction(fr.url, content)
 
     recipes = _make_recipes(fetch_side=_fetch, extract_side=_extract)
-    result = await recipes.collect_across_pages(
-        "https://s/1", strategy="next_link", max_pages=10
-    )
+    result = await recipes.collect_across_pages("https://s/1", strategy="next_link", max_pages=10)
     # page 1 collected; page 2 duplicate content -> stop with cycle, not collected.
     assert [p.url for p in result.pages] == ["https://s/1"]
     assert result.stopped_reason == "cycle"
@@ -550,9 +549,7 @@ async def test_page_param_no_param_stops_after_one() -> None:
 async def test_blocked_start_url_returns_blocked() -> None:
     cfg = _offline_config(denied_domains=["evil.com"])
     recipes = _make_recipes(config=cfg)
-    result = await recipes.collect_across_pages(
-        "https://evil.com/list", strategy="next_link"
-    )
+    result = await recipes.collect_across_pages("https://evil.com/list", strategy="next_link")
     assert result.pages_collected == 0
     assert result.stopped_reason == "blocked"
     assert any(d.status == FetchStatus.BLOCKED for d in result.diagnostics)
@@ -561,9 +558,7 @@ async def test_blocked_start_url_returns_blocked() -> None:
 @pytest.mark.asyncio
 async def test_unknown_strategy_errors() -> None:
     recipes = _make_recipes()
-    result = await recipes.collect_across_pages(
-        "https://site/x", strategy="bogus"
-    )
+    result = await recipes.collect_across_pages("https://site/x", strategy="bogus")
     assert result.stopped_reason == "error"
     assert any("Unknown collection strategy" in e for e in result.errors)
 

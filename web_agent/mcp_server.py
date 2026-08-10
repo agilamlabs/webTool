@@ -162,13 +162,9 @@ def _validate_format(format: Optional[str], *, allow_html: bool = False) -> Opti
     if not fmt:
         return None
     if fmt not in _VALID_FORMATS:
-        raise ValueError(
-            f"invalid format {format!r}: must be one of 'markdown' | 'text' | 'html'"
-        )
+        raise ValueError(f"invalid format {format!r}: must be one of 'markdown' | 'text' | 'html'")
     if fmt == "html" and not allow_html:
-        raise ValueError(
-            "format='html' is only supported by web_fetch; use 'markdown' or 'text'"
-        )
+        raise ValueError("format='html' is only supported by web_fetch; use 'markdown' or 'text'")
     return fmt
 
 
@@ -496,9 +492,7 @@ async def web_fetch(
         # raw page, so route via the fetcher directly (same smart routing
         # agent.fetch_and_extract uses). Explicit opt-in only -- raw HTML
         # costs 5-9x markdown in tokens.
-        fr = await agent._fetcher.fetch_smart(
-            url, session_id=session_id, binary_probe=binary_probe
-        )
+        fr = await agent._fetcher.fetch_smart(url, session_id=session_id, binary_probe=binary_probe)
         if fr.status != FetchStatus.SUCCESS:
             return _shape_content_response(
                 build_fetch_failure_result(fr),
@@ -1627,9 +1621,7 @@ async def web_scroll_to_bottom(
     ``scrolls_used`` + ``reached_bottom``.
     """
     agent: Agent = ctx.request_context.lifespan_context["agent"]
-    r = await agent.scroll_to_bottom(
-        session_id=session_id, tab_id=tab_id, max_scrolls=max_scrolls
-    )
+    r = await agent.scroll_to_bottom(session_id=session_id, tab_id=tab_id, max_scrolls=max_scrolls)
     return r.model_dump(mode="json")
 
 

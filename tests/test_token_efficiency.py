@@ -134,9 +134,7 @@ class TestExtractorWindowing:
 
         sliced = ext.extract(fr, max_chars=100)
         assert sliced.content is not None
-        expected_window, expected_next = slice_text_window(
-            full.content, offset=0, max_chars=100
-        )
+        expected_window, expected_next = slice_text_window(full.content, offset=0, max_chars=100)
         assert sliced.content == expected_window
         assert sliced.content_length == len(expected_window)
         assert sliced.truncated is True
@@ -315,9 +313,7 @@ class TestMcpBoundaryCaps:
     @pytest.mark.asyncio
     async def test_default_max_chars_applies_when_caller_passes_nothing(self) -> None:
         agent = _agent_with()  # AppConfig default: 40000
-        agent.fetch_and_extract = AsyncMock(
-            return_value=_page_result(content="x" * 50_000)
-        )
+        agent.fetch_and_extract = AsyncMock(return_value=_page_result(content="x" * 50_000))
         result = await mcp_server.web_fetch(_ctx_for(agent), "https://e/x")
         assert result.content is not None
         assert len(result.content) == 40_000  # no newlines -> exact cut
@@ -328,9 +324,7 @@ class TestMcpBoundaryCaps:
     @pytest.mark.asyncio
     async def test_truncation_hint_present_and_actionable(self) -> None:
         agent = _agent_with()
-        agent.fetch_and_extract = AsyncMock(
-            return_value=_page_result(content="x" * 50_000)
-        )
+        agent.fetch_and_extract = AsyncMock(return_value=_page_result(content="x" * 50_000))
         result = await mcp_server.web_fetch(_ctx_for(agent), "https://e/x")
         assert result.truncation_hint is not None
         assert "truncated at 40000 of 50000 chars" in result.truncation_hint
@@ -470,9 +464,7 @@ class TestMcpBoundaryCaps:
     async def test_web_observe_caps_visible_text(self) -> None:
         agent = _agent_with(AppConfig(extraction={"default_max_chars": 1000}))
         obs = MagicMock()
-        obs.model_dump = MagicMock(
-            return_value={"url": "https://e/x", "visible_text": "v" * 5000}
-        )
+        obs.model_dump = MagicMock(return_value={"url": "https://e/x", "visible_text": "v" * 5000})
         agent.observe = AsyncMock(return_value=obs)
         payload = await mcp_server.web_observe(_ctx_for(agent), url="https://e/x")
         assert len(payload["visible_text"]) == 1000

@@ -1,10 +1,10 @@
 """Deep-review (post-v1.6.16) low-severity regression tests: skills + extraction.
 
-  * The sec_gov_filing_search builtin skill sanitizes its query terms (so a
-    prompt-injection-steered ``company`` can't escape the ``site:sec.gov``
-    fence) AND post-filters results to sec.gov hosts (mirrors ec_europa).
-  * ``ContentExtractor.extract_async`` runs the synchronous CPU-heavy extract
-    off the event loop in a worker thread, producing the same result.
+* The sec_gov_filing_search builtin skill sanitizes its query terms (so a
+  prompt-injection-steered ``company`` can't escape the ``site:sec.gov``
+  fence) AND post-filters results to sec.gov hosts (mirrors ec_europa).
+* ``ContentExtractor.extract_async`` runs the synchronous CPU-heavy extract
+  off the event loop in a worker thread, producing the same result.
 """
 
 from __future__ import annotations
@@ -76,14 +76,20 @@ class TestSecGovSkillHardening:
         from web_agent.builtin_skills.sec_gov_filing_search import run
 
         agent = _FakeAgent(
-            [ExtractionResult(url="https://sec.gov.evil.com/x", content="x", extraction_method="raw")]
+            [
+                ExtractionResult(
+                    url="https://sec.gov.evil.com/x", content="x", extraction_method="raw"
+                )
+            ]
         )
         out = await run(agent, "https://www.sec.gov", {"company": "Apple"})  # type: ignore[arg-type]
         assert out["filing_url"] == ""  # label-boundary match rejects the spoof
 
 
 class TestExtractAsyncOffload:
-    _HTML = "<html><body><article><p>hello world this is the body content</p></article></body></html>"
+    _HTML = (
+        "<html><body><article><p>hello world this is the body content</p></article></body></html>"
+    )
 
     @pytest.mark.asyncio
     async def test_runs_off_the_event_loop_thread(self) -> None:

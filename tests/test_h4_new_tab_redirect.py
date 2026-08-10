@@ -63,9 +63,7 @@ async def test_new_tab_redirect_to_private_host_is_denied_and_tab_closed() -> No
     tab_mgr = MagicMock()
     tab_mgr.new_tab = AsyncMock(return_value="tab-xyz")
     # After goto, the tab landed on the private IMDS host.
-    tab_mgr.get_or_current = MagicMock(
-        return_value=_make_landed_page(PRIVATE_REDIRECT_URL)
-    )
+    tab_mgr.get_or_current = MagicMock(return_value=_make_landed_page(PRIVATE_REDIRECT_URL))
     tab_mgr.close_tab = AsyncMock()
 
     agent = _agent_with_tab_manager(_cfg(), tab_mgr)
@@ -86,9 +84,7 @@ async def test_new_tab_allowed_redirect_is_kept_open() -> None:
     must NOT raise and must NOT close the tab."""
     tab_mgr = MagicMock()
     tab_mgr.new_tab = AsyncMock(return_value="tab-ok")
-    tab_mgr.get_or_current = MagicMock(
-        return_value=_make_landed_page(ALLOWED_REDIRECT_URL)
-    )
+    tab_mgr.get_or_current = MagicMock(return_value=_make_landed_page(ALLOWED_REDIRECT_URL))
     tab_mgr.close_tab = AsyncMock()
 
     agent = _agent_with_tab_manager(_cfg(), tab_mgr)

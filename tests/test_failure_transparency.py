@@ -86,8 +86,7 @@ def _assert_failure(result: ExtractionResult, stage: str, *needles: str) -> None
     assert result.error_message, f"stage {stage}: error_message must be non-empty"
     for needle in needles:
         assert needle.lower() in result.error_message.lower(), (
-            f"stage {stage}: expected {needle!r} in error_message "
-            f"{result.error_message!r}"
+            f"stage {stage}: expected {needle!r} in error_message {result.error_message!r}"
         )
 
 
@@ -207,9 +206,7 @@ class TestFillFormFailureStages:
         page = MagicMock()
         page.goto = AsyncMock()
         page.wait_for_load_state = AsyncMock()
-        type(page).url = property(
-            lambda _self: internal_url if state["submitted"] else allowed_url
-        )
+        type(page).url = property(lambda _self: internal_url if state["submitted"] else allowed_url)
 
         locator = MagicMock()
 

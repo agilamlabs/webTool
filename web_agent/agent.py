@@ -1048,9 +1048,7 @@ class Agent:
             correlation_id=get_correlation_id(),
         )
 
-    async def export_session_state(
-        self, session_id: str, path: str | Path
-    ) -> StorageStateResult:
+    async def export_session_state(self, session_id: str, path: str | Path) -> StorageStateResult:
         """Capture a logged-in session's auth (cookies + origins) to a file.
 
         v1.7.0: after a login has been performed on ``session_id`` (by a
@@ -1063,14 +1061,10 @@ class Agent:
         Raises:
             KeyError: If ``session_id`` is unknown or no longer live.
         """
-        async with self._call_scope(
-            "export_session_state", {"session_id": session_id}
-        ):
+        async with self._call_scope("export_session_state", {"session_id": session_id}):
             return await self._sessions.export_state(session_id, path)
 
-    async def import_session_state(
-        self, path: str | Path, *, name: str | None = None
-    ) -> str:
+    async def import_session_state(self, path: str | Path, *, name: str | None = None) -> str:
         """Create a NEW session pre-loaded with auth saved by export.
 
         v1.7.0: rehydrates the storage_state file written by
@@ -1162,12 +1156,8 @@ class Agent:
             SearchError: Only when ``strict=True`` and the entire provider
                 chain is exhausted or blocked.
         """
-        async with self._call_scope(
-            "search", {"query": query, "max_results": max_results}
-        ):
-            outcome = await self._search.search_with_outcome(
-                query, max_results, strict=strict
-            )
+        async with self._call_scope("search", {"query": query, "max_results": max_results}):
+            outcome = await self._search.search_with_outcome(query, max_results, strict=strict)
             response = outcome.response
             response.search_blocked = outcome.blocked
             return response
@@ -1355,9 +1345,7 @@ class Agent:
         ``SafetyConfig.max_time_per_call_seconds``. Returns a :class:`CrawlResult`
         with per-page records, counts, the injection rollup, and a stop reason.
         """
-        async with self._call_scope(
-            "crawl_site", {"start_url": start_url, "max_pages": max_pages}
-        ):
+        async with self._call_scope("crawl_site", {"start_url": start_url, "max_pages": max_pages}):
             self._debug.reset()
             return await self._recipes.crawl_site(
                 start_url,

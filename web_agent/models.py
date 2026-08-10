@@ -2294,12 +2294,8 @@ class SnapshotDiff(BaseModel):
         default=None, description="Baseline content hash (None on first snapshot)."
     )
     new_hash: str = Field(default="", description="New capture content hash.")
-    old_captured_at: Optional[str] = Field(
-        default=None, description="Baseline capture timestamp."
-    )
-    new_captured_at: Optional[str] = Field(
-        default=None, description="New capture timestamp."
-    )
+    old_captured_at: Optional[str] = Field(default=None, description="Baseline capture timestamp.")
+    new_captured_at: Optional[str] = Field(default=None, description="New capture timestamp.")
     added_lines: list[str] = Field(
         default_factory=list,
         description="Lines in the new content but not the baseline (bounded by diff_max_lines).",
@@ -2383,9 +2379,7 @@ class CrawlResult(BaseModel):
     pages: list[CrawledPage] = Field(
         default_factory=list, description="Per-page records, in visit order."
     )
-    pages_crawled: int = Field(
-        default=0, description="Pages successfully fetched (== len(pages))."
-    )
+    pages_crawled: int = Field(default=0, description="Pages successfully fetched (== len(pages)).")
     urls_discovered: int = Field(
         default=0, description="Total distinct in-scope URLs discovered (visited + frontier)."
     )
@@ -2473,12 +2467,8 @@ class LoginHandoffResult(BaseModel):
         default=None,
         description="Absolute path of the exported storage_state file (confined to the download dir).",
     )
-    saved: bool = Field(
-        default=False, description="True when the storage_state export succeeded."
-    )
-    cookie_count: int = Field(
-        default=0, description="Cookies captured in the exported state."
-    )
+    saved: bool = Field(default=False, description="True when the storage_state export succeeded.")
+    cookie_count: int = Field(default=0, description="Cookies captured in the exported state.")
     origin_count: int = Field(
         default=0, description="Origins (localStorage buckets) captured in the exported state."
     )

@@ -557,9 +557,7 @@ class TestCrawlBlockedAndOffsite:
                     "https://another-external.com/y",
                 ),
             ),
-            "https://example.com/onsite": _ok(
-                "https://example.com/onsite", "<html>onsite</html>"
-            ),
+            "https://example.com/onsite": _ok("https://example.com/onsite", "<html>onsite</html>"),
         }
         crawler, fetcher = _crawler(fetch_map)
         result = await crawler.crawl(
@@ -654,9 +652,7 @@ class TestCrawlGuards:
         good = "https://example.com/good"
 
         class _RaisingFetcher(_FakeFetcher):
-            async def fetch(
-                self, url: str, session_id: Optional[str] = None
-            ) -> FetchResult:
+            async def fetch(self, url: str, session_id: Optional[str] = None) -> FetchResult:
                 self.calls.append(url)
                 if url == boom:
                     raise RuntimeError("kaboom")
@@ -693,10 +689,7 @@ class TestSitemapSeeding:
         seed_a = "https://example.com/seed-a"
         seed_b = "https://example.com/seed-b"
         sitemap_xml = (
-            "<urlset>"
-            f"<url><loc>{seed_a}</loc></url>"
-            f"<url><loc>{seed_b}</loc></url>"
-            "</urlset>"
+            f"<urlset><url><loc>{seed_a}</loc></url><url><loc>{seed_b}</loc></url></urlset>"
         )
         fetch_map = {
             start: _ok(start, "<html>home, no links</html>"),
@@ -757,10 +750,7 @@ class TestSitemapSeeding:
         onsite = "https://example.com/onsite"
         offsite = "https://evil.com/offsite"
         sitemap_xml = (
-            "<urlset>"
-            f"<url><loc>{onsite}</loc></url>"
-            f"<url><loc>{offsite}</loc></url>"
-            "</urlset>"
+            f"<urlset><url><loc>{onsite}</loc></url><url><loc>{offsite}</loc></url></urlset>"
         )
         fetch_map = {
             start: _ok(start, "<html>home</html>"),

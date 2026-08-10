@@ -202,9 +202,7 @@ class RobotsChecker:
             # SSRF lever (a redirect to an internal host would otherwise be
             # fetched). Any non-200 -- including a 3xx -- is treated as "no
             # robots / allow-all" per the existing semantics below.
-            async with httpx.AsyncClient(
-                timeout=self._timeout, follow_redirects=False
-            ) as client:
+            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=False) as client:
                 # v1.6.16 ROBOTS-2 (post-connect) fix: STREAM the GET so the
                 # peer-IP re-check below actually works. ``httpx_peer_ip`` reads
                 # the httpcore ``network_stream`` extension, which is ONLY

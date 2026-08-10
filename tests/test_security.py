@@ -49,8 +49,18 @@ class TestSafeJoinPath:
 
     @pytest.mark.parametrize(
         "name",
-        ["CON.pdf", "con.txt", "NUL", "AUX", "PRN", "COM1.log", "LPT9.dat",
-         "sub/CON.csv", "CON.", "PRN "],
+        [
+            "CON.pdf",
+            "con.txt",
+            "NUL",
+            "AUX",
+            "PRN",
+            "COM1.log",
+            "LPT9.dat",
+            "sub/CON.csv",
+            "CON.",
+            "PRN ",
+        ],
     )
     def test_rejects_windows_reserved_device_names(self, tmp_path: Path, name: str) -> None:
         # v1.6.16 deep-review fix: a web-derived filename like CON.pdf would
@@ -141,19 +151,12 @@ class TestDenyListIPv6Canonicalization:
         # 2001:db8::/32 is classified PRIVATE, so block_private_ips=False is
         # required to isolate the deny-list COMPARATOR -- otherwise the test
         # would pass via the private-IP gate even with the fix reverted.
-        sc = SafetyConfig(
-            denied_domains=["[2001:db8:0:0:0:0:0:1]"], block_private_ips=False
-        )
+        sc = SafetyConfig(denied_domains=["[2001:db8:0:0:0:0:0:1]"], block_private_ips=False)
         assert check_domain_allowed("http://[2001:db8::1]/x", sc) is False
 
     def test_compressed_deny_matches_expanded_url(self) -> None:
         sc = SafetyConfig(denied_domains=["[2001:db8::1]"], block_private_ips=False)
-        assert (
-            check_domain_allowed(
-                "http://[2001:0db8:0000:0000:0000:0000:0000:1]/x", sc
-            )
-            is False
-        )
+        assert check_domain_allowed("http://[2001:0db8:0000:0000:0000:0000:0000:1]/x", sc) is False
 
     def test_uppercase_deny_matches_lowercase_url(self) -> None:
         sc = SafetyConfig(denied_domains=["[2001:DB8::1]"], block_private_ips=False)

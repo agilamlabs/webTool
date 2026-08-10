@@ -474,9 +474,7 @@ class SearchEngine:
                     n=response.total_results,
                 )
                 # v1.7.0 (Wave 4A): the provider answered with hits.
-                self._metrics.incr(
-                    "search_provider_outcome", provider=provider.name, outcome="ok"
-                )
+                self._metrics.incr("search_provider_outcome", provider=provider.name, outcome="ok")
                 # Provider answered cleanly -- clear any prior trip.
                 self._breaker.record_success(provider)
                 # Cache non-empty responses so repeat searches skip the

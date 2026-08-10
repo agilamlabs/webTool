@@ -270,9 +270,7 @@ async def test_fill_form_and_extract_regates_post_submit_redirect(
     # returns the allowed host pre-submit and the internal host post-submit
     # so the INITIAL-nav re-check is satisfied but the POST-submit gate
     # must reject.
-    type(page).url = property(
-        lambda _self: internal_url if state["submitted"] else allowed_url
-    )
+    type(page).url = property(lambda _self: internal_url if state["submitted"] else allowed_url)
 
     # The submit click (step 4) resolves via ``page.locator(<selector>)``;
     # its ``.click()`` flips the redirect flag, mimicking the navigation.

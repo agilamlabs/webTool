@@ -1226,9 +1226,7 @@ class Recipes:
                 correlation_id=new_snap.correlation_id,
             )
 
-        diff = diff_snapshots(
-            baseline, new_snap, max_lines=self._config.monitoring.diff_max_lines
-        )
+        diff = diff_snapshots(baseline, new_snap, max_lines=self._config.monitoring.diff_max_lines)
         # Roll the baseline forward only on a SUCCESSFUL capture, so a transient
         # fetch failure can't overwrite a good baseline with an empty snapshot.
         if update and new_snap.fetch_status is None:
@@ -1291,8 +1289,10 @@ class Recipes:
         pages_cap = max(1, min(int(pages_cap), cfg.max_pages))
         depth_cap = cfg.max_depth if max_depth is None else max_depth
         depth_cap = max(0, min(int(depth_cap), cfg.max_depth))
-        same_dom = cfg.same_registrable_domain if same_registrable_domain is None else (
-            same_registrable_domain
+        same_dom = (
+            cfg.same_registrable_domain
+            if same_registrable_domain is None
+            else (same_registrable_domain)
         )
         sitemap = cfg.use_sitemap if use_sitemap is None else use_sitemap
 
@@ -1917,13 +1917,9 @@ class Recipes:
                     ),
                     url=current,
                 )
-                self._append_page(
-                    pages, current, fr, extracted, blocked_reason="injection_blocked"
-                )
+                self._append_page(pages, current, fr, extracted, blocked_reason="injection_blocked")
                 diagnostics.append(
-                    self._page_diagnostic(
-                        current, fr, extracted, block_reason="injection_blocked"
-                    )
+                    self._page_diagnostic(current, fr, extracted, block_reason="injection_blocked")
                 )
                 if strategy == "page_param":
                     current = self._bump_page_param(current)
@@ -1974,9 +1970,7 @@ class Recipes:
             except Exception as exc:
                 bag.err("budget_exceeded", str(exc))
                 self._append_page(pages, current, fr, extracted)
-                diagnostics.append(
-                    self._page_diagnostic(current, fr, extracted)
-                )
+                diagnostics.append(self._page_diagnostic(current, fr, extracted))
                 stopped_reason = "budget"
                 break
 
@@ -2010,11 +2004,7 @@ class Recipes:
         if extracted.failure_stage == "injection_blocked":
             return True
         report = extracted.injection
-        return (
-            report is not None
-            and report.risk == "high"
-            and not (extracted.content or "")
-        )
+        return report is not None and report.risk == "high" and not (extracted.content or "")
 
     @staticmethod
     def _injection_rollup(pages: list[CollectedPage]) -> tuple[Optional[str], int]:
@@ -2114,8 +2104,6 @@ class Recipes:
 
         # 1. rel=next
         for a in soup.find_all("a", rel=True):
-            if not isinstance(a, Tag):
-                continue
             rel = a.get("rel")
             rel_tokens = rel if isinstance(rel, list) else [rel]
             if any(isinstance(t, str) and t.lower() == "next" for t in rel_tokens):
@@ -2125,8 +2113,6 @@ class Recipes:
 
         # 2. + 3. aria-label / text substring match
         for a in soup.find_all("a"):
-            if not isinstance(a, Tag):
-                continue
             aria = a.get("aria-label")
             label = (aria if isinstance(aria, str) else "") + " " + a.get_text()
             label_l = label.lower()

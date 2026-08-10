@@ -95,9 +95,7 @@ class TestRobotsChecker:
         rp = RobotFileParser()
         rp.parse(["User-agent: *", "Disallow: /private/"])
 
-        async def _stub(
-            scheme: str, host: str, port: int | None = None
-        ) -> RobotFileParser:
+        async def _stub(scheme: str, host: str, port: int | None = None) -> RobotFileParser:
             return rp
 
         monkeypatch.setattr(rc, "_fetch_and_parse", _stub)
@@ -119,9 +117,7 @@ class TestRobotsChecker:
             ]
         )
 
-        async def _stub(
-            scheme: str, host: str, port: int | None = None
-        ) -> RobotFileParser:
+        async def _stub(scheme: str, host: str, port: int | None = None) -> RobotFileParser:
             return rp
 
         monkeypatch.setattr(rc, "_fetch_and_parse", _stub)
@@ -267,9 +263,7 @@ class TestRobotsPostConnectPeerIPCheck:
         assert result is None  # allow-all
 
     @pytest.mark.asyncio
-    async def test_public_peer_ip_parses_normally(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_public_peer_ip_parses_normally(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import httpx
 
         rc = RobotsChecker(user_agent="test-bot", block_private_ips=True)

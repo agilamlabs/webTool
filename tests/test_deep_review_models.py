@@ -1,13 +1,13 @@
 """Deep-review (post-v1.6.16) models.py-cluster regression tests.
 
-  * ``delay`` fields on TypeInput / ClickXYInput / TypeTextInput are bounded
-    (ge=0, le=5000) -- they feed UNTIMED Playwright keyboard.type / mouse.click
-    calls, so an unbounded value pinned the shared Playwright connection.
-  * ``FormFilterSpec.wait_timeout_ms`` has ge=1 so the Playwright
-    "0 == wait forever" sentinel is unreachable.
-  * ``LocatorSpec.is_empty()`` no longer counts ``role_name`` (only a filter
-    for ``role``), matching the resolver; the resolver gives a precise error
-    for a role_name-only spec instead of the misleading "empty".
+* ``delay`` fields on TypeInput / ClickXYInput / TypeTextInput are bounded
+  (ge=0, le=5000) -- they feed UNTIMED Playwright keyboard.type / mouse.click
+  calls, so an unbounded value pinned the shared Playwright connection.
+* ``FormFilterSpec.wait_timeout_ms`` has ge=1 so the Playwright
+  "0 == wait forever" sentinel is unreachable.
+* ``LocatorSpec.is_empty()`` no longer counts ``role_name`` (only a filter
+  for ``role``), matching the resolver; the resolver gives a precise error
+  for a role_name-only spec instead of the misleading "empty".
 """
 
 from __future__ import annotations

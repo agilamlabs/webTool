@@ -230,8 +230,6 @@ def _meta_maps(soup: BeautifulSoup) -> tuple[dict[str, Any], dict[str, Any]]:
     og: dict[str, Any] = {}
     meta: dict[str, Any] = {}
     for tag in soup.find_all("meta"):
-        if not isinstance(tag, Tag):
-            continue
         content = tag.get("content")
         if not isinstance(content, str) or not content.strip():
             continue
@@ -258,9 +256,7 @@ def _microdata_map(soup: BeautifulSoup, *, limit: int) -> dict[str, Any]:
     """Map ``[itemprop]`` -> ``content`` attr (or text) for the first ``limit`` items."""
     out: dict[str, Any] = {}
     count = 0
-    for tag in soup.find_all(attrs={"itemprop": True}):
-        if not isinstance(tag, Tag):
-            continue
+    for tag in soup.select("[itemprop]"):
         if count >= limit:
             break
         prop = tag.get("itemprop")
@@ -304,8 +300,6 @@ def _dom_pairs(soup: BeautifulSoup, *, limit: int) -> dict[str, Any]:
     for dt in soup.find_all("dt"):
         if scanned >= limit:
             break
-        if not isinstance(dt, Tag):
-            continue
         dd = dt.find_next_sibling("dd")
         if isinstance(dd, Tag):
             _add(dt.get_text(" ", strip=True), dd.get_text(" ", strip=True))
@@ -315,8 +309,6 @@ def _dom_pairs(soup: BeautifulSoup, *, limit: int) -> dict[str, Any]:
     for th in soup.find_all("th"):
         if scanned >= limit:
             break
-        if not isinstance(th, Tag):
-            continue
         td = th.find_next_sibling("td")
         if isinstance(td, Tag):
             _add(th.get_text(" ", strip=True), td.get_text(" ", strip=True))
@@ -326,8 +318,6 @@ def _dom_pairs(soup: BeautifulSoup, *, limit: int) -> dict[str, Any]:
     for label in soup.find_all("label"):
         if scanned >= limit:
             break
-        if not isinstance(label, Tag):
-            continue
         target: Optional[Tag] = None
         for_id = label.get("for")
         if isinstance(for_id, str) and for_id:
@@ -391,8 +381,7 @@ def _match_key(
         # Require the overlap to be on an alias axis OR a shared real token, so
         # a coincidental token (e.g. "the") cannot trigger an alias match.
         if (ktoks & field_alias) and (
-            (ktoks & field_tokens)
-            or any((field_tokens & g) and (ktoks & g) for g in _ALIAS_GROUPS)
+            (ktoks & field_tokens) or any((field_tokens & g) and (ktoks & g) for g in _ALIAS_GROUPS)
         ):
             return original
 
