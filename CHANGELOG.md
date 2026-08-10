@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed `Agent.interact()` to validate documented dict-shaped actions before execution.
+
 ### Industrial hardening
 
 - Split real-browser coverage into a merge-blocking, local-only

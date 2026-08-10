@@ -43,13 +43,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional, cast
 from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
+from pydantic import TypeAdapter
 
 from .audit import AuditLogger
 from .browser_actions import BrowserActions
@@ -965,7 +966,7 @@ class Agent:
     async def interact(
         self,
         url: str = "",
-        actions: list[Action] | None = None,
+        actions: Sequence[Action | dict[str, Any]] | None = None,
         stop_on_error: bool | None = None,
         *,
         session_id: Optional[str] = None,
@@ -979,18 +980,17 @@ class Agent:
         ``interact(actions=[...], session_id=...)`` acts on them without a
         navigation that would wipe the refs.
         """
-        if actions is None:
-            actions = []
-        async with self._call_scope("interact", {"url": url, "n_actions": len(actions)}):
+        parsed_actions = TypeAdapter(list[Action]).validate_python(actions or [])
+        async with self._call_scope("interact", {"url": url, "n_actions": len(parsed_actions)}):
             self._debug.reset()
             logger.info(
                 "Starting interaction sequence on {url} ({n} actions, session={s})",
                 url=url,
-                n=len(actions),
+                n=len(parsed_actions),
                 s=session_id or "ephemeral",
             )
             return await self._actions.execute_sequence(
-                url, actions, stop_on_error=stop_on_error, session_id=session_id
+                url, parsed_actions, stop_on_error=stop_on_error, session_id=session_id
             )
 
     async def screenshot(

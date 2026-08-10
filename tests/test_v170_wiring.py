@@ -390,6 +390,18 @@ class TestInteractActInPlace:
         passed_url = kwargs.get("url", _args[0] if _args else None)
         assert passed_url == ""
 
+    @pytest.mark.asyncio
+    async def test_agent_interact_parses_action_dicts(self) -> None:
+        agent = _bare_agent()
+        agent._debug = MagicMock()
+        agent._actions = MagicMock()
+        agent._actions.execute_sequence = AsyncMock(return_value=ActionSequenceResult(url=""))
+
+        await agent.interact(actions=[{"action": "click_xy", "x": 5, "y": 5}])
+
+        actions = agent._actions.execute_sequence.call_args.args[1]
+        assert actions[0].action == "click_xy"
+
 
 # ----------------------------------------------------------------------
 # Wave 4A: metrics wiring (Agent + MCP)

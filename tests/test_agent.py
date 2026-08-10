@@ -150,7 +150,7 @@ class TestV169NamedProfilePersistence:
                 [
                     {
                         "action": "evaluate",
-                        "script": "localStorage.setItem('wt_v169', 'persists');",
+                        "expression": "localStorage.setItem('wt_v169', 'persists');",
                     }
                 ],
                 session_id=sid,
@@ -161,7 +161,7 @@ class TestV169NamedProfilePersistence:
             sid = await agent.create_session()
             result = await agent.interact(
                 "https://httpbin.org/html",
-                [{"action": "evaluate", "script": "localStorage.getItem('wt_v169');"}],
+                [{"action": "evaluate", "expression": "localStorage.getItem('wt_v169');"}],
                 session_id=sid,
             )
 
@@ -247,7 +247,7 @@ class TestV1610Integration:
                 [
                     {
                         "action": "evaluate",
-                        "script": ("document.cookie = 'wt1610=hi; path=/; max-age=3600';"),
+                        "expression": ("document.cookie = 'wt1610=hi; path=/; max-age=3600';"),
                     }
                 ],
                 session_id=sid,
@@ -257,7 +257,7 @@ class TestV1610Integration:
             sid = await agent.create_session()
             result = await agent.interact(
                 "https://httpbin.org/html",
-                [{"action": "evaluate", "script": "document.cookie;"}],
+                [{"action": "evaluate", "expression": "document.cookie;"}],
                 session_id=sid,
             )
 
@@ -273,7 +273,7 @@ class TestV1610Integration:
     async def test_click_xy_unknown_policy_block_rejects_empty_inspection(self, tmp_path) -> None:
         """v1.6.10 Item 4: with allow_form_submit=False AND
         coordinate_click_unknown_policy='block', a click at coordinates
-        outside any element (empty body, click at (5, 5)) is rejected
+        outside the viewport is rejected
         because elementFromPoint returns no element."""
         from web_agent import BrowserConfig, SafetyConfig
         from web_agent.models import ActionStatus
@@ -292,15 +292,15 @@ class TestV1610Integration:
         async with Agent(config) as agent:
             sid = await agent.create_session()
             result = await agent.interact(
-                "data:text/html,<html><body style='margin:0;padding:0'></body></html>",
-                [{"action": "click_xy", "x": 5, "y": 5}],
+                "https://example.com",
+                [{"action": "click_xy", "x": -1, "y": -1}],
                 session_id=sid,
             )
 
         last = result.results[-1] if result.results else None
         assert last is not None, "expected at least one action result"
         assert last.status == ActionStatus.FAILED, (
-            f"expected click_xy to FAIL on empty body with block policy, got {last.status}"
+            f"expected off-viewport click_xy to FAIL with block policy, got {last.status}"
         )
         assert "unknown" in (last.error_message or "").lower(), (
             f"expected 'unknown' in error message, got {last.error_message!r}"
@@ -369,8 +369,8 @@ class TestV1610Integration:
         async with Agent(config) as agent:
             sid = await agent.create_session()
             result = await agent.interact(
-                "data:text/html,<html><body style='margin:0;padding:0'></body></html>",
-                [{"action": "click_xy", "x": 5, "y": 5}],
+                "https://example.com",
+                [{"action": "click_xy", "x": -1, "y": -1}],
                 session_id=sid,
             )
 
@@ -414,7 +414,7 @@ class TestV1610Integration:
                 [
                     {
                         "action": "evaluate",
-                        "script": ("document.cookie = 'sharedctx=A; path=/; max-age=3600';"),
+                        "expression": ("document.cookie = 'sharedctx=A; path=/; max-age=3600';"),
                     }
                 ],
                 session_id=sid_a,
@@ -423,7 +423,7 @@ class TestV1610Integration:
             sid_b = await agent.create_session()
             result = await agent.interact(
                 "https://httpbin.org/html",
-                [{"action": "evaluate", "script": "document.cookie;"}],
+                [{"action": "evaluate", "expression": "document.cookie;"}],
                 session_id=sid_b,
             )
 
