@@ -11,7 +11,7 @@ threat model and mitigations explicitly.
 Please **do not** open public GitHub issues for suspected security
 vulnerabilities.
 
-Email **<solutionsteams@decimalpointanalytics.com>** with:
+Email **<goku.agilam@gmail.com>** with:
 
 - A minimal reproduction (URL, config, version)
 - Expected vs. observed behavior
