@@ -1157,7 +1157,7 @@ class TestRobots1Eviction:
         monkeypatch.setattr(robots_module, "_ROBOTS_CACHE_MAXSIZE", 3)
         rc = RobotsChecker(user_agent="bot", ttl_seconds=1e9, block_private_ips=False)
 
-        async def _stub(scheme: str, host: str):
+        async def _stub(scheme: str, host: str, port: int | None = None):
             return None
 
         monkeypatch.setattr(rc, "_fetch_and_parse", _stub)
@@ -1169,8 +1169,8 @@ class TestRobots1Eviction:
         assert len(rc._locks) <= 3
         assert len(rc._cache) <= 3
         # The most-recently-seen host survived; the oldest was evicted.
-        assert "host9.example" in rc._locks
-        assert "host0.example" not in rc._locks
+        assert "https://host9.example" in rc._locks
+        assert "https://host0.example" not in rc._locks
 
 
 # ---------------------------------------------------------------------------
@@ -1322,7 +1322,7 @@ class TestRobots3FirstLookupFetchesRegardlessOfUptime:
 
         calls = {"n": 0}
 
-        async def _counting_stub(scheme: str, host: str):
+        async def _counting_stub(scheme: str, host: str, port: int | None = None):
             calls["n"] += 1
             return None
 

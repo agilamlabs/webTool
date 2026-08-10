@@ -81,7 +81,7 @@ class TestRobotsChecker:
     async def test_allows_when_robots_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rc = RobotsChecker(user_agent="test-bot")
 
-        async def _stub(scheme: str, host: str) -> None:
+        async def _stub(scheme: str, host: str, port: int | None = None) -> None:
             return None  # 404 / unreachable
 
         monkeypatch.setattr(rc, "_fetch_and_parse", _stub)
@@ -95,7 +95,9 @@ class TestRobotsChecker:
         rp = RobotFileParser()
         rp.parse(["User-agent: *", "Disallow: /private/"])
 
-        async def _stub(scheme: str, host: str) -> RobotFileParser:
+        async def _stub(
+            scheme: str, host: str, port: int | None = None
+        ) -> RobotFileParser:
             return rp
 
         monkeypatch.setattr(rc, "_fetch_and_parse", _stub)
@@ -117,7 +119,9 @@ class TestRobotsChecker:
             ]
         )
 
-        async def _stub(scheme: str, host: str) -> RobotFileParser:
+        async def _stub(
+            scheme: str, host: str, port: int | None = None
+        ) -> RobotFileParser:
             return rp
 
         monkeypatch.setattr(rc, "_fetch_and_parse", _stub)
@@ -129,7 +133,7 @@ class TestRobotsChecker:
         rc = RobotsChecker(user_agent="bot", ttl_seconds=3600)
         call_count = 0
 
-        async def _counting_stub(scheme: str, host: str) -> None:
+        async def _counting_stub(scheme: str, host: str, port: int | None = None) -> None:
             nonlocal call_count
             call_count += 1
             return None
@@ -147,10 +151,38 @@ class TestRobotsChecker:
         assert call_count == 2
 
     @pytest.mark.asyncio
+    async def test_cache_and_fetch_are_scoped_to_origin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rc = RobotsChecker(user_agent="bot", ttl_seconds=3600)
+        calls: list[tuple[str, str, int | None]] = []
+
+        async def _stub(scheme: str, host: str, port: int | None = None) -> None:
+            calls.append((scheme, host, port))
+            return None
+
+        monkeypatch.setattr(rc, "_fetch_and_parse", _stub)
+
+        await rc.is_allowed("http://example.com:8000/a")
+        await rc.is_allowed("http://example.com:8001/a")
+        await rc.is_allowed("https://example.com:8000/a")
+
+        assert calls == [
+            ("http", "example.com", 8000),
+            ("http", "example.com", 8001),
+            ("https", "example.com", 8000),
+        ]
+
+    @pytest.mark.asyncio
     async def test_url_without_host_is_allowed(self) -> None:
         rc = RobotsChecker()
         # file:// URL has no hostname -- robots check skipped.
         assert await rc.is_allowed("file:///tmp/local")
+
+    @pytest.mark.asyncio
+    async def test_malformed_port_is_denied(self) -> None:
+        rc = RobotsChecker()
+        assert not await rc.is_allowed("https://example.com:not-a-port/path")
 
     @pytest.mark.asyncio
     async def test_user_agent_property_exposed(self) -> None:

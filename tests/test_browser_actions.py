@@ -53,7 +53,7 @@ def auto_config(tmp_path) -> AppConfig:
     )
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestClickAction:
     @pytest.mark.asyncio
     async def test_click_nonexistent_selector(self, auto_config: AppConfig) -> None:
@@ -67,7 +67,7 @@ class TestClickAction:
         assert result.results[0].status in (ActionStatus.FAILED, ActionStatus.TIMEOUT)
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestFillAction:
     @pytest.mark.asyncio
     async def test_fill_input(self, auto_config: AppConfig) -> None:
@@ -87,7 +87,7 @@ class TestFillAction:
         assert result.results[2].data["result"] == "Test User"
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestNavigateAction:
     @pytest.mark.asyncio
     async def test_navigate_back_forward(self, auto_config: AppConfig) -> None:
@@ -109,7 +109,7 @@ class TestNavigateAction:
         assert "example.com" in result.results[2].data["result"]
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestScreenshotAction:
     @pytest.mark.asyncio
     async def test_viewport_screenshot(self, auto_config: AppConfig) -> None:
@@ -147,7 +147,7 @@ class TestScreenshotAction:
         assert ss_data["size_bytes"] > 0
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestWaitAction:
     @pytest.mark.asyncio
     async def test_wait_for_selector_found(self, auto_config: AppConfig) -> None:
@@ -177,7 +177,7 @@ class TestWaitAction:
         assert result.results[0].status in (ActionStatus.TIMEOUT, ActionStatus.FAILED)
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestEvaluateAction:
     @pytest.mark.asyncio
     async def test_evaluate_arithmetic(self, auto_config: AppConfig) -> None:
@@ -202,7 +202,7 @@ class TestEvaluateAction:
         assert "Example" in result.results[0].data["result"]
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestScrollAction:
     @pytest.mark.asyncio
     async def test_scroll_down(self, auto_config: AppConfig) -> None:
@@ -218,7 +218,7 @@ class TestScrollAction:
         assert result.actions_succeeded == 2
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestKeyboardAction:
     @pytest.mark.asyncio
     async def test_keyboard_in_input(self, auto_config: AppConfig) -> None:
@@ -239,7 +239,7 @@ class TestKeyboardAction:
         assert result.results[3].data["result"] == "Hi"
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestHoverAction:
     @pytest.mark.asyncio
     async def test_hover_element(self, auto_config: AppConfig) -> None:
@@ -252,7 +252,7 @@ class TestHoverAction:
         assert result.actions_succeeded == 1
 
 
-@pytest.mark.integration
+@pytest.mark.integration_live_web
 class TestSequenceExecution:
     @pytest.mark.asyncio
     async def test_full_sequence(self, auto_config: AppConfig) -> None:

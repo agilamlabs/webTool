@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Allow on-demand triggering of the integration job without a push
+  # Allow on-demand triggering of the live-web drift job without a push.
   workflow_dispatch:
   # Nightly run -- catches drift in upstream search engines / CAPTCHA
   # behavior + Playwright browser releases without blocking PRs.
@@ -66,10 +66,8 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Run unit tests with coverage
-        # Browser/network integration tests are excluded by the default
-        # addopts = '-m "not integration"' in pyproject.toml -- those run
-        # in the dedicated integration job below. The hermetic (mocked)
-        # tests in test_agent.py / test_browser_actions.py DO run here.
+        # Both real-browser suites are excluded by pyproject addopts and run
+        # in their dedicated jobs below. Mocked browser tests still run here.
         # Tee output to a file so the failure step below can publish it to
         # the publicly-visible job summary even when raw logs require auth.
         run: |
@@ -107,8 +105,47 @@ jobs:
           path: coverage.xml
           retention-days: 7
 
-  integration:
-    name: Integration tests (Playwright + network)
+  integration-deterministic:
+    name: Integration deterministic (local Chromium)
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Install Playwright Chromium + system deps
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run deterministic browser integration tests
+        run: |
+          python -m pytest tests/test_integration_deterministic.py \
+            -m integration_deterministic -v --tb=short --maxfail=1
+
+      - name: Upload deterministic integration artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-deterministic-debug
+          path: |
+            debug/
+            screenshots/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  integration-live-web:
+    name: Integration live web (ecosystem drift)
     # Skip on PRs -- search engines can serve CAPTCHAs from CI's IPs
     # and that flakiness shouldn't block legitimate PR merges. Runs on
     # push-to-main (post-merge sanity), nightly schedule (catch drift),
@@ -117,8 +154,8 @@ jobs:
     needs: [lint, test]
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Don't fail the overall workflow if a search engine flakes -- the
-    # integration job's value is signal, not gating.
+    # Don't fail the overall workflow if an external service flakes; this
+    # job's value is drift signal, not merge gating.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -139,19 +176,18 @@ jobs:
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Run integration tests (browser + network)
-        # Select by marker, not file path: the default addopts in
-        # pyproject.toml is '-m "not integration"', and this explicit
-        # CLI -m overrides it (argparse keeps the last -m value).
+      - name: Run live-web integration tests
+        # Select by marker so local deterministic tests never call external
+        # services and live-web drift does not duplicate the PR gate.
         run: |
-          python -m pytest -m integration \
+          python -m pytest -m integration_live_web \
             -v --tb=short --maxfail=5 --durations=10
 
-      - name: Upload integration test artifacts on failure
+      - name: Upload live-web integration artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-debug
+          name: integration-live-web-debug
           path: |
             debug/
             screenshots/

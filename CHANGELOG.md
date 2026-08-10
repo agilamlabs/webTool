@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Industrial hardening
+
+- Split real-browser coverage into a merge-blocking, local-only
+  `integration-deterministic` CI job and a non-blocking
+  `integration-live-web` ecosystem-drift job. The initial controlled server
+  covers redirects, explicit HTTP failures, robots denial, challenge
+  detection, prompt-injection containment, form interaction, session cookies,
+  and downloads through real Chromium.
+- Fixed robots policy caching and retrieval to use the full origin, including
+  scheme and non-default port. `Agent` now also forwards the explicit
+  `block_private_ips=False` setting to the shared robots checker, allowing
+  controlled private origins only when the caller has opted out of the default
+  SSRF guard.
+- Constrained the optional MCP dependency to the compatible 1.x API; an
+  unbounded `mcp>=1` install could resolve to MCP 2.x and fail during server
+  import before any test or tool could run.
+
 ## [1.7.0] - 2026-06-13
 
 ### Real-world hardening: solve the problems autonomous agents actually hit on the live 2026 web

@@ -126,7 +126,7 @@ class CaptchaResolution:
 # or a remote solver MUST be async, or it will stall all other concurrent work.
 CaptchaResolver = Callable[
     [CaptchaContext],
-    Union[bool, CaptchaResolution, None, Awaitable[Union[bool, CaptchaResolution, None]]],
+    Union[bool, CaptchaResolution, Awaitable[Union[bool, CaptchaResolution, None]], None],
 ]
 
 

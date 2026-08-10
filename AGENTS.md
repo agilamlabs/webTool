@@ -31,18 +31,22 @@ The package has no system dependencies beyond what `playwright install` brings.
 Run all three gates before declaring work done:
 
 ```bash
-python -m pytest -v          # 1579 unit tests; integration tests auto-excluded via pyproject addopts (-m "not integration")
+python -m pytest -v          # deterministic unit suite; real-browser suites are excluded
 python -m ruff check web_agent tests
 python -m mypy web_agent
 ```
 
-Integration tests (real Playwright browser, network) run under the `integration` marker — opt-in (28 tests; v1.7.0 quarantined them behind this marker so a bare `pytest` no longer launches real Chromium):
+Real-browser tests are split by purpose. The deterministic local suite gates
+PRs; the external-web suite is drift signal only:
 
 ```bash
-python -m pytest -v -m integration
+python -m pytest -v tests/test_integration_deterministic.py -m integration_deterministic
+python -m pytest -v -m integration_live_web
 ```
 
-CI runs lint + unit tests on every push and a separate integration job — see `.github/workflows/ci.yml`.
+CI runs lint, unit tests, and deterministic Chromium integration on every PR;
+live-web integration runs after merge, nightly, or manually — see
+`.github/workflows/ci.yml`.
 
 ## Repository layout
 
@@ -193,7 +197,7 @@ These rules constrain every change:
 - **No bare `except`.** Every catch states the exception type. `Exception` is fine; `BaseException` only for cancellation paths.
 - **Logging via loguru.** `logger.info / .warning / .error` — never `print`. Use `{}` placeholder substitution: `logger.info("Fetched {n}", n=len(items))`.
 - **Async-first.** Every I/O method is `async def`. No `time.sleep` in core code (use `asyncio.sleep` or `RateLimiter`).
-- **Tests** live next to the package layout (`tests/test_<module>.py`). Mock-based unit tests first; integration tests go behind the `@pytest.mark.integration` marker.
+- **Tests** live next to the package layout (`tests/test_<module>.py`). Mock-based unit tests first; controlled local Chromium tests use `@pytest.mark.integration_deterministic`, while external-service tests use `@pytest.mark.integration_live_web`.
 
 ## How to add a feature
 
@@ -201,7 +205,7 @@ These rules constrain every change:
 2. **Re-export from `__init__.py`** if it's part of the public API.
 3. **Implement in the appropriate module.** Don't reach across module boundaries — call existing public helpers.
 4. **Wire in `Agent`** if it's a user-facing operation; thread it into `Recipes` for composite workflows.
-5. **Add tests.** Mock-based unit tests in `tests/test_<feature>.py`. If it needs a real browser, add an integration test with `@pytest.mark.integration`.
+5. **Add tests.** Mock-based unit tests in `tests/test_<feature>.py`. Real-browser product correctness belongs in the controlled local suite; use `integration_live_web` only for external ecosystem drift.
 6. **Run gates locally.** `pytest`, `ruff`, `mypy` — all three.
 7. **Update CHANGELOG.md.** Every released change has an entry under the next version.
 8. **README.md** if the feature is user-visible.

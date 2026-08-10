@@ -1,7 +1,7 @@
 """robots.txt fetching, parsing, and TTL caching.
 
 Uses Python's stdlib :class:`urllib.robotparser.RobotFileParser` for
-parsing. ``robots.txt`` is fetched on first encounter for each host,
+parsing. ``robots.txt`` is fetched on first encounter for each origin,
 parsed, and cached for ``ttl_seconds``. Subsequent calls reuse the
 parsed result without network I/O.
 
@@ -29,17 +29,17 @@ from loguru import logger
 
 from .utils import httpx_peer_ip, is_private_address
 
-# v1.6.16 ROBOTS-1: bound the per-host cache / lock dicts. RobotsChecker
+# v1.6.16 ROBOTS-1: bound the per-origin cache / lock dicts. RobotsChecker
 # lives for the whole process (e.g. the MCP server holds one Agent), so a
-# run that touches many distinct hosts otherwise accumulates a
-# (float, RobotFileParser) tuple plus an asyncio.Lock per host forever.
+# run that touches many distinct origins otherwise accumulates a
+# (float, RobotFileParser) tuple plus an asyncio.Lock per origin forever.
 # Mirrors the bounded DNS cache in utils (_DNS_CACHE_MAXSIZE). FIFO
-# eviction of the oldest-inserted host keeps it minimal and correct.
+# eviction of the oldest-inserted origin keeps it minimal and correct.
 _ROBOTS_CACHE_MAXSIZE: int = 2048
 
 
 class RobotsChecker:
-    """Per-host robots.txt cache.
+    """Per-origin robots.txt cache.
 
     Args:
         user_agent: User-Agent string sent when fetching robots.txt and
@@ -68,13 +68,13 @@ class RobotsChecker:
         self._ttl = ttl_seconds
         self._timeout = timeout_seconds
         self._block_private_ips = block_private_ips
-        # host -> (fetched_at, parser_or_None)
+        # origin -> (fetched_at, parser_or_None)
         self._cache: dict[str, tuple[float, RobotFileParser | None]] = {}
-        # v1.6.14 C-10: per-host locks instead of one global lock. A
+        # v1.6.14 C-10: per-origin locks instead of one global lock. A
         # single shared lock serialised the robots.txt fetch for EVERY
-        # host -- a slow robots.txt on host A blocked checks for unrelated
-        # hosts B, C, ... Per-host locks preserve the "fetch each host's
-        # robots.txt at most once" guarantee while letting different hosts
+        # origin -- a slow robots.txt on origin A blocked checks for unrelated
+        # origins B, C, ... Per-origin locks preserve the "fetch each origin's
+        # robots.txt at most once" guarantee while letting different origins
         # proceed concurrently. Locks are created lazily on first use.
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -83,7 +83,7 @@ class RobotsChecker:
         return self._user_agent
 
     async def is_allowed(self, url: str) -> bool:
-        """Return True if ``url`` may be fetched per its host's robots.txt.
+        """Return True if ``url`` may be fetched per its origin's robots.txt.
 
         Returns ``True`` (allow) if:
         - URL has no host (e.g. ``file://``)
@@ -99,18 +99,26 @@ class RobotsChecker:
             return True
 
         scheme = parsed.scheme or "https"
-        # v1.6.16 ROBOTS-1: evict before inserting a new host so the
-        # per-host dicts stay bounded over a long-lived process.
-        if host not in self._locks:
-            self._evict_if_needed(host)
-        # v1.6.14 C-10: lock per-host so a slow robots.txt fetch on one
-        # host doesn't serialise checks for every other host. ``setdefault``
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        authority = f"[{host}]" if ":" in host else host
+        if port is not None:
+            authority = f"{authority}:{port}"
+        origin = f"{scheme.lower()}://{authority.lower()}"
+        # Evict before inserting a new origin so these maps stay bounded over
+        # a long-lived process.
+        if origin not in self._locks:
+            self._evict_if_needed(origin)
+        # Lock per origin so a slow robots.txt fetch on one origin doesn't
+        # serialise checks for every other origin. ``setdefault``
         # is safe without an outer lock because lock creation is sync
         # (no ``await`` between the get-or-create), so two coroutines for
-        # the same host still converge on the same Lock object.
-        lock = self._locks.setdefault(host, asyncio.Lock())
+        # the same origin still converge on the same Lock object.
+        lock = self._locks.setdefault(origin, asyncio.Lock())
         async with lock:
-            cached = self._cache.get(host)
+            cached = self._cache.get(origin)
             # v1.6.16 ROBOTS-3: treat "not cached" as an explicit miss.
             # The previous ``(0.0, None)`` sentinel combined with the
             # ``(monotonic() - cached_at) > ttl`` staleness test never fired
@@ -120,8 +128,8 @@ class RobotsChecker:
             # treated as allow-all. Check membership explicitly so the first
             # lookup for a host always fetches, independent of uptime.
             if cached is None or (time.monotonic() - cached[0]) > self._ttl:
-                rp = await self._fetch_and_parse(scheme, host)
-                self._cache[host] = (time.monotonic(), rp)
+                rp = await self._fetch_and_parse(scheme, host, port)
+                self._cache[origin] = (time.monotonic(), rp)
             else:
                 rp = cached[1]
 
@@ -130,12 +138,12 @@ class RobotsChecker:
             return True
         return rp.can_fetch(self._user_agent, url)
 
-    def _evict_if_needed(self, incoming_host: str) -> None:
+    def _evict_if_needed(self, incoming_origin: str) -> None:
         """Bound the cache / lock dicts via FIFO eviction (ROBOTS-1).
 
-        When the dicts are at capacity, drop the oldest-inserted host
-        (dict insertion order) -- but never the host we're about to use,
-        and never a host whose lock is currently held (its fetch is in
+        When the dicts are at capacity, drop the oldest-inserted origin
+        (dict insertion order) -- but never the origin we're about to use,
+        and never an origin whose lock is currently held (its fetch is in
         flight). The lock is evicted together with its cache entry so the
         two maps can't drift. A few hundred bytes per host means this only
         ever triggers in an extremely long-lived, high-host-cardinality
@@ -144,7 +152,7 @@ class RobotsChecker:
         while len(self._locks) >= _ROBOTS_CACHE_MAXSIZE:
             victim: str | None = None
             for candidate in self._locks:
-                if candidate == incoming_host:
+                if candidate == incoming_origin:
                     continue
                 lk = self._locks.get(candidate)
                 if lk is not None and lk.locked():
@@ -152,14 +160,16 @@ class RobotsChecker:
                 victim = candidate
                 break
             if victim is None:
-                # Every entry is the incoming host or has an in-flight
+                # Every entry is the incoming origin or has an in-flight
                 # fetch -- nothing safe to evict right now. Bail rather
                 # than spin; the next call will retry.
                 break
             self._locks.pop(victim, None)
             self._cache.pop(victim, None)
 
-    async def _fetch_and_parse(self, scheme: str, host: str) -> RobotFileParser | None:
+    async def _fetch_and_parse(
+        self, scheme: str, host: str, port: int | None = None
+    ) -> RobotFileParser | None:
         """Fetch and parse robots.txt for the given host.
 
         Returns ``None`` on any failure (network error, non-200 status,
@@ -182,7 +192,10 @@ class RobotsChecker:
             )
             return None
 
-        url = f"{scheme}://{host}/robots.txt"
+        authority = f"[{host}]" if ":" in host else host
+        if port is not None:
+            authority = f"{authority}:{port}"
+        url = f"{scheme}://{authority}/robots.txt"
         try:
             # v1.6.14 C-5: do NOT follow redirects when fetching robots.txt.
             # robots.txt is a fixed well-known path; a cross-host 3xx is a

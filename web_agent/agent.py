@@ -311,7 +311,10 @@ class Agent:
             else None
         )
         self._robots: RobotsChecker | None = (
-            RobotsChecker(user_agent=safety.robots_user_agent)
+            RobotsChecker(
+                user_agent=safety.robots_user_agent,
+                block_private_ips=safety.block_private_ips,
+            )
             if safety.respect_robots_txt
             else None
         )
