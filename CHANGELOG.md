@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Restored the MCP `<2` compatibility bound and blocked automated MCP major-version bumps.
 - Pinned GitHub Actions to immutable Node 24 SHAs, added weekly Dependabot updates, and corrected the agent guide's license metadata.
 - Fixed `Agent.interact()` to validate documented dict-shaped actions before execution.
 

@@ -26,3 +26,16 @@ def test_dependabot_tracks_python_and_github_actions() -> None:
         "github-actions",
         "pip",
     }
+
+    pip_updates = next(
+        update for update in config["updates"] if update["package-ecosystem"] == "pip"
+    )
+    assert pip_updates["ignore"] == [
+        {"dependency-name": "mcp", "update-types": ["version-update:semver-major"]}
+    ]
+
+
+def test_mcp_dependency_stays_on_compatible_major() -> None:
+    pyproject = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert pyproject.count('"mcp[cli]>=1.0.0,<2.0.0"') == 2
