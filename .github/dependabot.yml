@@ -11,6 +11,10 @@ updates:
       python-dependencies:
         patterns:
           - "*"
+    ignore:
+      - dependency-name: mcp
+        update-types:
+          - version-update:semver-major
     open-pull-requests-limit: 5
 
   - package-ecosystem: github-actions
